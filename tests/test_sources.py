@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,7 +8,7 @@ import pandas as pd
 import pytest
 
 from dinoapp import app
-from dinoapp.app import new_gallery_state, update_gallery_card
+from dinoapp.app import get_native_modules, new_gallery_state, update_gallery_card
 from dinoapp.label_store import LabelConflictError, load_labels, update_label
 from dinoapp.sources import AnnotationFiles, BarrageSource, NativeSource
 
@@ -146,6 +147,25 @@ def test_gallery_queue_is_stable_and_cards_change_only_one_marker(tmp_path: Path
     assert card["expected"] == [1, 0]
     assert card["value"] == [1, 1]
     assert card["changed"] is True
+
+
+def test_native_loader_adds_external_dependency_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    native_dir = tmp_path / "native"
+    dependency_dir = tmp_path / "dependency"
+    native_dir.mkdir()
+    dependency_dir.mkdir()
+    (dependency_dir / "profiles.py").write_text("VALUE = 7\n")
+    (native_dir / "cell_review.py").write_text("from profiles import VALUE\n")
+    (native_dir / "cell_review_app.py").write_text("LOADED = True\n")
+    for name in ("cell_review", "cell_review_app", "profiles"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    native, native_app = get_native_modules(str(native_dir), (str(dependency_dir),))
+
+    assert native.VALUE == 7
+    assert native_app.LOADED is True
 
 
 def test_launch_starts_universal_streamlit_app(monkeypatch: pytest.MonkeyPatch):

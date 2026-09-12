@@ -47,10 +47,14 @@ training-review implementation lazily. Configure its external location with:
 ```bash
 export DINO_NATIVE_REVIEW_DIR=/path/to/native/app
 export DINO_REVIEW_LABEL_ROOT=/path/to/native/labels
+export DINO_NATIVE_PYTHONPATH=/path/to/native/dependencies
 ```
 
 The native directory must provide importable `cell_review.py` and
-`cell_review_app.py` modules with the interfaces used by the adapter.
+`cell_review_app.py` modules with the interfaces used by the adapter. Multiple
+native dependency directories in `DINO_NATIVE_PYTHONPATH` use the platform path
+separator. By default, the app adds a sibling `svz-cut` directory beside the
+configured native app directory, matching the prod2 layout.
 
 ## License
 

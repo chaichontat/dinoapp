@@ -130,10 +130,15 @@ def get_barrage_source(root: str) -> BarrageSource:
 
 
 @st.cache_resource
-def get_native_modules(native_dir: str) -> tuple[Any, Any]:
-    directory = str(Path(native_dir).resolve())
-    if directory not in sys.path:
-        sys.path.insert(0, directory)
+def get_native_modules(
+    native_dir: str, dependency_dirs: tuple[str, ...] = ()
+) -> tuple[Any, Any]:
+    directories = (native_dir, *dependency_dirs)
+    for directory in reversed(directories):
+        resolved = str(Path(directory).expanduser().resolve())
+        if resolved in sys.path:
+            sys.path.remove(resolved)
+        sys.path.insert(0, resolved)
     native = importlib.import_module("cell_review")
     native_app = importlib.import_module("cell_review_app")
     return native, native_app
@@ -609,8 +614,12 @@ def review_barrage_cell(
             st.info(context["notice"])
 
 
-def load_native_source(native_dir: str, label_root: Path) -> tuple[NativeSource, Any, Any]:
-    native, native_app = get_native_modules(native_dir)
+def load_native_source(
+    native_dir: str,
+    label_root: Path,
+    dependency_dirs: tuple[str, ...] = (),
+) -> tuple[NativeSource, Any, Any]:
+    native, native_app = get_native_modules(native_dir, dependency_dirs)
     field_source = native_app.get_source(native.FieldSource)
     return NativeSource(field_source, label_root=label_root), native, native_app
 
@@ -756,8 +765,18 @@ def main() -> None:
                 ),
             )
         ).resolve()
+        default_native_pythonpath = str(Path(native_dir).resolve().parent / "svz-cut")
+        native_dependency_dirs = tuple(
+            path
+            for path in os.environ.get(
+                "DINO_NATIVE_PYTHONPATH", default_native_pythonpath
+            ).split(os.pathsep)
+            if path
+        )
         try:
-            source, native, native_app = load_native_source(native_dir, label_root)
+            source, native, native_app = load_native_source(
+                native_dir, label_root, native_dependency_dirs
+            )
         except (FileNotFoundError, ImportError, ValueError) as error:
             st.error(str(error))
             st.stop()
