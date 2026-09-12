@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,7 +9,13 @@ import pandas as pd
 import pytest
 
 from dinoapp import app
-from dinoapp.app import get_native_modules, new_gallery_state, update_gallery_card
+from dinoapp.app import (
+    gallery_page_crops,
+    get_native_modules,
+    new_gallery_state,
+    prefetch_gallery_page,
+    update_gallery_card,
+)
 from dinoapp.label_store import LabelConflictError, load_labels, update_label
 from dinoapp.sources import AnnotationFiles, BarrageSource, NativeSource
 
@@ -74,6 +81,17 @@ def test_barrage_source_rejects_crop_paths_outside_root(tmp_path: Path):
 
     with pytest.raises(ValueError, match="escapes"):
         BarrageSource(tmp_path).crop("one:1|10", "edu")
+
+
+def test_barrage_crop_title_uses_the_written_cell_identity(tmp_path: Path):
+    write_barrage(tmp_path)
+    index = pd.read_csv(tmp_path / "index.csv")
+    index.loc[0, "label"] = 999
+    index.to_csv(tmp_path / "index.csv", index=False)
+
+    crop = BarrageSource(tmp_path).crop("one:1|10", "edu")
+
+    assert crop.title == "Cell 10"
 
 
 def test_annotation_undo_uses_compare_and_set(tmp_path: Path):
@@ -147,6 +165,121 @@ def test_gallery_queue_is_stable_and_cards_change_only_one_marker(tmp_path: Path
     assert card["expected"] == [1, 0]
     assert card["value"] == [1, 1]
     assert card["changed"] is True
+
+
+def test_gallery_prefetch_reuses_next_page_crops(monkeypatch: pytest.MonkeyPatch):
+    class ImmediateExecutor:
+        def submit(self, function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+    class Source:
+        source_id = "test"
+
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def crop(self, cell: str, marker: str):
+            self.calls.append((cell, marker))
+            return SimpleNamespace(image=cell.encode(), title=cell, detail=marker)
+
+    source = Source()
+    cells = [f"cell|{index}" for index in range(app.GALLERY_PAGE_SIZE + 2)]
+    gallery = {
+        "queue_id": "queue",
+        "marker": "edu",
+        "cells": cells,
+        "pages": {},
+        "prefetches": {},
+    }
+    monkeypatch.setattr(app, "gallery_prefetch_executor", lambda: ImmediateExecutor())
+
+    prefetch_gallery_page(source, gallery, 1)
+    prefetched_calls = list(source.calls)
+    crops = gallery_page_crops(source, gallery, 1)
+
+    assert prefetched_calls == [("cell|24", "edu"), ("cell|25", "edu")]
+    assert source.calls == prefetched_calls
+    assert [crop.title for crop in crops] == ["cell|24", "cell|25"]
+
+
+def test_gallery_rejects_disagreement_between_item_and_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class Rerun(Exception):
+        pass
+
+    class Column:
+        def button(self, *args, **kwargs):
+            return False
+
+        def write(self, *args, **kwargs):
+            return None
+
+        def info(self, *args, **kwargs):
+            return None
+
+    cards = [
+        {
+            "itemId": cell,
+            "cell": cell,
+            "marker": "edu",
+            "expected": [0, 0],
+            "value": [0, 1],
+        }
+        for cell in ("cell|1", "cell|2")
+    ]
+    gallery = {
+        "marker": "edu",
+        "cells": ["cell|1", "cell|2"],
+        "page": 0,
+        "queue_id": "queue",
+        "pages": {("queue", 0): cards},
+        "prefetches": {},
+        "initial": {"cell|1": (0, 0), "cell|2": (0, 0)},
+    }
+    context = {
+        "history": [],
+        "galleries": {},
+        "notice": "",
+        "client_token": None,
+        "session_id": "session",
+    }
+    event = {
+        "itemId": "cell|1",
+        "cell": "cell|2",
+        "expected": [0, 0],
+        "value": [0, 1],
+        "token": "source:queue:0",
+    }
+    result = SimpleNamespace(needsFull=None, flipped=event)
+    saved: list[str] = []
+
+    def component(**kwargs):
+        return result
+
+    monkeypatch.setattr(app, "gallery_picker", lambda: component)
+    monkeypatch.setattr(app, "prefetch_gallery_page", lambda *args: None)
+    monkeypatch.setattr(app, "save_assignment", lambda *args, **kwargs: saved.append("saved"))
+    monkeypatch.setattr(app.st, "title", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app.st, "columns", lambda widths, **kwargs: tuple(Column() for _ in widths))
+    monkeypatch.setattr(app.st, "rerun", lambda: (_ for _ in ()).throw(Rerun()))
+
+    with pytest.raises(Rerun):
+        app.render_gallery(
+            SimpleNamespace(source_id="source"),
+            SimpleNamespace(values={"cell|1": (0, 0), "cell|2": (0, 0)}),
+            context,
+            gallery,
+            state_dir=tmp_path,
+        )
+
+    assert saved == []
+    assert context["notice"] == (
+        "That cell changed after this gallery was rendered; no edit was saved."
+    )
 
 
 def test_native_loader_adds_external_dependency_directories(

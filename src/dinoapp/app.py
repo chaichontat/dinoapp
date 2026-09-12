@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from dinoapp.label_store import Label, LabelConflictError
 from dinoapp.sources import (
     AnnotationFiles,
     BarrageSource,
+    Crop,
     Edit,
     NativeSource,
     ReviewSource,
@@ -122,6 +124,12 @@ def gallery_picker():
           return () => { for (const button of gallery.querySelectorAll('button')) button.onclick = null; };
         }""",
     )
+
+
+@st.cache_resource
+def gallery_prefetch_executor() -> ThreadPoolExecutor:
+    """Keep next-page crop work off the Streamlit rerun path."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="dinoapp-gallery")
 
 
 @st.cache_resource
@@ -229,7 +237,44 @@ def new_gallery_state(
         "initial": {cell: annotations.values[cell] for cell in cells},
         "page": 0,
         "pages": {},
+        "prefetches": {},
     }
+
+
+def _load_gallery_crops(
+    source: ReviewSource, cells: tuple[str, ...], marker: str
+) -> list[Crop]:
+    return [source.crop(cell, marker) for cell in cells]
+
+
+def prefetch_gallery_page(
+    source: ReviewSource, gallery: dict[str, Any], page: int
+) -> None:
+    """Start loading one unvisited gallery page without blocking this render."""
+    page_key = (gallery["queue_id"], page)
+    prefetches: dict[tuple[str, int], Future[list[Crop]]] = gallery["prefetches"]
+    if page_key in gallery["pages"] or page_key in prefetches:
+        return
+    start = page * GALLERY_PAGE_SIZE
+    cells = tuple(gallery["cells"][start : start + GALLERY_PAGE_SIZE])
+    if not cells:
+        return
+    prefetches[page_key] = gallery_prefetch_executor().submit(
+        _load_gallery_crops, source, cells, str(gallery["marker"])
+    )
+
+
+def gallery_page_crops(
+    source: ReviewSource, gallery: dict[str, Any], page: int
+) -> list[Crop]:
+    """Return crops in queue order, reusing completed background work."""
+    page_key = (gallery["queue_id"], page)
+    future = gallery["prefetches"].pop(page_key, None)
+    if future is not None:
+        return future.result()
+    start = page * GALLERY_PAGE_SIZE
+    cells = tuple(gallery["cells"][start : start + GALLERY_PAGE_SIZE])
+    return _load_gallery_crops(source, cells, str(gallery["marker"]))
 
 
 def update_gallery_card(
@@ -353,9 +398,9 @@ def render_gallery(
     page_key = (gallery["queue_id"], page)
     if page_key not in gallery["pages"]:
         cards: list[dict[str, Any]] = []
-        for cell in cells[start:stop]:
+        crops = gallery_page_crops(source, gallery, page)
+        for cell, crop in zip(cells[start:stop], crops, strict=True):
             current = annotations.values.get(cell)
-            crop = source.crop(cell, marker)
             card: dict[str, Any] = {
                 "itemId": cell,
                 "cell": cell,
@@ -369,6 +414,7 @@ def render_gallery(
             cards.append(card)
         gallery["pages"][page_key] = cards
     cards = gallery["pages"][page_key]
+    prefetch_gallery_page(source, gallery, page + 1)
 
     view_token = f"{source.source_id}:{gallery['queue_id']}:{page}"
     patch_existing = context["client_token"] == view_token
@@ -406,8 +452,9 @@ def render_gallery(
     event = result.flipped
     if not event:
         return
-    cell_identity = str(event.get("cell", ""))
-    card = next((card for card in cards if card["cell"] == cell_identity), None)
+    item_identity = str(event.get("itemId", ""))
+    card = next((card for card in cards if card["itemId"] == item_identity), None)
+    cell_identity = str(card["cell"]) if card is not None else ""
     expected_raw = event.get("expected")
     value_raw = event.get("value")
     expected = tuple(expected_raw) if isinstance(expected_raw, list) else None
@@ -417,6 +464,7 @@ def render_gallery(
     if (
         event.get("token") != view_token
         or card is None
+        or event.get("cell") != cell_identity
         or expected != displayed
         or expected != current
     ):
@@ -472,7 +520,10 @@ def review_marker_gallery(
     identity = GALLERY_IDENTITIES[identity_name]
     signature = (source.source_id, marker, subset, dataset, identity)
     if st.sidebar.button("Refresh matches", width="stretch"):
-        context["galleries"].pop(signature, None)
+        discarded = context["galleries"].pop(signature, None)
+        if discarded is not None:
+            for future in discarded["prefetches"].values():
+                future.cancel()
         context["client_token"] = None
         st.rerun()
     if signature not in context["galleries"]:

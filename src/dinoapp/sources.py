@@ -196,8 +196,7 @@ class BarrageSource:
         if "roi" in row.index and pd.notna(row["roi"]):
             parts.append(f"ROI {row['roi']}")
         parts.append(f"rank {int(row['rank']) + 1:,}")
-        label = row.get("label")
-        title = f"Cell {label}" if pd.notna(label) else cell.rsplit("|", 1)[-1]
+        title = f"Cell {cell.rsplit('|', 1)[-1]}"
         return Crop(path.read_bytes(), title, " · ".join(parts))
 
 
