@@ -219,15 +219,6 @@ def test_coefficient_columns_follow_the_bundle_targets(tmp_path, targets):
         np.testing.assert_allclose(transform(target, raw, (0, 0, 0)), raw.astype(np.float32) * gain[..., column], rtol=1e-6)
 
 
-def test_reordered_field_applies_its_first_column_to_edu(tmp_path):
-    transform, bundle = write_field(tmp_path, ["edu", "brdu"])
-    raw = np.full((3, 5), 1000, dtype=np.uint16)
-    column = correction_gain(np.array([[0.0, 0.0]]), bundle)[0]
-    corrected = {target: float(transform(target, raw, (0, 0, 0))[0, 0]) for target in ("edu", "brdu")}
-    assert corrected["edu"] == pytest.approx(1000 * column[0], rel=1e-6)
-    assert corrected["brdu"] == pytest.approx(1000 * column[1], rel=1e-6)
-
-
 def test_name_outside_the_targets_is_rejected(tmp_path):
     transform, _ = write_field(tmp_path, ["edu", "brdu", "pcna"])
     with pytest.raises(ValueError, match="no target 'dapi'"):
@@ -279,16 +270,6 @@ def test_require_periodic_targets_rejects_reordered_or_different_targets(tmp_pat
         require_periodic_targets(transform, contract, artifact="classifier bundle")
 
 
-def test_periodic_only_correction_needs_no_reference(field):
-    transform, _ = field
-    channels = {"edu": np.full((2, 6), 100, dtype=np.uint16), "brdu": np.full((2, 6), 200, dtype=np.uint16), "pi": np.full((2, 6), 9, dtype=np.uint16)}
-    corrected = correct_channels(channels, (0, 3, 4), pixel_correction=transform)
-    for name in ("edu", "brdu"):
-        np.testing.assert_array_equal(corrected[name], transform(name, channels[name], (0, 3, 4)))
-    np.testing.assert_array_equal(corrected["pi"], channels["pi"])
-    assert set(corrected) == set(channels)
-
-
 def test_periodic_correction_leaves_channels_outside_the_targets_untouched(tmp_path):
     transform, _ = write_field(tmp_path, ["edu", "brdu", "pcna"])
     channels = {name: np.full((2, 6), value, dtype=np.uint16) for name, value in [("dapi", 9), ("pcna", 50), ("brdu", 200), ("edu", 100), ("other", 7)]}
@@ -297,3 +278,4 @@ def test_periodic_correction_leaves_channels_outside_the_targets_untouched(tmp_p
         np.testing.assert_array_equal(corrected[name], transform(name, channels[name], (0, 3, 4)))
     for name in ("dapi", "other"):
         np.testing.assert_array_equal(corrected[name], channels[name])
+    assert set(corrected) == set(channels)

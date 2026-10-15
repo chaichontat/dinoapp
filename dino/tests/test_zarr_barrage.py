@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from types import SimpleNamespace
 
 import joblib
@@ -31,9 +30,6 @@ from dino.zarr_barrage import (
     stratified_sample,
 )
 from dino.zarr_source import CellCrop, build_source_manifest, write_json_atomic
-
-BARRAGE_STATS = ("mean", "min", "max", "median", "std")
-LEGACY_PANELS = [["pi", "PI"], ["edu", "EdU"], ["brdu", "BrdU"]]
 
 
 def _config(reference, markers, panels):
@@ -404,7 +400,6 @@ def test_display_cache_rejects_a_channel_set_other_than_the_source(tmp_path, mon
         zarr_barrage._load_or_measure_display_max(tmp_path, source)
 
 
-DEFAULT_CHANNEL_VALUES = {"pi": 100, "brdu": 300, "edu": 200}
 THREE_MARKER_CHANNEL_VALUES = {"dapi": 100, "edu": 200, "brdu": 300, "pcna": 400}
 
 
@@ -452,7 +447,7 @@ def run_barrage(monkeypatch):
 
 @pytest.fixture
 def barrage_run(tmp_path, run_barrage):
-    source_dir = _write_source(tmp_path, DEFAULT_CHANNEL_VALUES)
+    source_dir = _write_source(tmp_path, {"pi": 100, "brdu": 300, "edu": 200})
 
     def run(out_dir, *extra):
         run_barrage(source_dir, out_dir, *extra)
@@ -485,7 +480,7 @@ def test_fresh_default_barrage_writes_v4_records_and_markers(barrage_run, tmp_pa
     run = json.loads((out_dir / "run.json").read_text())
     assert run["artifact"] == "dino-zarr-barrage-v4"
     assert run["marker_contract"] == DEFAULT_CONTRACT.to_json()
-    assert run["crop_panels"] == LEGACY_PANELS
+    assert run["crop_panels"] == [["pi", "PI"], ["edu", "EdU"], ["brdu", "BrdU"]]
     assert json.loads((out_dir / "complete.json").read_text()) == run
     assert load_config(out_dir / "markers.json") == default_config()
 
@@ -504,7 +499,7 @@ def test_three_marker_barrage_measures_every_marker_and_renders_crop_panels(
     assert run["crop_panels"] == [["dapi", "DAPI"], ["pcna", "PCNA"], ["edu", "EdU"], ["brdu", "BrdU"]]
     assert run["display_max"] == {name: float(value) for name, value in THREE_MARKER_CHANNEL_VALUES.items()}
     assert load_config(out_dir / "markers.json") == THREE_MARKERS
-    statistics = [f"{marker}_{stat}" for marker in ("edu", "brdu", "pcna") for stat in BARRAGE_STATS]
+    statistics = [f"{marker}_{stat}" for marker in ("edu", "brdu", "pcna") for stat in ("mean", "min", "max", "median", "std")]
     index = pd.read_csv(out_dir / "index.csv")
     assert index.columns.tolist()[-len(statistics) :] == statistics
     assert not {"dapi_mean", "pi_mean"} & set(index.columns)
@@ -551,8 +546,6 @@ def test_display_max_follows_the_contract_channels(run_barrage, three_marker_sou
     run = json.loads((out_dir / "run.json").read_text())
     assert run["display_overrides"] == {"pcna": 5000.0, "dapi": 900.5}
     assert run["display_max"] == {"dapi": 900.5, "edu": 200.0, "brdu": 300.0, "pcna": 5000.0}
-    with pytest.raises(SystemExit):
-        run_barrage(three_marker_source, tmp_path / "rejected", "--display-max", "pi=1")
 
 
 def test_source_channels_must_cover_the_contract(barrage_run, tmp_path) -> None:
@@ -631,27 +624,13 @@ def test_legacy_partial_run_resumes_as_v3_without_markers(barrage_run, tmp_path)
     assert (partial / "index.csv").read_bytes() == (baseline / "index.csv").read_bytes()
 
 
-def test_legacy_partial_run_rejects_custom_crop_panels(barrage_run, tmp_path) -> None:
+@pytest.mark.parametrize("as_record", [_legacy_record, dict], ids=["legacy_v3", "current"])
+def test_partial_run_rejects_changed_crop_panels(barrage_run, tmp_path, as_record) -> None:
     baseline = tmp_path / "baseline"
     barrage_run(baseline)
     partial = tmp_path / "partial"
     partial.mkdir()
-    legacy = _legacy_record(json.loads((baseline / "run.json").read_text()))
-    (partial / "run.json").write_text(json.dumps(legacy))
-    save_config(REPANELED, barrage_run.source_dir)
-
-    with pytest.raises(ValueError, match="different rendering contract"):
-        barrage_run(partial)
-
-    assert not (partial / "complete.json").exists()
-
-
-def test_resume_rejects_changed_crop_panels(barrage_run, tmp_path) -> None:
-    baseline = tmp_path / "baseline"
-    barrage_run(baseline)
-    partial = tmp_path / "partial"
-    partial.mkdir()
-    shutil.copy2(baseline / "run.json", partial / "run.json")
+    (partial / "run.json").write_text(json.dumps(as_record(json.loads((baseline / "run.json").read_text()))))
     save_config(REPANELED, barrage_run.source_dir)
 
     with pytest.raises(ValueError, match="different rendering contract"):

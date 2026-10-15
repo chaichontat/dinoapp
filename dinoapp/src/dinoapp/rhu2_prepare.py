@@ -43,8 +43,7 @@ def prepare(review_root: Path, release: Path) -> None:
     if target.exists() or (review_root / 'spatial.json').exists():
         raise FileExistsError(f'Spatial snapshot already exists: {review_root}')
     cohort = release / 'cohort/cells.h5ad'
-    contract = DEFAULT_CONTRACT
-    probability_columns = [rhu2_probability_column(marker) for marker in contract.markers]
+    probability_columns = [rhu2_probability_column(marker) for marker in DEFAULT_CONTRACT.markers]
     data = ad.read_h5ad(cohort, backed='r')
     try:
         rows = data.obs[['dataset', 'roi', 'ccf_adjusted', 'x', 'y', 'z', *probability_columns]].copy()
@@ -72,7 +71,7 @@ def prepare(review_root: Path, release: Path) -> None:
         segmentation = json.loads((Path(source['segmentation']) / 'zarr.json').read_text())
         shape = segmentation['shape']
         keys = fused['attributes']['key']
-        if fused['shape'][:3] != shape or set(keys) != set(contract.channel_keys):
+        if fused['shape'][:3] != shape or set(keys) != set(DEFAULT_CONTRACT.channel_keys):
             raise ValueError(f'Invalid channel/segmentation geometry: {key}')
         if pixel_size <= 0 or not np.isfinite(pixel_size):
             raise ValueError(f'Invalid physical XY spacing: {key}')
@@ -92,9 +91,9 @@ def prepare(review_root: Path, release: Path) -> None:
     for meta, group in zip(metadata, groups, strict=True):
         group.to_parquet(review_root / meta['table'], index=False)
         pd.testing.assert_frame_equal(group, pd.read_parquet(review_root / meta['table']))
-    thresholds = dict.fromkeys(contract.markers, 0.5)
+    thresholds = dict.fromkeys(DEFAULT_CONTRACT.markers, 0.5)
     uncertainty = combined_uncertainty(
-        {marker: rows[column].to_numpy() for marker, column in zip(contract.markers, probability_columns)},
+        {marker: rows[column].to_numpy() for marker, column in zip(DEFAULT_CONTRACT.markers, probability_columns)},
         thresholds,
     )
     log_vmax = float(np.quantile(np.log1p(uncertainty[np.isfinite(uncertainty)]), 0.999))
@@ -105,7 +104,7 @@ def prepare(review_root: Path, release: Path) -> None:
              sampling='uniform ROI, then uniform cell, with SeedSequence([seed, position])',
              z_coordinates='native image plane; no unrecorded physical Z spacing assumed',
              display_max=32768.0, rois=metadata, **prepare_branches(review_root, release, rows)),
-        contract,
+        DEFAULT_CONTRACT,
     )
     (review_root / 'spatial.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(f'Snapshotted {len(rows):,} cells in {len(metadata)} ROIs; probabilities unchanged.')

@@ -21,13 +21,11 @@ from sklearn.preprocessing import SplineTransformer
 
 from dino_markers import (
     INTENSITY_MODEL,
-    MarkerContract,
     bundle_contract,
     default_config,
     derive_bundle,
     intensity_column,
     load_config,
-    require_same_contract,
 )
 
 from dino.artifacts import file_sha256
@@ -230,10 +228,11 @@ def apply_command(model, props, scale_zyx_um, classifier, out_dir):
     scale = np.asarray(scale_zyx_um)
     if not np.isfinite(scale).all() or np.any(scale <= 0):
         raise ValueError("Voxel spacing must be finite and positive")
-    from dino.periodic_pixels import PeriodicPixels
+    from dino.periodic_pixels import PeriodicPixels, require_periodic_targets
 
     bundle = joblib.load(model)
-    targets = list(PeriodicPixels(str(model.resolve()), file_sha256(model), tuple(scale_zyx_um)).targets)
+    correction = PeriodicPixels(str(model.resolve()), file_sha256(model), scale_zyx_um)
+    targets = correction.targets
     if "scale_zyx_um" in bundle and not np.array_equal(bundle["scale_zyx_um"], scale):
         raise ValueError("Correction and props voxel spacings differ")
     parquet = pq.ParquetFile(props)
@@ -249,12 +248,7 @@ def apply_command(model, props, scale_zyx_um, classifier, out_dir):
         ):
             raise ValueError("Classifier must use this uncorrected intensity table")
         classifier_contract = bundle_contract(classifier_bundle, where=str(classifier))
-        require_same_contract(
-            MarkerContract(classifier_contract.reference, tuple(targets)),
-            classifier_contract,
-            expected_from=f"periodic field {model}",
-            actual_from=f"classifier {classifier}",
-        )
+        require_periodic_targets(correction, classifier_contract, artifact=f"classifier {classifier}")
         if not np.array_equal(classifier_bundle["intensity_scale_zyx_um"], scale):
             raise ValueError("Classifier and props voxel spacings differ")
         if "periodic_correction" in classifier_bundle or "pixel_correction" in classifier_bundle:

@@ -16,7 +16,7 @@ from dino.artifacts import file_sha256, read_parquet_artifact
 from dino.classifier_features import validate_feature_contract
 from dino.zarr_source import CellCropReader
 from dinoapp.display_pixels import DisplayPixels
-from dinoapp.native import AnnotationFiles as AnnotationFiles, adapter_config, classifier_caption
+from dinoapp.native import adapter_config, classifier_caption
 from dinoapp.native import load_prediction_pointer, prediction_contract
 from dinoapp.native import render_field as render_field
 from dinoapp.review_predictions import load_review_predictions

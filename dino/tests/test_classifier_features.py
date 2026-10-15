@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -89,8 +91,6 @@ def test_classifier_context_loads_ratio_features_and_rejects_unknown_sets(tmp_pa
 
 
 def _classifier(contract=DEFAULT_CONTRACT, *, mode="marker", width=None, spatial_subtraction=None):
-    from types import SimpleNamespace
-
     context = ["log1p_cell_mean", "log_cell_over_local_mean"]
     markers = contract.markers
     if width is None:

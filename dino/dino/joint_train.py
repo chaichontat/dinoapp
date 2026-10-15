@@ -67,20 +67,19 @@ ENCODER_KEYS = (
     'highpass_sigma_px', 'mask_erosion_px', 'input_channels', 'input_channel_names_by_target',
     'feature_precision', 'feature_execution',
 )
-# Legacy embedding bundles identify the backbone by model_source_sha256 instead of dinov2_source.
-BACKBONE_SOURCE_KEYS = ('dinov2_source', 'model_source_sha256')
 # Classifier state inherited from the embedding bundle that a deployed bundle must not carry.
 STALE_KEYS = (
-    'embedding_pca', 'deployment', 'feature_cache', 'training_barrage_dirs', 'classifier_feature_schema',
-    'feature_names', 'position_artifact', 'position_features', 'position_spline', 'position_spline_config',
-    'test_fraction', 'split_source_model', 'split_source_model_sha256', 'label_snapshot',
+    'schema', CONTRACT_FIELD, 'embedding_pca', 'deployment', 'feature_cache', 'training_barrage_dirs',
+    'classifier_feature_schema', 'feature_names', 'position_artifact', 'position_features', 'position_spline',
+    'position_spline_config', 'test_fraction', 'split_source_model', 'split_source_model_sha256', 'label_snapshot',
     'label_snapshot_sha256', 'training_labels_snapshot', 'training_labels_snapshot_sha256',
 )
 
 
 def encoder_identity(bundle: dict) -> dict:
+    # Legacy embedding bundles identify the backbone by model_source_sha256 instead of dinov2_source.
     return {key: bundle[key] for key in ENCODER_KEYS} | {
-        key: bundle[key] for key in BACKBONE_SOURCE_KEYS if key in bundle
+        key: bundle[key] for key in ('dinov2_source', 'model_source_sha256') if key in bundle
     }
 
 
@@ -241,9 +240,8 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
         dataset_contract = bundle_contract(bundle, where=str(dataset.embedding_model))
         if contract is None:
             contract = dataset_contract
-        else:
-            require_same_contract(contract, dataset_contract, expected_from=str(datasets[0].embedding_model),
-                                  actual_from=str(dataset.embedding_model))
+        require_same_contract(contract, dataset_contract, expected_from=str(datasets[0].embedding_model),
+                              actual_from=str(dataset.embedding_model))
         labels, tranches[dataset.name] = read_labels(dataset, contract=contract)
         model_sha256 = file_sha256(dataset.embedding_model)
         source_labels, values = labeled_embeddings(
@@ -338,7 +336,7 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
     rows.to_parquet(output / 'labeled_predictions.parquet', index=False)
     for d, dataset in enumerate(datasets):
         deployed = {key: value for key, value in bundles[dataset.name].items()
-                    if key not in STALE_KEYS and key not in ('schema', CONTRACT_FIELD)}
+                    if key not in STALE_KEYS}
         members = np.flatnonzero(dataset_index == d)
         for target in markers:
             scaler, model = collapse(joint[scaler_key(target)], joint[model_key(target)], index=d,

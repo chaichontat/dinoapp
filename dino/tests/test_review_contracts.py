@@ -84,15 +84,16 @@ def test_review_predictions_load_under_the_default_contract(review):
     assert _load(path).cell.tolist() == ["run|1", "run|2"]
 
 
-def test_review_predictions_reject_a_missing_null_or_unknown_version(review):
+@pytest.mark.parametrize(
+    "artifact",
+    [{}, {"artifact": None}, {"artifact": "dino-labeled-review-v2"}],
+    ids=["missing", "null", "unknown"],
+)
+def test_review_predictions_reject_a_missing_null_or_unknown_version(review, artifact):
     path, manifest = review
-    for artifact in (..., None, "dino-labeled-review-v2"):
-        record = {key: value for key, value in manifest.items() if key != "artifact"}
-        if artifact is not ...:
-            record["artifact"] = artifact
-        path.write_text(json.dumps(record))
-        with pytest.raises(ValueError, match="differs from the selected classifier"):
-            _load(path)
+    path.write_text(json.dumps({key: value for key, value in manifest.items() if key != "artifact"} | artifact))
+    with pytest.raises(ValueError, match="differs from the selected classifier"):
+        _load(path)
 
 
 def test_review_predictions_reject_a_manifest_that_carries_a_contract(review):

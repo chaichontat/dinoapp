@@ -27,14 +27,18 @@ from streamlit.components.v2 import component
 
 from dinoapp.label_store import LabelConflictError
 from dinoapp.review_session import (
+    EDIT_REJECTED,
     activate_target,
     activate_view,
     capture_queue,
+    cell_draft,
+    draft_label,
     navigate,
     get_context,
     remember_widget,
     retire_active_view,
     save_assignment,
+    saved_filter_controls,
     undo_edit as persist_undo,
     widget_key,
 )
@@ -50,7 +54,6 @@ from dinoapp.sources import (
 
 GALLERY_PAGE_SIZE = 24
 CELL_OPTIONS = ("Unsaved", "Saved", "All cells")
-EDIT_REJECTED = (LabelConflictError, ContractMismatchError)
 
 
 @st.cache_resource
@@ -258,8 +261,7 @@ def update_gallery_card(
         return
     contract = config.contract
     target = toggle_marker(contract, value, marker)
-    sign = "+" if target[contract.markers.index(marker)] else "−"
-    action = f"Set {config.label(marker)}{sign}"
+    action = f"Set {config.label(marker)}{'+' if target[contract.markers.index(marker)] else '−'}"
     card.update(
         state=state_label(config, value),
         changed=value != initial,
@@ -353,7 +355,6 @@ def render_gallery(
         cards: list[dict[str, Any]] = []
         crops = gallery_page_crops(source, gallery, page)
         for cell, crop in zip(cells[start:stop], crops, strict=True):
-            current = annotations.values.get(cell)
             card: dict[str, Any] = {
                 "itemId": cell,
                 "cell": cell,
@@ -363,7 +364,6 @@ def render_gallery(
                 + base64.b64encode(crop.image).decode("ascii"),
                 "detail": crop.detail,
             }
-            update_gallery_card(card, current, gallery["initial"][cell], config=config)
             cards.append(card)
         gallery["pages"][page_key] = cards
     cards = gallery["pages"][page_key]
@@ -466,21 +466,6 @@ def render_gallery(
     st.rerun()
 
 
-def saved_filter_controls(context: dict[str, Any], config: MarkerConfig, prefix: str) -> SavedFilter:
-    """One select per marker; "Any" leaves the marker unconstrained."""
-    chosen: dict[str, int | None] = {}
-    for key in config.display_markers:
-        label = config.label(key)
-        options = ("Any", f"{label}+", f"{label}−")
-        name = f"{prefix}:{key}"
-        widget = widget_key(context, name, "Any")
-        if st.session_state[widget] not in options:
-            st.session_state[widget] = context["widgets"][name] = "Any"
-        selected = st.selectbox(label, options, key=widget, on_change=remember_widget, args=(context, name))
-        chosen[key] = None if selected == "Any" else int(selected.endswith("+"))
-    return tuple(chosen[key] for key in config.contract.markers)
-
-
 def review_marker_gallery(
     source: ReviewSource,
     annotations: AnnotationFiles,
@@ -520,31 +505,6 @@ def review_marker_gallery(
         context["galleries"][signature],
         state_dir=state_dir,
     )
-
-
-def cell_draft(
-    context: dict[str, Any], cell: str, saved: Label | None, markers: tuple[str, ...]
-) -> dict[str, Any]:
-    """Return the displayed cell's draft; other cells' drafts and drafts the saved value left behind are dropped."""
-    drafts = context["drafts"]
-    for other in [name for name in drafts if name != cell]:
-        del drafts[other]
-    draft = drafts.get(cell)
-    if draft is not None and draft["expected"] != saved:
-        context["notice"] = f"{cell} changed on disk; its unsaved marker edits were discarded."
-        draft = None
-    if draft is None:
-        draft = drafts[cell] = {
-            "expected": saved,
-            "values": dict(zip(markers, saved if saved is not None else (None,) * len(markers))),
-        }
-    return draft
-
-
-def draft_label(contract_markers: tuple[str, ...], draft: dict[str, Any]) -> Label | None:
-    """The draft as a complete assignment in contract order, or None while any marker is unset."""
-    values = tuple(draft["values"][key] for key in contract_markers)
-    return None if None in values else values
 
 
 def review_barrage_cell(

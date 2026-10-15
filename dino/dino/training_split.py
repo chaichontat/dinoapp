@@ -91,11 +91,10 @@ def split_dataset_rows(
         for marker in markers
         for dataset in range(datasets)
     )
-    capacity = min(test_size, len(rows) - test_size)
     if in_every_dataset:
         for strata in candidates:
             counts = np.unique(strata, return_counts=True)[1]
-            if counts.min() < 2 or len(counts) > capacity:
+            if counts.min() < 2 or len(counts) > min(test_size, len(rows) - test_size):
                 continue
             train, validation = train_test_split(
                 np.arange(len(rows)), test_size=test_size, random_state=seed, stratify=strata

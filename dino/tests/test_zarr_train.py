@@ -571,7 +571,6 @@ def test_dataset_split_rejects_a_dataset_without_two_rows_of_each_class() -> Non
 # --- Marker contract: input channels, contract resolution, and three-marker training. ---
 
 CUSTOM = MarkerContract("dapi", ("edu", "brdu", "pcna"))
-LEGACY_MODEL = Path(__file__).parent / "fixtures" / "legacy_model"
 
 
 def _config(contract: MarkerContract):
@@ -847,7 +846,7 @@ def test_changed_input_channels_reset_a_recognized_cache(monkeypatch, tmp_path) 
 
 def test_an_extended_legacy_cache_keeps_its_v2_metadata(monkeypatch, tmp_path) -> None:
     root = tmp_path / "legacy_model"
-    shutil.copytree(LEGACY_MODEL, root)
+    shutil.copytree(Path(__file__).parent / "fixtures" / "legacy_model", root)
     monkeypatch.chdir(root)
     cache_path = root / "model" / "features.joblib"
     cache = joblib.load(cache_path)

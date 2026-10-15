@@ -36,10 +36,7 @@ def load_calls(
         if contract is None:
             contract, contract_from = shard_contract, str(complete_path)
             parts = {marker: [] for marker in contract.markers}
-        else:
-            require_same_contract(
-                contract, shard_contract, expected_from=contract_from, actual_from=str(complete_path)
-            )
+        require_same_contract(contract, shard_contract, expected_from=contract_from, actual_from=str(complete_path))
         if (
             complete["source_sha256"] != source_hash
             or complete["cells"] != len(cells)

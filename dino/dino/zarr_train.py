@@ -525,42 +525,44 @@ def main() -> None:
 
     weights_sha256 = file_sha256(cfg.weights)
     dinov2_source = installed_dinov2_source()
-    cache_fields = {
-        "source_sha256s": training_source_sha256s,
-        "weights_sha256": weights_sha256,
-        "dinov2_source": dinov2_source,
-        "hub_model": cfg.hub_model,
-        "crop_size": cfg.crop_size,
-        "resize_size": cfg.resize_size,
-        "crop_eval_size": cfg.crop_eval_size,
-        "highpass_sigma_px": cfg.highpass_sigma_px,
-        "mask_erosion_px": cfg.mask_erosion_px,
-        "feature_precision": cfg.feature_precision,
-        "feature_execution": FEATURE_EXECUTION,
-        "input_channel_names_by_target": {
-            target: list(channel_names)
-            for target, channel_names in cfg.input_channel_names_by_target.items()
+    cache_metadata = FEATURE_CACHE.stamp(
+        {
+            "source_sha256s": training_source_sha256s,
+            "weights_sha256": weights_sha256,
+            "dinov2_source": dinov2_source,
+            "hub_model": cfg.hub_model,
+            "crop_size": cfg.crop_size,
+            "resize_size": cfg.resize_size,
+            "crop_eval_size": cfg.crop_eval_size,
+            "highpass_sigma_px": cfg.highpass_sigma_px,
+            "mask_erosion_px": cfg.mask_erosion_px,
+            "feature_precision": cfg.feature_precision,
+            "feature_execution": FEATURE_EXECUTION,
+            "input_channel_names_by_target": {
+                target: list(channel_names)
+                for target, channel_names in cfg.input_channel_names_by_target.items()
+            },
         },
-    }
-    cache_metadata = FEATURE_CACHE.stamp(cache_fields, cfg.contract)
+        cfg.contract,
+    )
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cfg.feature_cache or (cfg.out_dir / "features.joblib")
-    cache = joblib.load(cache_path) if cache_path.is_file() else {"metadata": cache_metadata, "entries": {}}
+    cache = joblib.load(cache_path) if cache_path.is_file() else {}
     metadata = cache.get("metadata")
-    if (
-        not isinstance(metadata, dict)
-        or not FEATURE_CACHE.recognizes(metadata)
-        or not isinstance(cache.get("entries"), dict)
-    ):
-        cache = {"metadata": cache_metadata, "entries": {}}
-    else:
+    reusable = (
+        isinstance(metadata, dict)
+        and FEATURE_CACHE.recognizes(metadata)
+        and isinstance(cache.get("entries"), dict)
+    )
+    if reusable:
         recorded, expected = FEATURE_CACHE.normalize(metadata, where=str(cache_path)), cache_metadata
         if "model_source_sha256" in recorded:
             # A legacy cache predates recorded dinov2 sources and, like a legacy bundle, is reused without a source check.
             recorded = {key: value for key, value in recorded.items() if key != "model_source_sha256"}
             expected = {key: value for key, value in cache_metadata.items() if key != "dinov2_source"}
-        if recorded != expected:
-            cache = {"metadata": cache_metadata, "entries": {}}
+        reusable = recorded == expected
+    if not reusable:
+        cache = {"metadata": cache_metadata, "entries": {}}
 
     features, missing = _cached_features(selected_rows, cache, markers)
     miss_count = sum(map(len, missing.values()))
@@ -625,36 +627,38 @@ def main() -> None:
                 metric_key(target, "validation_balanced_accuracy"): cutoff_score,
             }
         )
-    bundle_fields = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "source_sha256": source_sha256,
-        "training_source_sha256s": training_source_sha256s,
-        "training_barrage_dirs": [str(path.resolve()) for path in cfg.barrage_dirs],
-        "feature_extractor": cfg.hub_model,
-        "input_channels": cfg.input_channels,
-        "input_channel_names_by_target": {
-            target: list(channel_names)
-            for target, channel_names in cfg.input_channel_names_by_target.items()
+    bundle = ZARR_MODEL.stamp(
+        {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source_sha256": source_sha256,
+            "training_source_sha256s": training_source_sha256s,
+            "training_barrage_dirs": [str(path.resolve()) for path in cfg.barrage_dirs],
+            "feature_extractor": cfg.hub_model,
+            "input_channels": cfg.input_channels,
+            "input_channel_names_by_target": {
+                target: list(channel_names)
+                for target, channel_names in cfg.input_channel_names_by_target.items()
+            },
+            "weights": str(cfg.weights),
+            "weights_sha256": weights_sha256,
+            "dinov2_source": dinov2_source,
+            "crop_size": cfg.crop_size,
+            "resize_size": cfg.resize_size,
+            "crop_eval_size": cfg.crop_eval_size,
+            "highpass_sigma_px": cfg.highpass_sigma_px,
+            "mask_erosion_px": cfg.mask_erosion_px,
+            "feature_precision": cfg.feature_precision,
+            "feature_execution": FEATURE_EXECUTION,
+            **{scaler_key(target): scalers[target] for target in markers},
+            **{model_key(target): models[target] for target in markers},
+            "train_cells": train_rows["cell"].astype(str).tolist(),
+            "validation_cells": validation_rows["cell"].astype(str).tolist(),
+            "split_seed": cfg.seed,
+            "test_fraction": cfg.test_fraction,
+            **metrics,
         },
-        "weights": str(cfg.weights),
-        "weights_sha256": weights_sha256,
-        "dinov2_source": dinov2_source,
-        "crop_size": cfg.crop_size,
-        "resize_size": cfg.resize_size,
-        "crop_eval_size": cfg.crop_eval_size,
-        "highpass_sigma_px": cfg.highpass_sigma_px,
-        "mask_erosion_px": cfg.mask_erosion_px,
-        "feature_precision": cfg.feature_precision,
-        "feature_execution": FEATURE_EXECUTION,
-        **{scaler_key(target): scalers[target] for target in markers},
-        **{model_key(target): models[target] for target in markers},
-        "train_cells": train_rows["cell"].astype(str).tolist(),
-        "validation_cells": validation_rows["cell"].astype(str).tolist(),
-        "split_seed": cfg.seed,
-        "test_fraction": cfg.test_fraction,
-        **metrics,
-    }
-    bundle = ZARR_MODEL.stamp(bundle_fields, cfg.contract)
+        cfg.contract,
+    )
     model_path = cfg.out_dir / "model.joblib"
     _dump_joblib_atomic(bundle, model_path)
     logger.info(f"Wrote direct-Zarr Cell-DINO bundle: {model_path}")

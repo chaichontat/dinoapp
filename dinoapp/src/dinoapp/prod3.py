@@ -17,7 +17,6 @@ from dino_markers import cutoff_key, probability_column
 from skimage.segmentation import find_boundaries
 
 from dinoapp.native import (
-    AnnotationFiles as AnnotationFiles,
     Field,
     adapter_config,
     classifier_caption,

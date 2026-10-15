@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from dino.workspace_inputs import cell_id_roi_and_label, resolve_workspace_root
 from dino.cell_dino import build_cell_transform
-from dino.zarr_model import load_cell_dino_model
+from dino.zarr_model import MODEL_INPUT_CHANNELS, load_cell_dino_model
 from fishtools.brdu.barrage import load_obs_from_h5ad
 from dino.artifacts import (
     file_sha256,
@@ -32,10 +32,6 @@ from fishtools.io.workspace import Workspace
 FUSED_ZARR_NAME = "fused.zarr"
 INFERENCE_ARTIFACT_VERSION = 3
 PROGRESS_LOG_ROWS = 10_000
-MODEL_INPUT_CHANNELS = {
-    "cell_dino_cp_vits8": 5,
-    "cell_dino_hpa_vitl16": 4,
-}
 REQUIRED_BUNDLE_KEYS = {
     "feature_extractor",
     "weights",

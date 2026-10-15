@@ -17,7 +17,6 @@ from dino_markers import (
     DEFAULT_CONTRACT,
     INFERENCE,
     ContractMismatchError,
-    MarkerContract,
     UnsupportedArtifactError,
     config_to_json,
     default_config,
@@ -26,7 +25,7 @@ from dino_markers import (
 from PIL import Image
 
 from dino.artifacts import PARQUET_METADATA_KEY
-from dinoapp import prod2_2, prod3_2
+from dinoapp import prod3_2
 from dinoapp.app import get_native_modules
 from dinoapp.native import Field, render_field
 
@@ -62,20 +61,13 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _partition(path: Path, rows: pd.DataFrame, metadata: dict) -> None:
-    table = pa.Table.from_pandas(rows, preserve_index=False)
-    table = table.replace_schema_metadata({PARQUET_METADATA_KEY: json.dumps(metadata).encode()})
-    pq.write_table(table, path)
-
-
 class Fixture:
     """A Prod3-2 dataset root whose pixel readers are replaced by small stand-ins."""
 
-    def __init__(self, tmp_path: Path, monkeypatch, *, run_artifact='dino-zarr-infer-v2', pointer=False):
+    def __init__(self, tmp_path: Path, monkeypatch, *, pointer=False):
         self.root = tmp_path / 'prod3-2'
         self.run = tmp_path / 'reembedding'
         self.review = self.root / 'dino-test'
-        self.run_artifact = run_artifact
         for directory in (self.run / 'infer/shard-000/predictions', self.review / 'barrage-cortex-v1',
                           self.root / 'spatial-workflow-v1/vz-surface', self.run / 'vz-coordinates'):
             directory.mkdir(parents=True, exist_ok=True)
@@ -99,13 +91,13 @@ class Fixture:
             'shards': [{'shard': 0, 'cells': len(CELLS), 'partitions': 1}],
         }
         self.shard = {'model_sha256': _digest(self.model), 'source_sha256': 'source-hash', 'cells': len(CELLS),
-                      'artifact': run_artifact}
+                      'artifact': 'dino-zarr-infer-v2'}
         self.rows = pd.DataFrame({
             'cell': [f'tst|{label}' for label in CELLS], 'label': CELLS,
             'brdu': [False, False, True, True], 'edu': [False, True, False, True],
             'p_brdu': [.1, .2, .8, .9], 'p_edu': [.3, .7, .2, .6],
         })
-        self.partition = {'artifact': run_artifact, 'model_sha256': _digest(self.model),
+        self.partition = {'artifact': 'dino-zarr-infer-v2', 'model_sha256': _digest(self.model),
                           'source_sha256': 'source-hash', 'brdu_cutoff': .5, 'edu_cutoff': .5}
         self.display_contract = DEFAULT_CONTRACT
         self.pointer = None
@@ -128,31 +120,30 @@ class Fixture:
 
         monkeypatch.setattr(prod3_2, 'DisplayPixels', display)
         if pointer:
-            self.use_pointer(tmp_path, monkeypatch)
-
-    def use_pointer(self, tmp_path: Path, monkeypatch, *, artifact='dino-cortex-rescore-v1'):
-        scored = tmp_path / 'scored'
-        scored.mkdir()
-        self.record = {'artifact': artifact, 'source_sha256': 'source-hash',
-                       'embedding_model_sha256': self.complete['model_sha256'],
-                       'embedding_run': str(self.run / 'infer'), 'cells': len(CELLS), 'model': str(self.selected),
-                       'model_sha256': _digest(self.selected), 'prediction_partitions': 1,
-                       'review_manifest': str(tmp_path / 'review.json')}
-        self.scored = scored
-        self.partition = {**self.partition, 'artifact': artifact, 'model_sha256': _digest(self.selected)}
-        self.pointer = tmp_path / 'current.json'
-        monkeypatch.setattr(prod3_2, 'load_prediction_pointer',
-                            lambda path: ('selected', scored, tmp_path / 'scored-complete.json', dict(self.record)))
-        monkeypatch.setattr(prod3_2, 'validate_feature_contract', lambda bundle, embedding: self.selected_contract)
-        monkeypatch.setattr(prod3_2, 'load_review_predictions', lambda path, **kwargs: self.review_frame)
-        self.selected_contract = DEFAULT_CONTRACT
-        self.review_frame = self.rows.assign(split='training', tranche='barrage-cortex-v1')
+            scored = tmp_path / 'scored'
+            scored.mkdir()
+            self.record = {'artifact': 'dino-cortex-rescore-v1', 'source_sha256': 'source-hash',
+                           'embedding_model_sha256': self.complete['model_sha256'],
+                           'embedding_run': str(self.run / 'infer'), 'cells': len(CELLS), 'model': str(self.selected),
+                           'model_sha256': _digest(self.selected), 'prediction_partitions': 1,
+                           'review_manifest': str(tmp_path / 'review.json')}
+            self.scored = scored
+            self.partition = {**self.partition, 'artifact': 'dino-cortex-rescore-v1', 'model_sha256': _digest(self.selected)}
+            self.pointer = tmp_path / 'current.json'
+            monkeypatch.setattr(prod3_2, 'load_prediction_pointer',
+                                lambda path: ('selected', scored, tmp_path / 'scored-complete.json', dict(self.record)))
+            monkeypatch.setattr(prod3_2, 'validate_feature_contract', lambda bundle, embedding: self.selected_contract)
+            monkeypatch.setattr(prod3_2, 'load_review_predictions', lambda path, **kwargs: self.review_frame)
+            self.selected_contract = DEFAULT_CONTRACT
+            self.review_frame = self.rows.assign(split='training', tranche='barrage-cortex-v1')
 
     def build(self) -> type:
         (self.run / 'complete.json').write_text(json.dumps(self.complete))
         (self.run / 'infer/shard-000/complete.json').write_text(json.dumps(self.shard))
         directory = self.scored if self.pointer is not None else self.run / 'infer/shard-000/predictions'
-        _partition(directory / 'part-0.parquet', self.rows, self.partition)
+        table = pa.Table.from_pandas(self.rows, preserve_index=False)
+        table = table.replace_schema_metadata({PARQUET_METADATA_KEY: json.dumps(self.partition).encode()})
+        pq.write_table(table, directory / 'part-0.parquet')
         fixture = self
 
         class Adapter(prod3_2.FieldSource):
@@ -175,13 +166,6 @@ REORDERED = parse_config({
     'markers': [{'key': 'edu', 'label': 'EdU', 'color': '#00ff00'},
                 {'key': 'brdu', 'label': 'BrdU', 'color': '#ff00ff'}],
     'presentation': {'crop_panels': ['pi', 'edu', 'brdu'], 'negative_color': [.25, .25, .25],
-                     'uncalled_color': '#999999'},
-}, source='test')
-THREE = parse_config({
-    'version': 1, 'reference': {'key': 'dapi', 'label': 'DAPI'},
-    'markers': [{'key': key, 'label': key.upper(), 'color': color}
-                for key, color in (('edu', '#00ff00'), ('brdu', '#ff00ff'), ('pcna', '#0000ff'))],
-    'presentation': {'crop_panels': ['dapi', 'pcna', 'edu', 'brdu'], 'negative_color': [.25, .25, .25],
                      'uncalled_color': '#999999'},
 }, source='test')
 
@@ -216,14 +200,16 @@ def test_prod3_2_reads_the_selected_pointer_predictions_and_classifier(tmp_path,
     np.testing.assert_array_equal(source.calls, [4, 0, 1, 4, 2, 3])
 
 
-def test_prod2_2_shares_the_adapter_and_its_annotation_directory():
-    assert issubclass(prod2_2.FieldSource, prod3_2.FieldSource)
-    assert prod2_2.FieldSource.annotation_directories() == (prod2_2.REVIEW_ROOT / 'barrage-cortex-v1',)
-
-
 def test_prod3_2_rejects_an_annotation_directory_whose_markers_do_not_fit_its_channels(tmp_path, monkeypatch):
     fixture = Fixture(tmp_path, monkeypatch)
-    fixture.write_markers(THREE)
+    three = parse_config({
+        'version': 1, 'reference': {'key': 'dapi', 'label': 'DAPI'},
+        'markers': [{'key': key, 'label': key.upper(), 'color': color}
+                    for key, color in (('edu', '#00ff00'), ('brdu', '#ff00ff'), ('pcna', '#0000ff'))],
+        'presentation': {'crop_panels': ['dapi', 'pcna', 'edu', 'brdu'], 'negative_color': [.25, .25, .25],
+                         'uncalled_color': '#999999'},
+    }, source='test')
+    fixture.write_markers(three)
 
     with pytest.raises(ValueError, match='do not match the marker configuration'):
         fixture.build()()
@@ -239,7 +225,7 @@ def test_prod3_2_rejects_reordered_annotations_against_its_inference_run(tmp_pat
 
 def test_prod3_2_rejects_a_reembedding_manifest_of_another_contract(tmp_path, monkeypatch):
     fixture = Fixture(tmp_path, monkeypatch)
-    fixture.complete = INFERENCE.stamp(fixture.complete, MarkerContract('pi', ('edu', 'brdu')))
+    fixture.complete = INFERENCE.stamp(fixture.complete, REORDERED.contract)
 
     with pytest.raises(ContractMismatchError, match='marker order is part of the contract'):
         fixture.build()()
@@ -248,7 +234,7 @@ def test_prod3_2_rejects_a_reembedding_manifest_of_another_contract(tmp_path, mo
 def test_prod3_2_rejects_a_shard_inference_record_of_another_contract(tmp_path, monkeypatch):
     fixture = Fixture(tmp_path, monkeypatch)
     fixture.shard = INFERENCE.stamp({k: v for k, v in fixture.shard.items() if k != 'artifact'},
-                                    MarkerContract('pi', ('edu', 'brdu')))
+                                    REORDERED.contract)
     fixture.partition = {**fixture.partition, 'artifact': 'dino-zarr-infer-v3'}
 
     with pytest.raises(ContractMismatchError, match='marker order is part of the contract'):
@@ -265,7 +251,7 @@ def test_prod3_2_requires_a_versioned_shard_inference_record(tmp_path, monkeypat
 
 def test_prod3_2_rejects_a_display_bundle_of_another_contract(tmp_path, monkeypatch):
     fixture = Fixture(tmp_path, monkeypatch)
-    fixture.display_contract = MarkerContract('pi', ('edu', 'brdu'))
+    fixture.display_contract = REORDERED.contract
 
     with pytest.raises(ContractMismatchError, match='marker order is part of the contract'):
         fixture.build()()
@@ -273,7 +259,7 @@ def test_prod3_2_rejects_a_display_bundle_of_another_contract(tmp_path, monkeypa
 
 def test_prod3_2_rejects_a_selected_classifier_of_another_contract(tmp_path, monkeypatch):
     fixture = Fixture(tmp_path, monkeypatch, pointer=True)
-    fixture.selected_contract = MarkerContract('pi', ('edu', 'brdu'))
+    fixture.selected_contract = REORDERED.contract
 
     with pytest.raises(ContractMismatchError, match='marker order is part of the contract'):
         fixture.build()()
@@ -282,7 +268,7 @@ def test_prod3_2_rejects_a_selected_classifier_of_another_contract(tmp_path, mon
 def test_prod3_2_rejects_a_pointer_manifest_of_another_contract(tmp_path, monkeypatch):
     fixture = Fixture(tmp_path, monkeypatch, pointer=True)
     fixture.record = CORTEX_RESCORE.stamp({k: v for k, v in fixture.record.items() if k != 'artifact'},
-                                          MarkerContract('pi', ('edu', 'brdu')))
+                                          REORDERED.contract)
 
     with pytest.raises(ContractMismatchError, match='marker order is part of the contract'):
         fixture.build()()
@@ -298,10 +284,10 @@ def test_prod3_2_rejects_a_partition_of_another_artifact_than_its_run_record(tmp
 
 
 def test_prod3_2_rejects_a_partition_of_another_contract(tmp_path, monkeypatch):
-    fixture = Fixture(tmp_path, monkeypatch, run_artifact='dino-zarr-infer-v3')
+    fixture = Fixture(tmp_path, monkeypatch)
     fixture.shard = INFERENCE.stamp({k: v for k, v in fixture.shard.items() if k != 'artifact'}, DEFAULT_CONTRACT)
     fixture.partition = INFERENCE.stamp({k: v for k, v in fixture.partition.items() if k != 'artifact'},
-                                        MarkerContract('pi', ('edu', 'brdu')))
+                                        REORDERED.contract)
 
     with pytest.raises(ContractMismatchError, match='marker order is part of the contract'):
         fixture.build()()

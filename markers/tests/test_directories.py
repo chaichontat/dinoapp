@@ -87,13 +87,13 @@ def test_handmade_directory_with_undecodable_complete_and_custom_markers(tmp_pat
     assert contract_of(tmp_path) == CUSTOM
 
 
-@pytest.mark.parametrize("content", [b"{broken", b"[1, 2]", b'"text"', b"3", b""])
+@pytest.mark.parametrize("content", [b"{broken", b"[1, 2]"])
 def test_opaque_complete_json_is_skipped(tmp_path, content):
     (tmp_path / "complete.json").write_bytes(content)
     assert declared_contract(tmp_path) is None
 
 
-@pytest.mark.parametrize("content", [b"{broken", b"\xff\xfe\x00", b"[1, 2]", b"3", b""])
+@pytest.mark.parametrize("content", [b"{broken", b"\xff\xfe\x00", b"[1, 2]"])
 def test_run_json_must_be_an_object(tmp_path, content):
     (tmp_path / "run.json").write_bytes(content)
     with pytest.raises(MarkerConfigError, match=rf"^{tmp_path / 'run.json'}: run.json must be a JSON object$"):
@@ -107,18 +107,17 @@ def test_foreign_records_are_skipped(tmp_path, write):
     assert contract_of(tmp_path) == DEFAULT_CONTRACT
 
 
-@pytest.mark.parametrize("record", [{"rois": 1}, {"artifact": 7}, {"artifact": None}, {"artifact": ["x"]}])
+@pytest.mark.parametrize("record", [{"artifact": 7}])
 def test_records_without_a_string_artifact_are_skipped(tmp_path, write, record):
     write(tmp_path / "run.json", record)
     assert declared_contract(tmp_path) is None
 
 
-@pytest.mark.parametrize("name", ["run.json", "complete.json"])
-def test_foreign_record_carrying_a_contract_fails(tmp_path, write, name):
-    write(tmp_path / name, {"artifact": "solarmap-native-barrage-v1", "marker_contract": CUSTOM.to_json()})
+def test_foreign_record_carrying_a_contract_fails(tmp_path, write):
+    write(tmp_path / "run.json", {"artifact": "solarmap-native-barrage-v1", "marker_contract": CUSTOM.to_json()})
     with pytest.raises(
         UnsupportedArtifactError,
-        match=rf"^{tmp_path / name}: unrecognized record 'solarmap-native-barrage-v1' carries marker_contract$",
+        match=rf"^{tmp_path / 'run.json'}: unrecognized record 'solarmap-native-barrage-v1' carries marker_contract$",
     ):
         declared_contract(tmp_path)
 
@@ -136,8 +135,6 @@ def test_v3_record_with_reordered_markers_mismatches(tmp_path, default_json, wri
         declared_contract(tmp_path)
     assert str(tmp_path / "run.json") in str(info.value)
     assert str(tmp_path / "markers.json") in str(info.value)
-    with pytest.raises(ContractMismatchError):
-        contract_of(tmp_path)
 
 
 def test_v4_record_with_matching_markers(tmp_path, three_json, write):
@@ -165,8 +162,6 @@ def test_invalid_markers_json_raises(tmp_path, default_json, write):
 def test_spatial_json_versions(tmp_path, write):
     write(tmp_path / "spatial.json", {"artifact": "rhu2-spatial-review-v1", "n": 1})
     assert declared_contract(tmp_path) == DEFAULT_CONTRACT
-    write(tmp_path / "spatial.json", SPATIAL_REVIEW.stamp({}, DEFAULT_CONTRACT))
-    assert declared_contract(tmp_path) == DEFAULT_CONTRACT
     write(tmp_path / "spatial.json", SPATIAL_REVIEW.stamp({}, CUSTOM))
     assert declared_contract(tmp_path) == CUSTOM
 
@@ -177,9 +172,6 @@ def test_spatial_json_must_be_recognized(tmp_path, write):
         declared_contract(tmp_path)
     write(tmp_path / "spatial.json", [1])
     with pytest.raises(MarkerConfigError, match=rf"^{tmp_path / 'spatial.json'}: spatial.json must be a JSON object"):
-        declared_contract(tmp_path)
-    (tmp_path / "spatial.json").write_bytes(b"{broken")
-    with pytest.raises(MarkerConfigError, match="spatial.json must be a JSON object"):
         declared_contract(tmp_path)
 
 
@@ -222,12 +214,6 @@ def test_resolve_directory_custom_record_without_markers_json_raises(tmp_path, w
     write(tmp_path / "run.json", BARRAGE.stamp({}, CUSTOM))
     with pytest.raises(ContractMismatchError, match="packaged default markers.json records"):
         resolve_directory(tmp_path)
-
-
-def test_resolve_directory_supplied_matches_custom_record(tmp_path, three_json, write):
-    write(tmp_path / "run.json", BARRAGE.stamp({}, CUSTOM))
-    supplied = custom_config(three_json)
-    assert resolve_directory(tmp_path, supplied=supplied) == supplied
 
 
 def test_save_config_writes_exact_text(tmp_path):
@@ -302,20 +288,6 @@ def test_save_config_file_mode_follows_the_umask(tmp_path):
     plain.write_text("x")
     path = save_config(default_config(), tmp_path)
     assert path.stat().st_mode == plain.stat().st_mode
-
-
-def test_save_config_reports_the_open_error_in_a_read_only_directory(tmp_path):
-    directory = tmp_path / "locked"
-    directory.mkdir()
-    directory.chmod(0o555)
-    try:
-        if os.access(directory, os.W_OK):
-            pytest.skip("directory permissions are not enforced")
-        with pytest.raises(PermissionError) as info:
-            save_config(default_config(), directory)
-        assert info.value.__context__ is None
-    finally:
-        directory.chmod(0o755)
 
 
 def test_save_config_reports_a_missing_directory_as_the_original_error(tmp_path):

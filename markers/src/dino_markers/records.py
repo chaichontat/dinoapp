@@ -63,7 +63,7 @@ class ArtifactKind:
             return dict(record)
         return {
             **record,
-            **copy.deepcopy(dict(self.legacy_fields)),
+            **copy.deepcopy(self.legacy_fields),
             self.version_key: self.current,
             CONTRACT_FIELD: DEFAULT_CONTRACT.to_json(),
         }
@@ -124,44 +124,39 @@ CONTRACT_FILES: tuple[str, ...] = ("complete.json", "run.json", "spatial.json", 
 _FAMILIES = (("dino-zarr-source-complete-v", PREPARED_SOURCE), ("dino-zarr-barrage-v", BARRAGE))
 
 
-def _read_json(path: Path) -> object:
-    """The decoded JSON value, or None when the file does not decode."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-
-
 def declared_contract(directory: Path) -> MarkerContract | None:
     found: list[tuple[Path, MarkerContract]] = []
-    for name in ("complete.json", "run.json"):
+    for name in ("complete.json", "run.json", "spatial.json"):
         path = directory / name
         if not path.is_file():
             continue
-        record = _read_json(path)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            record = None
         if not isinstance(record, dict):
-            if name == "run.json":
-                raise MarkerConfigError(f"{path}: run.json must be a JSON object")
-            continue
-        artifact = record.get("artifact")
-        kind = next(
-            (
-                family
-                for prefix, family in _FAMILIES
-                if isinstance(artifact, str) and artifact.startswith(prefix)
-            ),
-            None,
-        )
-        if kind is not None:
-            found.append((path, kind.contract(record, where=str(path))))
-        elif CONTRACT_FIELD in record:
-            raise UnsupportedArtifactError(f"{path}: unrecognized record {artifact!r} carries {CONTRACT_FIELD}")
-    path = directory / "spatial.json"
-    if path.is_file():
-        record = _read_json(path)
-        if not isinstance(record, dict):
-            raise MarkerConfigError(f"{path}: spatial.json must be a JSON object")
-        found.append((path, SPATIAL_REVIEW.contract(record, where=str(path))))
+            if name == "complete.json":
+                continue
+            raise MarkerConfigError(f"{path}: {name} must be a JSON object")
+        if name == "spatial.json":
+            kind = SPATIAL_REVIEW
+        else:
+            artifact = record.get("artifact")
+            kind = next(
+                (
+                    family
+                    for prefix, family in _FAMILIES
+                    if isinstance(artifact, str) and artifact.startswith(prefix)
+                ),
+                None,
+            )
+            if kind is None:
+                if CONTRACT_FIELD in record:
+                    raise UnsupportedArtifactError(
+                        f"{path}: unrecognized record {artifact!r} carries {CONTRACT_FIELD}"
+                    )
+                continue
+        found.append((path, kind.contract(record, where=str(path))))
     path = directory / "markers.json"
     if path.is_file():
         found.append((path, load_config(path).contract))

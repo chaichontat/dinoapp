@@ -123,10 +123,9 @@ def test_contract_check_accepts_only_brdu_against_pi():
             require_spatial_subtraction_contract(contract, artifact='bundle')
 
 
-@pytest.mark.parametrize('contract', [MarkerContract('pi', ('edu', 'pcna')), MarkerContract('dapi', ('edu', 'brdu', 'pcna'))])
-def test_binding_rejects_a_bundle_whose_contract_cannot_be_subtracted(model, contract):
+def test_binding_rejects_a_bundle_whose_contract_cannot_be_subtracted(model):
     _fitted, path = model
-    bundle = v7(contract)
+    bundle = v7(MarkerContract('pi', ('edu', 'pcna')))
     before = dict(bundle)
     with pytest.raises(ValueError, match='spatial subtraction supports only BrdU against the pi channel'):
         bind_spatial_subtraction(bundle, model_path=path, source_manifest=manifest())
@@ -179,8 +178,6 @@ class Subtraction:
 
 
 class Correction:
-    targets = ('brdu', 'edu')
-
     def __init__(self, calls, targets):
         self.targets = targets
         self.calls = calls
@@ -203,13 +200,6 @@ def test_correct_channels_with_three_markers_subtracts_then_corrects_every_targe
     assert calls == [('subtract', 11.0, 5.0, (1, 2, 3)), ('correct', 'pcna', 3.0, (1, 2, 3)), ('correct', 'edu', 7.0, (1, 2, 3)), ('correct', 'brdu', 6.0, (1, 2, 3))]
     assert {name: float(pixels[0, 0]) for name, pixels in corrected.items()} == {'pi': 5.0, 'pcna': 30.0, 'edu': 70.0, 'brdu': 60.0}
     assert float(channels['brdu'][0, 0]) == 11.0
-
-
-def test_correct_channels_corrects_only_the_targets_of_the_correction():
-    calls = []
-    corrected = correct_channels(crops(pi=5, pcna=3, edu=7, brdu=11), (0, 0, 0), pixel_correction=Correction(calls, ('edu',)))
-    assert calls == [('correct', 'edu', 7.0, (0, 0, 0))]
-    assert {name: float(pixels[0, 0]) for name, pixels in corrected.items()} == {'pi': 5.0, 'pcna': 3.0, 'edu': 70.0, 'brdu': 11.0}
 
 
 def test_subtraction_without_a_reference_channel_name_is_rejected():

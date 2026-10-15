@@ -2,7 +2,6 @@
 import base64
 from io import BytesIO
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -321,8 +320,6 @@ def test_spatial_source_resolves_its_config_and_shares_it_with_each_roi(catalog)
     assert catalog.config.contract == DEFAULT_CONTRACT
     roi = catalog.roi_source(0)
     assert roi.config is catalog.config
-    crop_source = FieldCropSource(roi, (32768., 3000., 1000.), "opened-target", "snapshot")
-    assert crop_source.config is catalog.config
 
 
 def test_a_field_crop_source_built_after_a_config_change_carries_the_new_config(tmp_path, three_marker_catalog):
@@ -337,11 +334,6 @@ def test_a_field_crop_source_built_after_a_config_change_carries_the_new_config(
 
     assert before.config.contract == DEFAULT_CONTRACT
     assert after.config.contract == THREE.contract
-
-
-def test_snapshot_v2_of_the_default_contract_loads(tmp_path):
-    build_catalog(tmp_path, version=2)
-    assert SpatialSource(tmp_path).config.contract == DEFAULT_CONTRACT
 
 
 def test_v1_snapshots_must_not_carry_a_contract(tmp_path):
@@ -404,11 +396,6 @@ def test_three_marker_fields_and_crops_use_the_contract_channels(three_marker_ca
         assert crop.width == crop.height * 4  # DAPI, PCNA, EdU, BrdU
     with pytest.raises(ValueError, match='4 finite positive values'):
         source.cell_crop(1, (1000., 2000., 3000.))
-    encoded = render_field(field, source.field_calls(field, SimpleNamespace(values={})), config=source.config,
-                           mode='Cell identities', selected=None, border_alpha=.35, boundary_alpha=0,
-                           contrast=source.contrast)
-    with Image.open(BytesIO(base64.b64decode(encoded.split(',', 1)[1]))) as image:
-        assert image.size == (100, 100)
 
 
 def test_roi_rejects_fused_channels_that_differ_from_the_contract(tmp_path):

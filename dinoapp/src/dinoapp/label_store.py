@@ -5,11 +5,8 @@ import fcntl
 from pathlib import Path
 from typing import Literal
 
-import dino_markers
 import pandas as pd
-from dino_markers import MarkerContract, contract_of, require_same_contract, validate_label
-
-Label = dino_markers.Label
+from dino_markers import Label, MarkerContract, contract_of, require_same_contract, validate_label
 
 
 class LabelConflictError(ValueError):

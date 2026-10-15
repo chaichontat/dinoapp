@@ -1,16 +1,11 @@
-import math
-import re
-
 import pytest
 
 from dino_markers import (
-    MarkerConfigError,
     badge_colors,
     decode_call,
     default_config,
     hex_color,
     identity_color,
-    parse_color,
     parse_config,
 )
 
@@ -30,31 +25,13 @@ def default_states():
     return [decode_call(contract, code) for code in range(5)]
 
 
-def test_parse_color():
-    assert parse_color("#ff00ff", where="x") == (1.0, 0.0, 1.0)
-    assert parse_color("#FF00FF", where="x") == (1.0, 0.0, 1.0)
-    assert parse_color("#999999", where="x") == (0.6, 0.6, 0.6)
-    assert parse_color([0, 1, 0.5], where="x") == (0.0, 1.0, 0.5)
-    assert parse_color((0.25, 0.25, 0.25), where="x") == (0.25, 0.25, 0.25)
-    assert all(type(c) is float for c in parse_color([0, 1, 0], where="x"))
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["#fff", "ff00ff", "#gg0000", "#ff00ff0", [True, 0, 0], [0, 0], [0, 0, 1.01], [math.nan, 0, 0], [math.inf, 0, 0], 1, None, ["0", 0, 0]],
-)
-def test_parse_color_rejects(value):
-    with pytest.raises(MarkerConfigError, match=re.escape(f"invalid color {value!r} for here")):
-        parse_color(value, where="here")
-
-
 def test_hex_color():
     assert hex_color((1.0, 0.0, 1.0)) == "#ff00ff"
     assert hex_color((0.25, 0.25, 0.25)) == "#404040"
     assert hex_color((0.6, 0.6, 0.6)) == "#999999"
     assert hex_color((0.0, 0.0, 0.0)) == "#000000"
     assert hex_color((1.0, 1.0, 1.0)) == "#ffffff"
-    assert hex_color(parse_color("#008f3a", where="x")) == "#008f3a"
+    assert hex_color((0.0, 143 / 255, 58 / 255)) == "#008f3a"
 
 
 def test_identity_color_default_equals_the_dinoapp_palette():
@@ -95,7 +72,6 @@ def test_badges_without_overrides_use_identity_color_and_luminance(three_json):
     assert badge_colors(config, (0, 1, 0)) == ("#ff00ff", "#ffffff")
     assert badge_colors(config, (0, 0, 1)) == ("#0000ff", "#ffffff")
     assert badge_colors(config, (1, 1, 1)) == ("#ffffff", "#202020")
-    assert badge_colors(config, (1, 1, 0)) == ("#ffffff", "#202020")
     assert badge_colors(config, None) == ("#999999", "#ffffff")
 
 

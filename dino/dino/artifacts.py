@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 
 
 PARQUET_METADATA_KEY = b"fishtools.dino"
-_SOURCE_SUFFIXES = {".json", ".py", ".toml", ".yaml", ".yml"}
-_IGNORED_PARTS = {".git", ".pytest_cache", "__pycache__"}
 
 
 def _dump_joblib_atomic(value: Any, path: Path) -> None:
@@ -70,33 +68,6 @@ def file_sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
-
-
-def path_sha256(path: Path) -> str:
-    """Hash a model source tree without binding it to its absolute location."""
-
-    if path.is_file():
-        return file_sha256(path)
-    if not path.is_dir():
-        raise FileNotFoundError(f"Expected model source path for SHA-256 digest: {path}")
-
-    files = sorted(
-        candidate
-        for candidate in path.rglob("*")
-        if candidate.is_file()
-        and candidate.suffix in _SOURCE_SUFFIXES
-        and not (_IGNORED_PARTS & set(candidate.relative_to(path).parts))
-    )
-    if not files:
-        raise ValueError(f"No model source files found under {path}")
-
-    digest = hashlib.sha256()
-    for candidate in files:
-        relative = candidate.relative_to(path).as_posix().encode("utf-8")
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(bytes.fromhex(file_sha256(candidate)))
     return digest.hexdigest()
 
 

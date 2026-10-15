@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-from dinoapp.native import AnnotationFiles as AnnotationFiles
 from dinoapp.native import render_field as render_field
 from dinoapp.prod3_2 import FieldSource as CorrectedFieldSource
 

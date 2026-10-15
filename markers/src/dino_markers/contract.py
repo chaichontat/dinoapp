@@ -13,7 +13,6 @@ Label = tuple[int, ...]
 SavedFilter = tuple[int | None, ...]
 
 MAX_MARKERS: int = 7
-CONFIG_FILENAME: str = "markers.json"
 CONTRACT_FIELD: str = "marker_contract"
 RESERVED_KEYS: frozenset[str] = frozenset(
     {

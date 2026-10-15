@@ -14,7 +14,6 @@ from dino_markers import (
     ContractMismatchError,
     Label,
     MarkerConfig,
-    SavedFilter,
     badge_colors,
     decode_call,
     hex_color,
@@ -32,23 +31,23 @@ from dinoapp.native import (
     FieldSource,
     pick_cell,
     prefetch_marker_crop,
-    training_gallery,
     training_miscalls,
 )
 from dinoapp.label_store import LabelConflictError
 from dinoapp.review_session import (
+    EDIT_REJECTED,
     activate_view,
+    cell_draft,
+    draft_label,
     get_active_context,
     remember_widget,
     retire_view,
+    saved_filter_controls,
     widget_key,
     save_assignment as persist_assignment,
     undo_edit as persist_undo,
 )
 from dinoapp.sources import AnnotationFiles
-
-
-EDIT_REJECTED = (LabelConflictError, ContractMismatchError)
 
 
 @st.cache_resource(hash_funcs={type: id})
@@ -266,29 +265,6 @@ def undo_edit(annotations: AnnotationFiles, state_dir: Path, edit) -> None:
 GALLERY_PAGE_SIZE = 24
 
 
-def cell_draft(context: dict, cell: str, saved: Label | None, markers: tuple[str, ...]) -> dict:
-    """Return the displayed cell's draft; other cells' drafts and drafts the saved value left behind are dropped."""
-    drafts = context["drafts"]
-    for other in [name for name in drafts if name != cell]:
-        del drafts[other]
-    draft = drafts.get(cell)
-    if draft is not None and draft["expected"] != saved:
-        context["notice"] = f"{cell} changed on disk; its unsaved marker edits were discarded."
-        draft = None
-    if draft is None:
-        draft = drafts[cell] = {
-            "expected": saved,
-            "values": dict(zip(markers, saved if saved is not None else (None,) * len(markers))),
-        }
-    return draft
-
-
-def draft_label(markers: tuple[str, ...], draft: dict) -> Label | None:
-    """The draft as a complete assignment in contract order, or None while any marker is unset."""
-    values = tuple(draft["values"][key] for key in markers)
-    return None if None in values else values
-
-
 def refresh_gallery_queue(signature: tuple) -> None:
     """Discard only the explicitly refreshed gallery queue."""
     gallery = get_active_context()["native"]["gallery_states"].pop(signature, None)
@@ -466,7 +442,6 @@ def review_gallery(
                         f"Z {source.origin[0] + plane_z * source.scale[0]:.1f} µm"
                     ),
                 )
-            update_gallery_card(card, current, gallery["initial"][cell], config=config)
             cards.append(card)
         pages[current_key] = {"cards": cards, "missing": missing}
     page_data = pages[current_key]
@@ -608,84 +583,6 @@ def review_gallery(
             f"in {edit.path.parent.name}."
         )
     st.rerun()
-
-
-def saved_filter_controls(context: dict, config: MarkerConfig, prefix: str) -> SavedFilter:
-    """One select per marker; "Any" leaves the marker unconstrained."""
-    chosen: dict[str, int | None] = {}
-    for key in config.display_markers:
-        label = config.label(key)
-        options = ("Any", f"{label}+", f"{label}−")
-        name = f"{prefix}:{key}"
-        widget = widget_key(context, name, "Any")
-        if st.session_state[widget] not in options:
-            st.session_state[widget] = context["widgets"][name] = "Any"
-        selected = st.selectbox(label, options, key=widget, on_change=remember_widget, args=(context, name))
-        chosen[key] = None if selected == "Any" else int(selected.endswith("+"))
-    return tuple(chosen[key] for key in config.contract.markers)
-
-
-def review_marker_gallery(
-    source: FieldSource,
-    paths: tuple[Path, ...],
-    state_dir: Path,
-    marker: str,
-) -> None:
-    """Rapidly toggle one marker in a stable snapshot of labeled cell crops."""
-    config = source.config
-    marker_name = config.label(marker)
-    others = ", ".join(config.label(key) for key in config.display_markers if key != marker)
-    context = get_active_context()
-    annotations = AnnotationFiles(paths, source.default_annotation_path, contract=config.contract)
-    with st.sidebar:
-        st.header(f"{marker_name} correction gallery")
-        split_name = st.selectbox(
-            "Examples",
-            ("Training", "Validation", "All labeled"),
-            index=2,
-            key=widget_key(context, "gallery_split", 'All labeled'), on_change=remember_widget, args=(context, "gallery_split"),
-        )
-        identity = saved_filter_controls(context, config, "gallery_saved")
-        st.caption(
-            "Matches use the current saved labels. The queue stays fixed while you edit."
-        )
-    split = {"Training": "training", "Validation": "validation", "All labeled": "all"}[
-        split_name
-    ]
-    signature = (marker, split, identity)
-    with st.sidebar:
-        if st.button("Refresh matches", width="stretch"):
-            refresh_gallery_queue(signature)
-            st.rerun()
-
-    gallery_states = context["native"]["gallery_states"]
-    if signature not in gallery_states:
-        matches = training_gallery(
-            source.training_predictions,
-            annotations.values,
-            contract=config.contract,
-            split=split,
-            identity=identity,
-        )
-        gallery = new_gallery_state(
-            matches, annotations, kind="toggle", crop_kind=marker
-        )
-        gallery.update(marker=marker, split=split, identity=identity)
-        gallery_states[signature] = gallery
-    review_gallery(
-        source,
-        annotations,
-        state_dir,
-        gallery_states[signature],
-        title=f"{marker_name} correction gallery",
-        caption=(
-            f"Click a crop to flip {marker_name}"
-            + (f" while keeping {others} unchanged. " if others else ". ")
-            + "Each filter keeps its loaded crops until you refresh its matches."
-        ),
-        group_label=f"{marker_name} correction cells",
-        empty_message="No cells match this saved state.",
-    )
 
 
 def review_training_miscalls(
@@ -907,8 +804,7 @@ def review_field(
             draft["values"][key] = choice
     value = draft_label(contract.markers, draft) if draft is not None else None
     if actions[len(markers)].button("Save", disabled=value is None, width="stretch", key=f"field-save:{view_token}"):
-        saved = annotations.values.get(cell)
-        if value != saved:
+        if value != annotations.values.get(cell):
             try:
                 edit = save_assignment(
                     annotations,

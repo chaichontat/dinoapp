@@ -12,17 +12,21 @@ import streamlit as st
 from dino_markers import (
     CONTRACT_FIELD,
     DEFAULT_CONTRACT,
+    ContractMismatchError,
+    MarkerConfig,
     MarkerConfigError,
     MarkerContract,
     MissingContractError,
+    SavedFilter,
     UnsupportedArtifactError,
     require_same_contract,
 )
 
-from dinoapp.label_store import Label
+from dinoapp.label_store import Label, LabelConflictError
 from dinoapp.sources import AnnotationFiles, Edit
 
 JOURNAL_SCHEMA = "dino-review-journal-v1"
+EDIT_REJECTED = (LabelConflictError, ContractMismatchError)
 
 
 def get_context(source_id: str) -> dict[str, Any]:
@@ -63,16 +67,6 @@ def retire_active_view() -> None:
         retire_view(get_context(target_id))
 
 
-def _cancel_prefetches(context: dict[str, Any]) -> None:
-    for gallery in context["galleries"].values():
-        for future in gallery["prefetches"].values():
-            future.cancel()
-    for gallery in context["native"]["gallery_states"].values():
-        for futures in gallery["prefetches"].values():
-            for future in futures:
-                future.cancel()
-
-
 def activate_target(target_id: str, *, revision: str, contract: MarkerContract) -> dict[str, Any]:
     """Bind annotation ownership separately from model and display revisions.
 
@@ -81,14 +75,19 @@ def activate_target(target_id: str, *, revision: str, contract: MarkerContract) 
     """
     context = get_context(target_id)
     changed_contract = context["contract"] is not None and context["contract"] != contract
+    changed_revision = not changed_contract and context["revision"] is not None and context["revision"] != revision
+    if changed_contract or changed_revision:
+        for gallery in context["galleries"].values():
+            for future in gallery["prefetches"].values():
+                future.cancel()
+        for gallery in context["native"]["gallery_states"].values():
+            for futures in gallery["prefetches"].values():
+                for future in futures:
+                    future.cancel()
     if changed_contract:
-        _cancel_prefetches(context)
         del st.session_state["review_contexts"][target_id]
         context = get_context(target_id)
-    changed_target = st.session_state.get("review_target_id") != target_id
-    changed_revision = context["revision"] is not None and context["revision"] != revision
-    if changed_revision:
-        _cancel_prefetches(context)
+    elif changed_revision:
         context["galleries"].clear()
         context["cell_queues"].clear()
         for key in ("active_field", "field_crop_source", "focus_cell", "crop_return"):
@@ -99,6 +98,7 @@ def activate_target(target_id: str, *, revision: str, contract: MarkerContract) 
         context["native"]["field_token"] = None
         context["native"]["selection"] = None
         context["native"]["selections"].clear()
+    changed_target = st.session_state.get("review_target_id") != target_id
     if changed_target or changed_revision or changed_contract:
         retire_view(context)
     context["revision"] = revision
@@ -132,6 +132,46 @@ def widget_key(context: dict[str, Any], name: str, default: object) -> str:
 def remember_widget(context: dict[str, Any], name: str) -> None:
     context["widgets"][name] = st.session_state[f"review:{context['session_id']}:{name}"]
     retire_view(context)
+
+
+def saved_filter_controls(context: dict[str, Any], config: MarkerConfig, prefix: str) -> SavedFilter:
+    """One select per marker; "Any" leaves the marker unconstrained."""
+    chosen: dict[str, int | None] = {}
+    for key in config.display_markers:
+        label = config.label(key)
+        options = ("Any", f"{label}+", f"{label}−")
+        name = f"{prefix}:{key}"
+        widget = widget_key(context, name, "Any")
+        if st.session_state[widget] not in options:
+            st.session_state[widget] = context["widgets"][name] = "Any"
+        selected = st.selectbox(label, options, key=widget, on_change=remember_widget, args=(context, name))
+        chosen[key] = None if selected == "Any" else int(selected.endswith("+"))
+    return tuple(chosen[key] for key in config.contract.markers)
+
+
+def cell_draft(
+    context: dict[str, Any], cell: str, saved: Label | None, markers: tuple[str, ...]
+) -> dict[str, Any]:
+    """Return the displayed cell's draft; other cells' drafts and drafts the saved value left behind are dropped."""
+    drafts = context["drafts"]
+    for other in [name for name in drafts if name != cell]:
+        del drafts[other]
+    draft = drafts.get(cell)
+    if draft is not None and draft["expected"] != saved:
+        context["notice"] = f"{cell} changed on disk; its unsaved marker edits were discarded."
+        draft = None
+    if draft is None:
+        draft = drafts[cell] = {
+            "expected": saved,
+            "values": dict(zip(markers, saved if saved is not None else (None,) * len(markers))),
+        }
+    return draft
+
+
+def draft_label(markers: tuple[str, ...], draft: dict[str, Any]) -> Label | None:
+    """The draft as a complete assignment in contract order, or None while any marker is unset."""
+    values = tuple(draft["values"][key] for key in markers)
+    return None if None in values else values
 
 
 def navigate(context: dict[str, Any], scope: str, view: str) -> None:

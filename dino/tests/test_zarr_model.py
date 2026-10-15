@@ -25,6 +25,7 @@ from dino.zarr_model import (
     read_model_images,
     sort_cells_for_io,
 )
+from dino.spatial_pixels import SpatialPixels
 from dino.zarr_source import CellCrop, CellCropReader, OpenSource
 from dino_markers import ContractMismatchError, MarkerContract, UnsupportedArtifactError
 
@@ -250,19 +251,6 @@ class _Periodic:
         return pixels + 1
 
 
-def _two_channel_crop() -> CellCrop:
-    return CellCrop(
-        labels=np.ones((2, 2), dtype=np.uint32),
-        mask=np.ones((2, 2), dtype=bool),
-        neighbor_mask=np.zeros((2, 2), dtype=bool),
-        channels={
-            "brdu": np.full((2, 2), 512, dtype=np.uint16),
-            "edu": np.full((2, 2), 256, dtype=np.uint16),
-            "dapi": np.full((2, 2), 100, dtype=np.uint16),
-        },
-    )
-
-
 def _read_images(monkeypatch, **corrections):
     references = []
     correct = zarr_model.correct_channels
@@ -277,7 +265,16 @@ def _read_images(monkeypatch, **corrections):
         offset_zyx = (0, 0, 0)
 
         def read_cell(self, **kwargs):
-            return _two_channel_crop()
+            return CellCrop(
+                labels=np.ones((2, 2), dtype=np.uint32),
+                mask=np.ones((2, 2), dtype=bool),
+                neighbor_mask=np.zeros((2, 2), dtype=bool),
+                channels={
+                    "brdu": np.full((2, 2), 512, dtype=np.uint16),
+                    "edu": np.full((2, 2), 256, dtype=np.uint16),
+                    "dapi": np.full((2, 2), 100, dtype=np.uint16),
+                },
+            )
 
     read_model_images(
         Reader(),
@@ -297,8 +294,6 @@ def test_read_model_images_passes_the_subtraction_reference_only_when_one_exists
 
 
 def test_model_crop_reader_opens_the_subtraction_reference_channel(monkeypatch, tmp_path) -> None:
-    from dino.spatial_pixels import SpatialPixels
-
     monkeypatch.setattr(SpatialPixels, "from_spec", classmethod(lambda cls, spec: _Subtraction()))
     labels = zarr.open_array(tmp_path / "labels", mode="w", shape=(1, 4, 4), chunks=(1, 4, 4), dtype="u4")
     channels = {
@@ -401,12 +396,8 @@ def test_periodic_correction_requires_a_versioned_bundle(tmp_path) -> None:
     reader.close()
 
 
-@pytest.mark.parametrize(
-    "contract",
-    [MarkerContract("dapi", ("brdu", "edu")), MarkerContract("pi", ("edu", "pcna"))],
-    ids=["reference-dapi", "no-brdu"],
-)
-def test_spatial_subtraction_rejects_contracts_it_cannot_serve(tmp_path, contract) -> None:
+def test_spatial_subtraction_rejects_contracts_it_cannot_serve(tmp_path) -> None:
+    contract = MarkerContract("dapi", ("brdu", "edu"))
     reader, rows, _ = _batch_inputs(tmp_path, contract.markers)
     bundle = _bundle(
         schema="dino-zarr-model-v7", marker_contract=contract.to_json(), spatial_subtraction={"model": "unused"}

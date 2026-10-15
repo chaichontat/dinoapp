@@ -28,7 +28,7 @@ from dino.workspace_inputs import (
     resolve_workspace_root,
 )
 from dino.cell_dino import build_cell_transform, installed_dinov2_source
-from dino.zarr_model import load_cell_dino_model
+from dino.zarr_model import MODEL_INPUT_CHANNELS, load_cell_dino_model
 from fishtools.brdu.model import load_barrage_training_table
 from fishtools.io.workspace import Workspace
 from fishtools.segment.cell_thumbnail import cell_thumbnail_from_fused
@@ -38,11 +38,6 @@ FUSED_ZARR_NAME = "fused.zarr"
 C_POWER_RANGE = np.linspace(-6.0, 5.0, 45)
 UINT16_TO_UINT8_SCALE = 256.0
 FEATURE_CACHE_VERSION = "v3_cell_dino_content_bound"
-
-MODEL_INPUT_CHANNELS = {
-    "cell_dino_cp_vits8": 5,
-    "cell_dino_hpa_vitl16": 4,
-}
 
 
 @dataclass(frozen=True)
@@ -390,10 +385,6 @@ def _best_logreg_for_target_cv(
     return best_c, best_accuracy, n_splits
 
 
-def _make_split_tables(train: pd.DataFrame, *, cfg: TrainConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return split_training_rows(train, markers=DEFAULT_CONTRACT.markers, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed)
-
-
 def main() -> None:
     cfg = _parse_args()
     torch.manual_seed(cfg.seed)
@@ -404,7 +395,9 @@ def main() -> None:
     if len(train_table) < 8:
         raise ValueError(f"Need more labeled rows to fit/train split, got {len(train_table)}")
 
-    train_rows, test_rows = _make_split_tables(train_table, cfg=cfg)
+    train_rows, test_rows = split_training_rows(
+        train_table, markers=DEFAULT_CONTRACT.markers, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed
+    )
     logger.info(
         f"Using labeled barrage rows: train={len(train_rows)} (CV), test={len(test_rows)}, cv_folds={cfg.cv_folds}"
     )

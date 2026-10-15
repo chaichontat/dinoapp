@@ -108,7 +108,6 @@ Label = tuple[int, ...]              # one 0/1 per contract marker, contract ord
 SavedFilter = tuple[int | None, ...] # one entry per contract marker; None matches 0 or 1
 
 MAX_MARKERS: int = 7
-CONFIG_FILENAME: str = "markers.json"
 CONTRACT_FIELD: str = "marker_contract"
 RESERVED_KEYS: frozenset[str] = frozenset({
     "cell", "combined", "rank", "dataset", "roi", "label", "x", "y", "z",
@@ -354,7 +353,6 @@ A call code is the binary number of the label with the first contract marker as 
 ### 1.9 Colors and the field composite (`colors.py`)
 
 ```python
-def parse_color(value: object, *, where: str) -> RGB
 def hex_color(rgb: RGB) -> str                                    # "#%02x%02x%02x" of round(c * 255)
 def identity_color(config: MarkerConfig, value: Label | None) -> RGB
 def badge_colors(config: MarkerConfig, value: Label | None) -> tuple[str, str]   # (background, foreground) hex

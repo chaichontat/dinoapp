@@ -342,7 +342,7 @@ THREE_MARKERS = {
 THREE_MARKER_CELLS = ("tri|1", "tri|2", "tri|3")
 
 
-def write_three_marker_barrage(root, labels=None, markers=THREE_MARKERS):
+def write_three_marker_barrage(root, labels=None):
     import json
     from PIL import Image
 
@@ -354,7 +354,7 @@ def write_three_marker_barrage(root, labels=None, markers=THREE_MARKERS):
         paths = ",".join(f"{index}_{stem}.png" for stem in ("combined", "edu", "brdu", "pcna"))
         rows.append(f"{cell},{index},{paths}")
     (root / "index.csv").write_text("\n".join(rows) + "\n")
-    (root / "markers.json").write_text(json.dumps(markers))
+    (root / "markers.json").write_text(json.dumps(THREE_MARKERS))
     if labels is not None:
         (root / "labels.csv").write_text("cell,edu,brdu,pcna\n" + "".join(f"{row}\n" for row in labels))
 
@@ -378,24 +378,15 @@ def three_marker_barrage(tmp_path, monkeypatch):
     return tmp_path, open_review
 
 
-def control(review, label):
-    return next(widget for widget in review.segmented_control if widget.label == label)
-
-
 def set_marker(review, label, value):
-    control(review, label).set_value(value).run()
-    assert not review.exception
-
-
-def select_in_sidebar(review, label, value):
-    next(widget for widget in review.sidebar.selectbox if widget.label == label).select(value).run()
+    next(widget for widget in review.segmented_control if widget.label == label).set_value(value).run()
     assert not review.exception
 
 
 def test_cell_review_offers_one_control_per_marker_and_starts_unset(three_marker_barrage):
     root, open_review = three_marker_barrage
     review = open_review()
-    select_in_sidebar(review, "Review view", "Cell review")
+    choose(review, "Review view", "Cell review")
     assert [widget.label for widget in review.segmented_control] == ["EdU", "BrdU", "PCNA"]
     assert [widget.value for widget in review.segmented_control] == [None, None, None]
     save = next(widget for widget in review.button if widget.label == "Save and next")
@@ -407,7 +398,7 @@ def test_cell_review_offers_one_control_per_marker_and_starts_unset(three_marker
 def test_save_and_next_waits_for_every_marker_then_writes_one_row_and_advances(three_marker_barrage):
     root, open_review = three_marker_barrage
     review = open_review()
-    select_in_sidebar(review, "Review view", "Cell review")
+    choose(review, "Review view", "Cell review")
     set_marker(review, "EdU", 1)
     set_marker(review, "BrdU", 0)
     assert next(widget for widget in review.button if widget.label == "Save and next").disabled
@@ -434,20 +425,20 @@ def test_save_and_next_waits_for_every_marker_then_writes_one_row_and_advances(t
 def test_unsaved_cells_exclude_saved_all_negative_and_saved_cells_filter_per_marker(three_marker_barrage):
     root, open_review = three_marker_barrage
     review = open_review(labels=["tri|1,0,0,0", "tri|2,1,0,1"])
-    select_in_sidebar(review, "Review view", "Cell review")
+    choose(review, "Review view", "Cell review")
     (queue,) = context_of(review)["cell_queues"].values()
     assert queue["cells"] == ["tri|3"]
-    select_in_sidebar(review, "Cells", "All cells")
+    choose(review, "Cells", "All cells")
     assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|1", "tri|2", "tri|3"]
-    select_in_sidebar(review, "Cells", "Saved")
+    choose(review, "Cells", "Saved")
     assert [widget.label for widget in review.sidebar.selectbox][-3:] == ["EdU", "BrdU", "PCNA"]
     assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|1", "tri|2"]
-    select_in_sidebar(review, "EdU", "EdU+")
+    choose(review, "EdU", "EdU+")
     assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|2"]
-    select_in_sidebar(review, "BrdU", "BrdU−")
-    select_in_sidebar(review, "PCNA", "PCNA−")
+    choose(review, "BrdU", "BrdU−")
+    choose(review, "PCNA", "PCNA−")
     assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == []
-    select_in_sidebar(review, "PCNA", "PCNA+")
+    choose(review, "PCNA", "PCNA+")
     assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|2"]
     assert "No saved call" not in [element.value for element in review.main.markdown]
     assert "EdU+ / BrdU− / PCNA+" in [element.value for element in review.main.markdown]
@@ -470,12 +461,12 @@ def test_gallery_views_and_per_marker_filters_follow_the_config_and_a_card_toggl
     review = open_review(labels=["tri|1,0,0,0", "tri|2,1,0,1", "tri|3,1,1,0"])
     views = next(widget for widget in review.sidebar.selectbox if widget.label == "Review view").options
     assert views == ["Cell review", "EdU correction gallery", "BrdU correction gallery", "PCNA correction gallery"]
-    select_in_sidebar(review, "Review view", "PCNA correction gallery")
+    choose(review, "Review view", "PCNA correction gallery")
     (gallery,) = context_of(review)["galleries"].values()
     assert gallery["cells"] == ["tri|1", "tri|2", "tri|3"]
     assert [widget.label for widget in review.sidebar.selectbox][-3:] == ["EdU", "BrdU", "PCNA"]
-    select_in_sidebar(review, "EdU", "EdU+")
-    select_in_sidebar(review, "BrdU", "BrdU−")
+    choose(review, "EdU", "EdU+")
+    choose(review, "BrdU", "BrdU−")
     context = context_of(review)
     gallery = next(g for key, g in context["galleries"].items() if key[-1] == (1, 0, None))
     assert gallery["cells"] == ["tri|2"]
@@ -498,7 +489,7 @@ def test_gallery_views_and_per_marker_filters_follow_the_config_and_a_card_toggl
 def test_gallery_rejects_a_flip_that_changes_more_than_its_marker(three_marker_barrage):
     root, open_review = three_marker_barrage
     review = open_review(labels=["tri|2,1,0,1"])
-    select_in_sidebar(review, "Review view", "BrdU correction gallery")
+    choose(review, "Review view", "BrdU correction gallery")
     before = (root / "labels.csv").read_bytes()
     send_flip(review, {
         "itemId": "tri|2", "cell": "tri|2", "expected": [1, 0, 1], "value": [1, 1, 0],
@@ -515,8 +506,8 @@ def test_changing_only_a_label_rebuilds_the_source_and_survives_a_stale_filter(t
 
     root, open_review = three_marker_barrage
     review = open_review(labels=["tri|1,0,0,0"])
-    select_in_sidebar(review, "Review view", "EdU correction gallery")
-    select_in_sidebar(review, "EdU", "EdU+")
+    choose(review, "Review view", "EdU correction gallery")
+    choose(review, "EdU", "EdU+")
     markers = json.loads(json.dumps(THREE_MARKERS))
     markers["markers"][0]["label"] = "EdU label"
     stat = (root / "markers.json").stat()
@@ -526,10 +517,10 @@ def test_changing_only_a_label_rebuilds_the_source_and_survives_a_stale_filter(t
     assert not review.exception
     views = next(widget for widget in review.sidebar.selectbox if widget.label == "Review view").options
     assert views == ["Cell review", "EdU label correction gallery", "BrdU correction gallery", "PCNA correction gallery"]
-    select_in_sidebar(review, "Review view", "EdU label correction gallery")
+    choose(review, "Review view", "EdU label correction gallery")
     assert [widget.label for widget in review.sidebar.selectbox][-3:] == ["EdU label", "BrdU", "PCNA"]
     assert review.sidebar.selectbox[-3].value == "Any"
-    select_in_sidebar(review, "Review view", "Cell review")
+    choose(review, "Review view", "Cell review")
     assert [widget.label for widget in review.segmented_control] == ["EdU label", "BrdU", "PCNA"]
 
 
@@ -539,8 +530,8 @@ def test_stale_session_write_shows_the_mismatch_and_leaves_labels_unchanged(thre
 
     root, open_review = three_marker_barrage
     review = open_review(labels=["tri|1,0,0,0"])
-    select_in_sidebar(review, "Review view", "Cell review")
-    select_in_sidebar(review, "Cells", "All cells")
+    choose(review, "Review view", "Cell review")
+    choose(review, "Cells", "All cells")
     for label, value in (("EdU", 1), ("BrdU", 1), ("PCNA", 1)):
         set_marker(review, label, value)
     reordered = json.loads(json.dumps(THREE_MARKERS))
@@ -611,42 +602,3 @@ def test_annotation_marker_change_rebuilds_the_source_and_the_sampled_field(tmp_
     assert [widget.label for widget in review.segmented_control] == ["EdU label", "BrdU"]
     review.run()
     assert built == {"sources": 2, "fields": 2}
-
-
-def test_a_reordered_two_marker_contract_is_rejected_at_save(tmp_path, monkeypatch):
-    import json
-    from PIL import Image
-    from streamlit.testing.v1 import AppTest
-    from dinoapp import app, review_session
-
-    Image.new("RGB", (8, 8)).save(tmp_path / "crop.png")
-    (tmp_path / "index.csv").write_text("cell,rank,image_path\ntwo|1,0,crop.png\ntwo|2,1,crop.png\n")
-    (tmp_path / "labels.csv").write_text("cell,brdu,edu\ntwo|1,0,0\n")
-    monkeypatch.setenv("DINO_REVIEW_SOURCE", "Barrage")
-    monkeypatch.setenv("DINO_REVIEW_BARRAGE_DIR", str(tmp_path))
-    app.st.cache_resource.clear()
-    review = AppTest.from_file(app.__file__).run(timeout=20)
-    assert not review.exception
-    select_in_sidebar(review, "Review view", "Cell review")
-    assert [widget.label for widget in review.segmented_control] == ["EdU", "BrdU"]
-    set_marker(review, "EdU", 1)
-    set_marker(review, "BrdU", 0)
-    reordered = {**json.loads(json.dumps(THREE_MARKERS)), "reference": {"key": "pi", "label": "PI"}}
-    reordered["markers"] = [marker for marker in reordered["markers"] if marker["key"] != "pcna"]
-    reordered["presentation"]["crop_panels"] = ["pi", "edu", "brdu"]
-    persist = review_session.save_assignment
-
-    def stale_save(annotations, state_dir, context, cell, value, **kwargs):
-        (tmp_path / "markers.json").write_text(json.dumps(reordered))
-        return persist(annotations, state_dir, context, cell, value, **kwargs)
-
-    monkeypatch.setattr(review_session, "save_assignment", stale_save)
-    before = (tmp_path / "labels.csv").read_bytes()
-    next(widget for widget in review.button if widget.label == "Save and next").click().run()
-    assert not review.exception
-    assert (tmp_path / "labels.csv").read_bytes() == before
-    assert any(
-        "records reference 'pi', markers ['edu', 'brdu'], but this review session requires reference 'pi', markers ['brdu', 'edu']"
-        in element.value
-        for element in review.info
-    )

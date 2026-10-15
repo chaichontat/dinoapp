@@ -153,11 +153,11 @@ def display_inputs(tmp_path, monkeypatch):
         joblib.dump(bundle, path)
         return path
 
-    return source_dir, write_bundle, periodic
+    return source_dir, write_bundle
 
 
 def test_display_pixels_bind_a_bundle_of_the_source_contract(display_inputs):
-    source_dir, write_bundle, _ = display_inputs
+    source_dir, write_bundle = display_inputs
 
     pixels = DisplayPixels(write_bundle(), source_dir)
 
@@ -166,7 +166,7 @@ def test_display_pixels_bind_a_bundle_of_the_source_contract(display_inputs):
 
 
 def test_display_pixels_accept_a_legacy_bundle_of_a_legacy_source(display_inputs):
-    source_dir, write_bundle, _ = display_inputs
+    source_dir, write_bundle = display_inputs
     path = write_bundle()
     bundle = joblib.load(path)
     legacy = {key: value for key, value in bundle.items() if key != 'marker_contract'}
@@ -177,7 +177,7 @@ def test_display_pixels_accept_a_legacy_bundle_of_a_legacy_source(display_inputs
 
 
 def test_display_pixels_reject_a_bundle_whose_reference_is_not_pi(display_inputs):
-    source_dir, write_bundle, _ = display_inputs
+    source_dir, write_bundle = display_inputs
     contract = MarkerContract('dapi', ('brdu', 'edu'))
     config = parse_config({
         'version': 1, 'reference': {'key': 'dapi', 'label': 'DAPI'},
@@ -192,22 +192,8 @@ def test_display_pixels_reject_a_bundle_whose_reference_is_not_pi(display_inputs
         DisplayPixels(write_bundle(contract), source_dir)
 
 
-def test_display_pixels_reject_a_bundle_without_brdu(display_inputs):
-    source_dir, write_bundle, _ = display_inputs
-    config = parse_config({
-        'version': 1, 'reference': {'key': 'pi', 'label': 'PI'},
-        'markers': [{'key': 'edu', 'label': 'EdU', 'color': '#00ff00'}],
-        'presentation': {'crop_panels': ['pi', 'edu'], 'negative_color': [.25, .25, .25],
-                         'uncalled_color': '#999999'},
-    }, source='test')
-    (source_dir / 'markers.json').write_text(json.dumps(config_to_json(config)))
-
-    with pytest.raises(ValueError, match='supports only BrdU against the pi channel'):
-        DisplayPixels(write_bundle(config.contract), source_dir)
-
-
 def test_display_pixels_reject_a_source_with_reordered_markers(display_inputs):
-    source_dir, write_bundle, _ = display_inputs
+    source_dir, write_bundle = display_inputs
     config = parse_config({
         'version': 1, 'reference': {'key': 'pi', 'label': 'PI'},
         'markers': [{'key': 'edu', 'label': 'EdU', 'color': '#00ff00'},
@@ -222,7 +208,7 @@ def test_display_pixels_reject_a_source_with_reordered_markers(display_inputs):
 
 
 def test_display_pixels_reject_periodic_targets_that_reorder_the_markers(tmp_path, display_inputs):
-    source_dir, write_bundle, _ = display_inputs
+    source_dir, write_bundle = display_inputs
     (tmp_path / 'reordered').mkdir()
     _, reordered = build_corrections(tmp_path / 'reordered', ('edu', 'brdu'))
 

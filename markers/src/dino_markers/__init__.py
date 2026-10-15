@@ -11,7 +11,7 @@ from .calls import (
     uncalled_code,
     validate_label,
 )
-from .colors import badge_colors, hex_color, identity_color, parse_color
+from .colors import badge_colors, hex_color, identity_color
 from .config import (
     BadgeColor,
     Channel,
@@ -24,7 +24,6 @@ from .config import (
     parse_config,
 )
 from .contract import (
-    CONFIG_FILENAME,
     CONTRACT_FIELD,
     DEFAULT_CONTRACT,
     MAX_MARKERS,
@@ -83,7 +82,6 @@ __all__ = [
     "BARRAGE",
     "BARRAGE_STATS",
     "CLASSIFIER_METRICS",
-    "CONFIG_FILENAME",
     "CONTRACT_FIELD",
     "CONTRACT_FILES",
     "CORTEX_RESCORE",
@@ -135,7 +133,6 @@ __all__ = [
     "miscall_column",
     "model_key",
     "oof_probability_column",
-    "parse_color",
     "parse_config",
     "positive_count_key",
     "prediction_column",

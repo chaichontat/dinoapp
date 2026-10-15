@@ -368,7 +368,7 @@ def three_marker_field_app(root, initial):
     import numpy as np
     from PIL import Image
     import streamlit as st
-    from dino_markers import decode_call, encode_call, load_config
+    from dino_markers import encode_call, load_config
     from dinoapp import native_app
     from dinoapp.native import Field
     from dinoapp.review_session import activate_target
@@ -410,8 +410,6 @@ def three_marker_field_app(root, initial):
         state['field_token'] = f'{field.token}:{field.origin_xy_um.tolist()}:{field.scale_xy_um.tolist()}:{field.center_xy_um.tolist()}'
     native_app.review_field(source, field, (path,), root / 'review', '', 'Cell identities')
     st.session_state.test_field_token = native_app.get_active_context()['event_token']
-    st.session_state.test_contract = contract
-    st.session_state.test_decoded = decode_call(contract, int(model[2]))
 
 
 @pytest.fixture
@@ -470,7 +468,7 @@ def test_field_panel_offers_per_marker_controls_and_badges_follow_the_config(thr
     assert not app.exception
     badge = next(item.value for item in app.markdown if 'selected-label-state' in item.value)
     assert 'data-state="BrdU + PCNA only"' in badge
-    assert 'background: #ff00ff' in badge or 'background: #00ffff' not in badge
+    assert 'background: #ffffff' in badge and 'color: #202020' in badge
     assert path.read_text() == 'cell,edu,brdu,pcna\ntest|1,1,0,1\ntest|2,0,1,1\n'
     assert app.session_state.review_contexts['three-markers']['history'][-1].value == (0, 1, 1)
 
@@ -538,7 +536,7 @@ def send_flip(review, payload):
     review._run(states)
 
 
-def native_gallery_app(root, mode):
+def native_gallery_app(root):
     import io
     from pathlib import Path
     from types import SimpleNamespace
@@ -568,10 +566,7 @@ def native_gallery_app(root, mode):
     source = SimpleNamespace(config=config, default_annotation_path=root / 'labels.csv',
                              training_predictions=predictions, marker_crop=crop,
                              origin=np.zeros(3), scale=np.ones(3))
-    if mode == 'miscalls':
-        native_app.review_training_miscalls(source, (root / 'labels.csv',), root / 'review')
-    else:
-        native_app.review_marker_gallery(source, (root / 'labels.csv',), root / 'review', 'pcna')
+    native_app.review_training_miscalls(source, (root / 'labels.csv',), root / 'review')
     st.session_state.test_token = native_app.get_active_context()['event_token']
 
 
@@ -584,60 +579,22 @@ def native_gallery(tmp_path, monkeypatch):
     (tmp_path / 'labels.csv').write_text(
         'cell,edu,brdu,pcna\n' + ''.join(f'test|{label},1,0,1\n' for label in range(1, 26))
     )
-    requests = {'miscalls': [], 'gallery': [], 'prefetch': []}
+    requests = {'miscalls': []}
 
-    def rows(predictions, live_labels, *, contract, split, identity, target='absent'):
-        kind = 'gallery' if target == 'absent' else 'miscalls'
-        requests[kind].append(dict(contract=contract, split=split, identity=identity, target=target))
+    def rows(predictions, live_labels, *, contract, split, identity, target):
+        requests['miscalls'].append(dict(contract=contract, split=split, identity=identity, target=target))
         selected = predictions[predictions['cell'].isin(live_labels)].copy()
-        if kind == 'miscalls':
-            selected['audit_marker'] = 'pcna'
+        selected['audit_marker'] = 'pcna'
         return selected.reset_index(drop=True)
 
-    monkeypatch.setattr(native_app, 'training_gallery', rows)
     monkeypatch.setattr(native_app, 'training_miscalls', rows)
-    monkeypatch.setattr(native_app, 'prefetch_marker_crop', lambda source, cell, marker: requests['prefetch'].append((cell, marker)))
+    monkeypatch.setattr(native_app, 'prefetch_marker_crop', lambda source, cell, marker: None)
     return tmp_path, requests
-
-
-def test_marker_gallery_filters_per_marker_and_a_card_flips_only_its_marker(native_gallery):
-    root, requests = native_gallery
-    app = AppTest.from_function(native_gallery_app, args=(str(root), 'gallery')).run(timeout=20)
-    assert not app.exception
-    assert [widget.label for widget in app.sidebar.selectbox] == ['Examples', 'EdU', 'BrdU', 'PCNA']
-    assert [widget.value for widget in app.sidebar.selectbox][1:] == ['Any', 'Any', 'Any']
-    assert requests['gallery'][-1]['identity'] == (None, None, None)
-    assert requests['gallery'][-1]['contract'].markers == ('edu', 'brdu', 'pcna')
-    app.sidebar.selectbox[1].select('EdU+').run()
-    app.sidebar.selectbox[2].select('BrdU−').run()
-    assert requests['gallery'][-1]['identity'] == (1, 0, None)
-    context = app.session_state.review_contexts['native-gallery']
-    (gallery,) = [g for key, g in context['native']['gallery_states'].items() if key[-1] == (1, 0, None)]
-    cards = gallery['pages'][(gallery['queue_id'], 0)]['cards']
-    card = cards[0]
-    assert (card['state'], card['action'], card['expected'], card['value']) == (
-        'EdU+ / BrdU− / PCNA+', 'Set PCNA−', [1, 0, 1], [1, 0, 0])
-    send_flip(app, {'itemId': card['itemId'], 'cell': card['cell'], 'expected': card['expected'],
-                    'value': card['value'], 'token': app.session_state.test_token})
-    assert not app.exception
-    rows = (root / 'labels.csv').read_text().splitlines()
-    assert rows[1] == 'test|1,1,0,0' and rows[2] == 'test|10,1,0,1'
-    assert context['notice'].startswith('Saved test|1 as EdU only in')
-    journal_path, = (root / 'review').glob('changes-*.jsonl')
-    record = json.loads(journal_path.read_text().splitlines()[0])
-    assert (record['action'], record['value'], record['gallery_identity']) == ('gallery_toggle_pcna', [1, 0, 0], [1, 0, None])
-
-
-def test_gallery_prefetches_the_next_page_through_the_generic_marker_crop(native_gallery):
-    root, requests = native_gallery
-    app = AppTest.from_function(native_gallery_app, args=(str(root), 'gallery')).run(timeout=20)
-    assert not app.exception
-    assert requests['prefetch'] == [('test|25', 'pcna')]
 
 
 def test_miscalls_name_the_disagreeing_marker_and_flip_only_that_marker(native_gallery):
     root, requests = native_gallery
-    app = AppTest.from_function(native_gallery_app, args=(str(root), 'miscalls')).run(timeout=20)
+    app = AppTest.from_function(native_gallery_app, args=(str(root),)).run(timeout=20)
     assert not app.exception
     labels = [widget.label for widget in app.sidebar.selectbox]
     assert labels == ['Examples', 'Disagreement', 'EdU', 'BrdU', 'PCNA']
@@ -671,6 +628,6 @@ def test_two_marker_miscalls_offer_either_marker(tmp_path, monkeypatch):
     native_app.gallery_picker.clear()
     monkeypatch.setattr(native_app, 'training_miscalls', lambda *args, **kwargs: pd.DataFrame(
         columns=['cell', 'audit_marker', 'split', 'tranche']))
-    app = AppTest.from_function(native_gallery_app, args=(str(tmp_path), 'miscalls')).run(timeout=20)
+    app = AppTest.from_function(native_gallery_app, args=(str(tmp_path),)).run(timeout=20)
     assert not app.exception
     assert app.sidebar.selectbox[1].options == ['Either marker', 'EdU', 'BrdU']

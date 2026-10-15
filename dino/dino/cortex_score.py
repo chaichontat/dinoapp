@@ -224,34 +224,36 @@ def score_cortex(
     cortex = load_cortex_lookup(cortex_props)
     labeled = set(pd.read_csv(labeled_cells, usecols=["cell"])["cell"].astype(str))
     mode = str(bundle.get("classifier_feature_mode", "marker"))
-    fields = {
-        "model": str(model.resolve()),
-        "model_sha256": file_sha256(model),
-        "embedding_model": str(embedding_model.resolve()),
-        "embedding_model_sha256": embedding_model_sha256,
-        "embedding_run": str(embedding_run.resolve()),
-        "cortex_props": str(cortex_props.resolve()),
-        "cortex_props_sha256": file_sha256(cortex_props),
-        "labeled_cells": str(labeled_cells.resolve()),
-        "labeled_cells_sha256": file_sha256(labeled_cells),
-        "excluded_labeled_cells": len(labeled),
-        "source_sha256": str(bundle["source_sha256"]),
-        "model_schema": str(bundle["schema"]),
-        "embedding_dimension": EMBEDDING_WIDTH,
-        "classifier_embedding_dimension": EMBEDDING_WIDTH if mode == "marker" else EMBEDDING_WIDTH * len(markers),
-        "classifier_feature_count": int(bundle[scaler_key(markers[0])].n_features_in_),
-        "classifier_feature_mode": mode,
-        "embedding_pca_components": None,
-        "context_features": list(bundle["context_features"]),
-        "intensity_props": bundle["intensity_props"],
-        "intensity_props_sha256": bundle["intensity_props_sha256"],
-        "dapi_props": bundle.get("dapi_props"),
-        "dapi_props_sha256": bundle.get("dapi_props_sha256"),
-        "intensity_neighbors": int(bundle["intensity_neighbors"]),
-        "classifier_feature_schema": str(bundle["schema"]),
-        **{cutoff_key(marker): float(bundle[cutoff_key(marker)]) for marker in markers},
-    }
-    expected = CORTEX_RESCORE.stamp(fields, contract)
+    expected = CORTEX_RESCORE.stamp(
+        {
+            "model": str(model.resolve()),
+            "model_sha256": file_sha256(model),
+            "embedding_model": str(embedding_model.resolve()),
+            "embedding_model_sha256": embedding_model_sha256,
+            "embedding_run": str(embedding_run.resolve()),
+            "cortex_props": str(cortex_props.resolve()),
+            "cortex_props_sha256": file_sha256(cortex_props),
+            "labeled_cells": str(labeled_cells.resolve()),
+            "labeled_cells_sha256": file_sha256(labeled_cells),
+            "excluded_labeled_cells": len(labeled),
+            "source_sha256": str(bundle["source_sha256"]),
+            "model_schema": str(bundle["schema"]),
+            "embedding_dimension": EMBEDDING_WIDTH,
+            "classifier_embedding_dimension": EMBEDDING_WIDTH if mode == "marker" else EMBEDDING_WIDTH * len(markers),
+            "classifier_feature_count": int(bundle[scaler_key(markers[0])].n_features_in_),
+            "classifier_feature_mode": mode,
+            "embedding_pca_components": None,
+            "context_features": list(bundle["context_features"]),
+            "intensity_props": bundle["intensity_props"],
+            "intensity_props_sha256": bundle["intensity_props_sha256"],
+            "dapi_props": bundle.get("dapi_props"),
+            "dapi_props_sha256": bundle.get("dapi_props_sha256"),
+            "intensity_neighbors": int(bundle["intensity_neighbors"]),
+            "classifier_feature_schema": str(bundle["schema"]),
+            **{cutoff_key(marker): float(bundle[cutoff_key(marker)]) for marker in markers},
+        },
+        contract,
+    )
     tasks = _partitions(
         embedding_run, source_sha256=str(bundle["source_sha256"]), model_sha256=embedding_model_sha256,
         contract=contract,
@@ -264,7 +266,7 @@ def score_cortex(
         recorded = json.loads(complete_path.read_text())
         recorded_from = complete_path
     else:
-        recorded_from = next(iter(sorted(prediction_dir.glob("*.parquet"))), None)
+        recorded_from = min(prediction_dir.glob("*.parquet"), default=None)
         recorded = read_parquet_artifact(recorded_from)[0] if recorded_from is not None else None
     if recorded is None:
         run_record = expected

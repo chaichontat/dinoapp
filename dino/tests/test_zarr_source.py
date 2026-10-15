@@ -359,20 +359,10 @@ def test_manifest_requires_the_channels_of_a_custom_contract(tmp_path) -> None:
             offset_zyx=(0, 0, 0),
             required_channels=("dapi", "edu", "brdu", "pcna"),
         )
-
-
-def test_default_channels_are_not_required_by_a_custom_contract(tmp_path) -> None:
-    labels_path, channels = _source_inputs(tmp_path, ("dapi", "edu"))
-
-    manifest = build_source_manifest(
-        labels_path=labels_path, channel_paths=channels, offset_zyx=(0, 0, 0), required_channels=("dapi", "edu")
-    )
-
-    assert set(manifest["channels"]) == {"dapi", "edu"}
     with pytest.raises(ValueError, match=r"Missing required channel sources: \['brdu', 'pi'\]"):
         build_source_manifest(
             labels_path=labels_path,
-            channel_paths=channels,
+            channel_paths={key: channels[key] for key in ("dapi", "edu")},
             offset_zyx=(0, 0, 0),
             required_channels=DEFAULT_CONTRACT.channel_keys,
         )

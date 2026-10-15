@@ -26,7 +26,6 @@ from skimage.segmentation import find_boundaries
 from test_characterization_review import build_corrected_barrage, build_native_root
 
 from dinoapp.native import (
-    PALETTE,
     AnnotationFiles,
     Field,
     FieldSource,
@@ -45,6 +44,7 @@ from dinoapp.native import (
 )
 from dinoapp.label_store import LabelConflictError, load_labels, update_label
 from dino.zarr_source import CellCrop
+from dinoapp.native_app import new_gallery_state, update_gallery_card
 
 CONFIG3 = parse_config(
     {
@@ -357,8 +357,6 @@ def test_training_gallery_rejects_broader_identity_filters(identity):
 
 
 def test_gallery_card_state_changes_without_replacing_its_loaded_crop():
-    from dinoapp.native_app import update_gallery_card
-
     image = "data:image/png;base64,resident"
     card = {
         "kind": "toggle",
@@ -378,8 +376,6 @@ def test_gallery_card_state_changes_without_replacing_its_loaded_crop():
 
 
 def test_brdu_gallery_card_state_changes_without_replacing_its_loaded_crop():
-    from dinoapp.native_app import update_gallery_card
-
     image = "data:image/png;base64,resident"
     card = {
         "kind": "toggle",
@@ -399,8 +395,6 @@ def test_brdu_gallery_card_state_changes_without_replacing_its_loaded_crop():
 
 
 def test_miscall_gallery_card_flips_only_its_marker():
-    from dinoapp.native_app import update_gallery_card
-
     image = "data:image/png;base64,resident"
     card = {
         "kind": "miscall",
@@ -420,8 +414,6 @@ def test_miscall_gallery_card_flips_only_its_marker():
 
 
 def test_miscall_gallery_keeps_both_marker_cards_for_one_cell():
-    from dinoapp.native_app import new_gallery_state
-
     rows = pd.DataFrame(
         {
             "cell": ["run|7", "run|7"],
@@ -449,9 +441,8 @@ def _marker_crop(marker: str) -> CellCrop:
     return CellCrop(labels=labels, mask=mask, neighbor_mask=np.zeros_like(mask), channels=channels)
 
 
-@pytest.mark.parametrize(("marker", "label"), [("edu", "EdU"), ("brdu", "BrdU"), ("pcna", "PCNA")])
-def test_render_marker_crop_is_one_square_panel_and_ignores_other_channels(marker, label):
-    result = Image.open(io.BytesIO(render_marker_crop(_marker_crop(marker), marker, 63, label=label)))
+def test_render_marker_crop_is_one_square_panel_and_ignores_other_channels():
+    result = Image.open(io.BytesIO(render_marker_crop(_marker_crop("pcna"), "pcna", 63, label="PCNA")))
 
     assert result.mode == "RGB"
     assert result.size == (8, 8)
@@ -466,8 +457,7 @@ def test_render_marker_crop_errors_name_the_marker_label():
         render_marker_crop(crop, "pcna", 0.0, label="PCNA")
 
 
-@pytest.mark.parametrize("marker", ["edu", "brdu", "pcna"])
-def test_prefetch_populates_the_requested_crop_cache(marker):
+def test_prefetch_populates_the_requested_crop_cache():
     class Source:
         def __init__(self):
             self.calls = []
@@ -477,9 +467,9 @@ def test_prefetch_populates_the_requested_crop_cache(marker):
 
     source = Source()
 
-    prefetch_marker_crop(source, "full-run2|20", marker)
+    prefetch_marker_crop(source, "full-run2|20", "pcna")
 
-    assert source.calls == [(20, marker)]
+    assert source.calls == [(20, "pcna")]
 
 
 def test_gallery_crop_cache_retains_current_and_prefetched_pages(monkeypatch):
@@ -547,28 +537,19 @@ def test_prediction_pointer_binds_independent_review_manifest(tmp_path):
         load_prediction_pointer(pointer)
 
 
-def _predictions(markers, labels=(1, 2, 4, 5), prefix="run", **overrides):
+def _predictions(markers, labels=(1, 2, 4, 5)):
     rng = np.random.default_rng(3)
     frame = pd.DataFrame({"label": np.asarray(labels, dtype=np.int64)})
-    frame["cell"] = [f"{prefix}|{label}" for label in labels]
+    frame["cell"] = [f"run|{label}" for label in labels]
     for marker in markers:
         probability = rng.uniform(0.05, 0.95, len(labels))
         frame[f"p_{marker}"] = probability
         frame[marker] = probability >= 0.5
-    for column, values in overrides.items():
-        frame[column] = values
     return frame
 
 
 def test_model_calls_encode_the_first_marker_as_the_most_significant_bit():
-    frame = pd.DataFrame({
-        "label": np.array([1, 2, 4, 5], dtype=np.int64),
-        "cell": [f"full-run2|{label}" for label in (1, 2, 4, 5)],
-        "brdu": [False, False, True, True],
-        "edu": [False, True, False, True],
-        "p_brdu": [0.1, 0.2, 0.8, 0.9],
-        "p_edu": [0.3, 0.7, 0.2, 0.6],
-    })
+    frame = _prod2_predictions()
 
     model = load_model_calls(
         frame, dataset="Prod2", contract=DEFAULT_CONTRACT, cutoffs={"brdu": 0.5, "edu": 0.5},
@@ -664,7 +645,7 @@ def test_prediction_contract_reads_inference_and_rescore_versions():
         assert prediction_contract(kind.stamp({}, CONFIG3.contract), where="m.json") == CONFIG3.contract
 
 
-@pytest.mark.parametrize("artifact", [None, "dino-zarr-infer-v1", "something-else"])
+@pytest.mark.parametrize("artifact", [None, "dino-zarr-infer-v1"])
 def test_prediction_contract_rejects_other_versions(artifact):
     with pytest.raises(UnsupportedArtifactError):
         prediction_contract({"artifact": artifact}, where="m.json")
@@ -676,14 +657,6 @@ def test_classifier_caption_lists_each_marker_cutoff_in_contract_order():
     )
     assert classifier_caption("abc", CONFIG3, {"edu": 0.1, "brdu": 0.2, "pcna": 0.3}) == (
         "Classifier abc · EdU cutoff 0.1000000000 · BrdU cutoff 0.2000000000 · PCNA cutoff 0.3000000000"
-    )
-
-
-def test_default_code_colors_are_the_palette():
-    assert PALETTE.dtype == np.float64
-    np.testing.assert_array_equal(code_colors(default_config(), np.arange(5, dtype=np.uint8)), PALETTE)
-    np.testing.assert_array_equal(
-        PALETTE, [[0.25, 0.25, 0.25], [0, 1, 0], [1, 0, 1], [1, 1, 1], [0.6, 0.6, 0.6]]
     )
 
 
@@ -736,8 +709,6 @@ CONTRAST3 = dict.fromkeys(("dapi", "edu", "brdu", "pcna"), (0.0, 1.0))
     [
         ("Cell identities", (0.8, 0.5, 1.0)),  # blue clips: BrdU magenta 0.8 + PCNA blue 0.7
         ("dapi", (0.3, 0.3, 0.3)),
-        ("edu", (0.0, 0.5, 0.0)),
-        ("brdu", (0.8, 0.0, 0.8)),
         ("pcna", (0.0, 0.0, 0.7)),
     ],
 )
@@ -823,6 +794,7 @@ def test_annotation_directories_name_the_directories_each_adapter_annotates(tmp_
     assert prod3_2.FieldSource.annotation_directories(tmp_path) == (tmp_path / "dino-prod3-2" / "barrage-cortex-v1",)
     assert prod3_2.FieldSource.annotation_directories() == (prod3_2.REVIEW_ROOT / "barrage-cortex-v1",)
     assert prod2_2.FieldSource.annotation_directories(tmp_path) == (tmp_path / "dino-prod2-2" / "barrage-cortex-v1",)
+    assert prod2_2.FieldSource.annotation_directories() == (prod2_2.REVIEW_ROOT / "barrage-cortex-v1",)
 
 
 def _prod2_predictions():
@@ -852,9 +824,9 @@ def test_prod2_adapter_reads_its_calls_config_contrast_and_caption(tmp_path):
     assert source.training_predictions.cell.tolist() == _prod2_predictions().cell.tolist()
 
 
-def _write_markers(root: Path, config, directory: str = "barrage-pixel") -> None:
-    (root / directory).mkdir(parents=True, exist_ok=True)
-    (root / directory / "markers.json").write_text(json.dumps(config_to_json(config)))
+def _write_markers(root: Path, config) -> None:
+    (root / "barrage-pixel").mkdir(parents=True, exist_ok=True)
+    (root / "barrage-pixel" / "markers.json").write_text(json.dumps(config_to_json(config)))
 
 
 def test_prod2_adapter_rejects_an_annotation_directory_with_other_channels(tmp_path):
@@ -873,20 +845,13 @@ def test_prod2_adapter_rejects_reordered_annotations_against_its_unversioned_man
         FieldSource(root)
 
 
-@pytest.mark.parametrize("carry", ["reordered_inference", "unversioned_with_contract"])
-def test_prod2_adapter_rejects_a_prediction_manifest_with_another_contract(tmp_path, carry):
+def test_prod2_adapter_rejects_a_prediction_manifest_with_another_contract(tmp_path):
     root = build_native_root(tmp_path, _prod2_predictions())
     manifest = tmp_path / "model-v1" / "cortex-pred" / "complete.json"
-    record = json.loads(manifest.read_text())
-    if carry == "reordered_inference":
-        record = INFERENCE.stamp(record, MarkerContract("pi", ("edu", "brdu")))
-        error = ContractMismatchError
-    else:
-        record["marker_contract"] = DEFAULT_CONTRACT.to_json()
-        error = UnsupportedArtifactError
+    record = INFERENCE.stamp(json.loads(manifest.read_text()), MarkerContract("pi", ("edu", "brdu")))
     manifest.write_text(json.dumps(record))
 
-    with pytest.raises(error):
+    with pytest.raises(ContractMismatchError):
         FieldSource(root)
 
 

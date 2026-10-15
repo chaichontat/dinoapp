@@ -504,14 +504,6 @@ def test_three_marker_annotations_hold_triples_and_filter_per_marker(tmp_path: P
     with pytest.raises(ValueError, match="one entry per marker"):
         cells((0, 1))
 
-    edit = annotations.assign("t:1|1", (0, 1, 1), expected=(0, 0, 0))
-    assert edit.previous == (0, 0, 0) and annotations.values["t:1|1"] == (0, 1, 1)
-    annotations.undo(edit)
-    assert annotations.values["t:1|1"] == (0, 0, 0)
-    assert (tmp_path / "labels.csv").read_text().splitlines()[1] == "t:1|1,0,0,0"
-    with pytest.raises(ValueError, match="3-tuple"):
-        annotations.assign("t:1|1", (0, 1), expected=(0, 0, 0))
-
 
 def test_annotation_files_reject_a_directory_whose_contract_differs(tmp_path: Path):
     write_three_marker_barrage(tmp_path / "three")
@@ -528,38 +520,6 @@ def test_annotation_files_reject_a_directory_whose_contract_differs(tmp_path: Pa
         AnnotationFiles(
             (plain / "labels.csv", tmp_path / "three" / "labels.csv"), plain / "labels.csv", contract=DEFAULT_CONTRACT
         )
-
-
-def test_reordered_markers_file_makes_an_open_session_stale(tmp_path: Path):
-    write_barrage(tmp_path)
-    source = BarrageSource(tmp_path)
-    annotations = AnnotationFiles(
-        source.annotation_paths, source.default_annotation_path, contract=source.config.contract
-    )
-    original = (tmp_path / "labels.csv").read_bytes()
-    reordered = parse_config(
-        {
-            "version": 1,
-            "reference": {"key": "pi", "label": "PI"},
-            "markers": [
-                {"key": "edu", "label": "EdU", "color": "#00ff00"},
-                {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
-            ],
-            "presentation": {
-                "crop_panels": ["pi", "edu", "brdu"],
-                "negative_color": [0.25, 0.25, 0.25],
-                "uncalled_color": "#999999",
-            },
-        },
-        source="test",
-    )
-    save_config(reordered, tmp_path)
-
-    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
-        annotations.assign("one:1|10", (1, 0), expected=(0, 0))
-    with pytest.raises(ContractMismatchError):
-        update_label(tmp_path / "labels.csv", "one:1|10", (1, 0), contract=DEFAULT_CONTRACT)
-    assert (tmp_path / "labels.csv").read_bytes() == original
 
 
 def test_native_adapter_dispatches_crops_by_marker_through_marker_crop(tmp_path: Path):

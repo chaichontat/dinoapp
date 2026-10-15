@@ -29,7 +29,6 @@ from dino_markers import (
 from dino.artifacts import (
     file_sha256,
     ordered_cell_sha256,
-    path_sha256,
     read_embedding_artifact,
     read_parquet_artifact,
     write_parquet_atomic,
@@ -127,7 +126,7 @@ def make_inference_run(tmp_path, monkeypatch):
             bundle["dinov2_source"] = installed_dinov2_source()
         else:
             bundle["dinov2_repo"] = str(encoder_dir)
-            bundle["model_source_sha256"] = path_sha256(encoder_dir)
+            bundle["model_source_sha256"] = "0" * 64
         expected_embeddings = {}
         expected_probabilities = {}
         for target in contract.markers:
@@ -192,17 +191,6 @@ def test_inference_rejects_a_bundle_built_with_another_dinov2(make_inference_run
     assert installed_dinov2_source() in str(result.exception)
     assert "git+https://github.com/chaichontat/dinov2@0000000" in str(result.exception)
     assert not run.out_dir.exists()
-
-
-def test_legacy_bundle_inference_skips_the_dinov2_source_check(inference_run, monkeypatch) -> None:
-    monkeypatch.setattr(
-        cell_dino, "installed_dinov2_source", lambda: pytest.fail("a legacy bundle must not check dinov2")
-    )
-
-    result = CliRunner().invoke(zarr_cli.main, inference_run.args)
-
-    assert result.exit_code == 0, result.exception
-    assert "status=complete" in result.output
 
 
 def _output_bytes(out_dir):
@@ -984,10 +972,15 @@ def test_three_marker_inference_writes_v3_records_with_grouped_columns(make_infe
 
 
 @pytest.mark.integration
-def test_default_contract_inference_stamps_the_default_contract(inference_run) -> None:
+def test_default_contract_inference_stamps_the_default_contract(inference_run, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cell_dino, "installed_dinov2_source", lambda: pytest.fail("a legacy bundle must not check dinov2")
+    )
+
     result = CliRunner().invoke(zarr_cli.main, inference_run.args)
 
     assert result.exit_code == 0, result.exception
+    assert "status=complete" in result.output
     contract = json.loads((inference_run.out_dir / "contract.json").read_text())
     assert contract["artifact"] == "dino-zarr-infer-v3"
     assert contract["marker_contract"] == DEFAULT_CONTRACT.to_json()
@@ -1176,9 +1169,8 @@ def test_load_bundle_does_not_require_markers_it_does_not_have(make_inference_ru
     assert "pcna_cutoff" not in zarr_infer._load_bundle(run.model_path)
 
 
-@pytest.mark.parametrize("contract", [THREE_MARKERS, MarkerContract("pi", ("edu", "pcna"))])
-def test_load_bundle_rejects_spatial_subtraction_outside_brdu_against_pi(make_inference_run, contract) -> None:
-    run = make_inference_run(contract, current=True)
+def test_load_bundle_rejects_spatial_subtraction_outside_brdu_against_pi(make_inference_run) -> None:
+    run = make_inference_run(THREE_MARKERS, current=True)
     _save_bundle(run, spatial_subtraction={"model": "x"})
 
     with pytest.raises(ValueError, match="spatial subtraction supports only BrdU against the pi channel"):

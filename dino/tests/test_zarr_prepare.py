@@ -252,17 +252,14 @@ def test_prepare_resumes_partial_pair_and_rejects_changed_source(preparation_run
     } == after
 
 
-THREE_MARKER_KEYS = ("dapi", "edu", "brdu", "pcna")
-LABELS = {"pi": "PI", "dapi": "DAPI", "brdu": "BrdU", "edu": "EdU", "pcna": "PCNA"}
-
-
 def write_markers(path, reference, markers, *, colors=("#ff0000", "#00ff00", "#0000ff")):
     """Write a valid markers.json for the given contract and return its path."""
+    labels = {"pi": "PI", "dapi": "DAPI", "brdu": "BrdU", "edu": "EdU", "pcna": "PCNA"}
     value = {
         "version": 1,
-        "reference": {"key": reference, "label": LABELS[reference]},
+        "reference": {"key": reference, "label": labels[reference]},
         "markers": [
-            {"key": key, "label": LABELS[key], "color": color} for key, color in zip(markers, colors)
+            {"key": key, "label": labels[key], "color": color} for key, color in zip(markers, colors)
         ],
         "presentation": {
             "crop_panels": [reference, *reversed(markers)],
@@ -323,7 +320,7 @@ def test_three_marker_prepare_records_contract_and_config(preparation_run, monke
     run = preparation_run
     markers = write_markers(run.tmp_path / "three.json", "dapi", ["edu", "brdu", "pcna"])
 
-    run_main(run, monkeypatch, THREE_MARKER_KEYS, "--markers", str(markers))
+    run_main(run, monkeypatch, ("dapi", "edu", "brdu", "pcna"), "--markers", str(markers))
 
     complete = read_json(run.out_dir / "complete.json")
     assert complete["artifact"] == "dino-zarr-source-complete-v2"

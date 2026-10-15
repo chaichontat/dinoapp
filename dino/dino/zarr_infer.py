@@ -528,10 +528,8 @@ def main() -> None:
     if cfg.out_dir.exists() and any(cfg.out_dir.iterdir()):
         if not cfg.resume:
             raise FileExistsError(f"Refusing --no-resume with occupied destination: {cfg.out_dir}")
-        if not contract_path.is_file():
-            raise ValueError(f"Inference output contract mismatch: {cfg.out_dir}")
-        run_record = json.loads(contract_path.read_text())
-        if INFERENCE.normalize(run_record, where=str(contract_path)) != expected:
+        run_record = json.loads(contract_path.read_text()) if contract_path.is_file() else None
+        if run_record is None or INFERENCE.normalize(run_record, where=str(contract_path)) != expected:
             raise ValueError(f"Inference output contract mismatch: {cfg.out_dir}")
     else:
         run_record = expected

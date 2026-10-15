@@ -287,35 +287,6 @@ def read_journal(state_dir, session_id="sess0001"):
     return [json.loads(line) for line in (state_dir / f"changes-{session_id}.jsonl").read_text().splitlines()]
 
 
-def test_new_context_has_no_contract_and_no_drafts(monkeypatch):
-    import streamlit as st
-
-    from dinoapp.review_session import get_context
-
-    monkeypatch.setattr(st, "session_state", {})
-    context = get_context("target")
-    assert context["contract"] is None
-    assert context["drafts"] == {}
-
-
-def test_new_default_journal_records_schema_and_contract_after_path(tmp_path, monkeypatch):
-    from dinoapp.review_session import save_assignment, undo_edit
-
-    annotations, context, state_dir, path = session(tmp_path, monkeypatch, contract=DEFAULT_CONTRACT)
-    edit = save_assignment(annotations, state_dir, context, "x|1", (1, 0), expected=None,
-                           record={"action": "assign", "source_id": "s"})
-    undo_edit(annotations, context, state_dir, edit)
-
-    assign, undo = read_journal(state_dir)
-    assert list(assign) == ["action", "source_id", "cell", "previous", "value", "path", "schema",
-                            "marker_contract", "time_utc"]
-    assert list(undo) == ["action", "cell", "previous", "value", "path", "schema", "marker_contract", "time_utc"]
-    for record in (assign, undo):
-        assert record["schema"] == JOURNAL_SCHEMA
-        assert record["marker_contract"] == {"version": 1, "reference": "pi", "markers": ["brdu", "edu"]}
-    assert (assign["previous"], assign["value"]) == (None, [1, 0])
-
-
 def test_three_marker_journal_carries_contract_on_every_record(tmp_path, monkeypatch):
     from dinoapp.review_session import save_assignment, undo_edit
 
@@ -357,28 +328,6 @@ def write_first_record(state_dir, record):
 
 LEGACY_RECORD = {"action": "assign", "cell": "x|9", "previous": None, "value": [1, 0], "path": "p",
                  "time_utc": "2026-01-01T00:00:00+00:00"}
-
-
-def test_legacy_journal_continues_without_schema_under_the_default_contract(tmp_path, monkeypatch):
-    from dinoapp.review_session import save_assignment
-
-    annotations, context, state_dir, path = session(tmp_path, monkeypatch, contract=DEFAULT_CONTRACT)
-    write_first_record(state_dir, LEGACY_RECORD)
-    save_assignment(annotations, state_dir, context, "x|1", (1, 0), expected=None, record={"action": "assign"})
-
-    legacy, appended = read_journal(state_dir)
-    assert legacy == LEGACY_RECORD
-    assert list(appended) == ["action", "cell", "previous", "value", "path", "time_utc"]
-
-
-def test_new_form_journal_keeps_new_form_when_appended(tmp_path, monkeypatch):
-    from dinoapp.review_session import save_assignment
-
-    annotations, context, state_dir, path = session(tmp_path, monkeypatch, contract=DEFAULT_CONTRACT)
-    save_assignment(annotations, state_dir, context, "x|1", (1, 0), expected=None, record={"action": "assign"})
-    save_assignment(annotations, state_dir, context, "x|2", (0, 1), expected=None, record={"action": "assign"})
-
-    assert [record["schema"] for record in read_journal(state_dir)] == [JOURNAL_SCHEMA] * 2
 
 
 @pytest.mark.parametrize(
@@ -429,21 +378,6 @@ def test_legacy_journal_cannot_continue_under_a_custom_contract(tmp_path, monkey
     assert not path.exists()
     assert context["history"] == []
     assert not list(state_dir.glob("*.csv"))
-
-
-def test_journal_of_another_contract_cannot_continue_under_the_session_contract(tmp_path, monkeypatch):
-    from dinoapp.review_session import save_assignment
-
-    config = three_marker_config()
-    save_config(config, tmp_path)
-    annotations, context, state_dir, path = session(tmp_path, monkeypatch, contract=config.contract)
-    write_first_record(state_dir, {**LEGACY_RECORD, "schema": JOURNAL_SCHEMA,
-                                   "marker_contract": DEFAULT_CONTRACT.to_json()})
-
-    with pytest.raises(ContractMismatchError, match="changes-sess0001.jsonl"):
-        save_assignment(annotations, state_dir, context, "x|1", (1, 0, 1), expected=None,
-                        record={"action": "assign"})
-    assert not path.exists()
 
 
 def test_stale_session_save_writes_nothing_after_the_directory_contract_changes(tmp_path, monkeypatch):

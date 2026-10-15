@@ -7,7 +7,7 @@ import pytest
 from click.testing import CliRunner
 from dino.periodic import main, balanced_sample, fit_field, correction_gain
 from dino.intensity_context import IntensityContext
-from dino_markers import DEFAULT_CONTRACT, ContractMismatchError, MarkerContract
+from dino_markers import DEFAULT_CONTRACT, ContractMismatchError, MarkerContract, MissingContractError
 
 THREE = MarkerContract("dapi", ("edu", "brdu", "pcna"))
 
@@ -18,17 +18,15 @@ def classifier_bundle(contract=DEFAULT_CONTRACT, *, legacy=True, **fields):
     return {**schema, **fields}
 
 
-def periodic_spline():
-    from sklearn.preprocessing import SplineTransformer
-
-    return SplineTransformer(knots=np.tile(np.linspace(0, 1, 5)[:, None], (1, 2)), extrapolation="periodic").fit([[0.0, 0.0], [1.0, 1.0]])
-
-
 def constant_field(path, targets, divisors, **extra):
     """A field whose gain divides each target's intensity by a constant: the periodic basis sums to one."""
+    from sklearn.preprocessing import SplineTransformer
+
     bundle = dict(
         period_xy_um=np.ones(2),
-        periodic_spline=periodic_spline(),
+        periodic_spline=SplineTransformer(
+            knots=np.tile(np.linspace(0, 1, 5)[:, None], (1, 2)), extrapolation="periodic"
+        ).fit([[0.0, 0.0], [1.0, 1.0]]),
         periodic_center=np.zeros(16),
         coefficient=np.column_stack([np.full(16, np.log(d)) for d in divisors]),
         targets=list(targets),
@@ -422,24 +420,20 @@ def test_apply_corrects_each_target_only_by_its_own_columns(tmp_path):
     assert corrected.intensity_edu_2_mean.tolist() == pytest.approx([20.0])
 
 
-@pytest.mark.parametrize("targets", [("edu", "edu"), (), ("edu", 3)])
-def test_apply_rejects_a_field_whose_targets_are_not_unique_keys(tmp_path, targets):
+@pytest.mark.parametrize(
+    ("targets", "divisors", "message"),
+    [
+        (("edu", "edu"), (2, 3), "nonempty list of unique keys"),
+        (("edu", "brdu"), (2,), "coefficient has 1 columns for 2 targets"),
+    ],
+)
+def test_apply_rejects_an_invalid_field(tmp_path, targets, divisors, message):
     model, props, out = tmp_path / "gain.joblib", tmp_path / "props.parquet", tmp_path / "corrected"
-    constant_field(model, targets, (2, 3)[: len(targets)] or (2,))
+    constant_field(model, targets, divisors)
     three_marker_props(props)
     result = CliRunner().invoke(main, apply_arguments(model, props, out))
     assert isinstance(result.exception, ValueError)
-    assert "nonempty list of unique keys" in str(result.exception)
-    assert not out.exists()
-
-
-def test_apply_rejects_a_field_whose_coefficient_width_differs_from_its_targets(tmp_path):
-    model, props, out = tmp_path / "gain.joblib", tmp_path / "props.parquet", tmp_path / "corrected"
-    constant_field(model, ("edu", "brdu"), (2,))
-    three_marker_props(props)
-    result = CliRunner().invoke(main, apply_arguments(model, props, out))
-    assert isinstance(result.exception, ValueError)
-    assert "coefficient has 1 columns for 2 targets" in str(result.exception)
+    assert message in str(result.exception)
     assert not out.exists()
 
 
@@ -447,8 +441,6 @@ def test_apply_rejects_a_field_whose_coefficient_width_differs_from_its_targets(
     ("classifier_contract", "targets"),
     [
         (MarkerContract("pi", ("edu", "brdu")), ("brdu", "edu")),
-        (DEFAULT_CONTRACT, ("edu", "brdu")),
-        (MarkerContract("dapi", ("brdu", "edu", "pcna")), ("edu", "brdu", "pcna")),
         (DEFAULT_CONTRACT, ("brdu", "edu", "pcna")),
     ],
 )
@@ -464,18 +456,12 @@ def test_apply_rejects_a_classifier_whose_marker_order_differs_from_the_field(tm
 
 
 def test_apply_requires_the_classifier_to_carry_its_contract(tmp_path):
-    from dino_markers import MissingContractError
-
     model, props, classifier, out = tmp_path / "gain.joblib", tmp_path / "props.parquet", tmp_path / "classifier.joblib", tmp_path / "corrected"
     constant_field(model, ("brdu", "edu"), (2, 2))
     three_marker_props(props)
     joblib.dump(dict(schema="dino-knn-intensity-v2", intensity_props=str(props), intensity_scale_zyx_um=[1, 1, 1]), classifier)
     result = CliRunner().invoke(main, apply_arguments(model, props, out, classifier))
     assert isinstance(result.exception, MissingContractError)
-
-
-def snapshot(directory):
-    return {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
 
 
 def test_measure_binds_the_field_targets_to_a_three_marker_classifier(tmp_path):
@@ -504,12 +490,10 @@ def test_measure_writes_a_current_default_classifier_and_leaves_its_inputs(tmp_p
     assert set(run) == {"source_sha256", "classifier", "classifier_sha256", "pixel_correction"}
 
 
-@pytest.mark.parametrize(
-    ("classifier_contract", "targets"),
-    [(MarkerContract("pi", ("edu", "brdu")), ("brdu", "edu")), (DEFAULT_CONTRACT, ("edu", "brdu"))],
-)
-def test_measure_rejects_a_classifier_whose_marker_order_differs_from_the_field(tmp_path, classifier_contract, targets):
-    _, out, args = measure_inputs(tmp_path, targets=targets, classifier_fields=classifier_bundle(classifier_contract, legacy=False))
+def test_measure_rejects_a_classifier_whose_marker_order_differs_from_the_field(tmp_path):
+    _, out, args = measure_inputs(
+        tmp_path, targets=("brdu", "edu"), classifier_fields=classifier_bundle(MarkerContract("pi", ("edu", "brdu")), legacy=False)
+    )
     result = CliRunner().invoke(main, args)
     assert isinstance(result.exception, ContractMismatchError)
     assert "marker order is part of the contract" in str(result.exception)

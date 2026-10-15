@@ -1,13 +1,14 @@
 import json
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
 from dino.artifacts import ordered_cell_sha256, write_embedding_atomic
-from dino.joint_train import collapse, design_matrix, fit_and_score, labeled_embeddings
+from dino.joint_train import collapse, design_matrix, fit, fit_and_score, labeled_embeddings
 from dino_markers import DEFAULT_CONTRACT, ContractMismatchError, MarkerContract
 
 
@@ -98,9 +99,8 @@ def test_labeled_embeddings_rejects_duplicate_cells(tmp_path):
 
 
 def test_encoder_contract_rejects_different_backbone_source_before_fitting(tmp_path):
-    import joblib
     from dino.artifacts import file_sha256
-    from dino.joint_train import ENCODER_KEYS, fit
+    from dino.joint_train import ENCODER_KEYS
 
     datasets = []
     for name in ['first', 'second']:
@@ -159,7 +159,6 @@ def _declare(directory, contract):
 
 def _dataset(root, name, contract, *, cells=32, seed=0, declare=True, current=True):
     """One dataset's inputs for a fit: tranche labels, embedding run, embedding bundle and intensities."""
-    import joblib
     from dino.artifacts import file_sha256
 
     rng = np.random.default_rng(seed)
@@ -211,9 +210,6 @@ def _config(tmp_path, datasets, *, validation_cells=24):
 
 
 def test_three_marker_fit_stamps_v2_bundles_and_names_every_marker(tmp_path):
-    import joblib
-    from dino.joint_train import fit
-
     datasets = [_dataset(tmp_path / name, name, CUSTOM, seed=seed) for seed, name in enumerate(['first', 'second'])]
     output = tmp_path / 'output'
 
@@ -246,8 +242,6 @@ def test_three_marker_fit_stamps_v2_bundles_and_names_every_marker(tmp_path):
 
 
 def test_fit_rejects_a_tranche_with_reordered_markers_before_reading_its_columns(tmp_path):
-    from dino.joint_train import fit
-
     default = DEFAULT_CONTRACT
     datasets = [_dataset(tmp_path / name, name, default, cells=24, seed=seed, current=False, declare=False)
                 for seed, name in enumerate(['first', 'second'])]
@@ -261,8 +255,6 @@ def test_fit_rejects_a_tranche_with_reordered_markers_before_reading_its_columns
 
 
 def test_fit_rejects_a_shard_inference_record_with_another_contract(tmp_path):
-    from dino.joint_train import fit
-
     datasets = [_dataset(tmp_path / name, name, DEFAULT_CONTRACT, cells=24, seed=seed, current=False)
                 for seed, name in enumerate(['first', 'second'])]
     complete = Path(datasets[0]['embedding_run'], 'shard-000', 'complete.json')
@@ -275,8 +267,6 @@ def test_fit_rejects_a_shard_inference_record_with_another_contract(tmp_path):
 
 
 def test_fit_rejects_datasets_with_different_contracts(tmp_path):
-    from dino.joint_train import fit
-
     datasets = [_dataset(tmp_path / 'first', 'first', DEFAULT_CONTRACT, cells=24, current=False),
                 _dataset(tmp_path / 'second', 'second', MarkerContract('pi', ('edu', 'brdu')), cells=24, seed=1)]
 

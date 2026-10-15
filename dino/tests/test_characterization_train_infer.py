@@ -42,7 +42,6 @@ from dino.artifacts import (
     PARQUET_METADATA_KEY,
     file_sha256,
     ordered_cell_sha256,
-    path_sha256,
     read_embedding_artifact,
     read_parquet_artifact,
     write_embedding_atomic,
@@ -54,6 +53,35 @@ from dino.zarr_source import load_source, manifest_digest
 
 FIXTURE = Path(__file__).parent / "fixtures" / "legacy_model"
 INFERENCE_RUN = Path("inference") / "shard-000"
+
+
+_SOURCE_SUFFIXES = {".json", ".py", ".toml", ".yaml", ".yml"}
+_IGNORED_PARTS = {".git", ".pytest_cache", "__pycache__"}
+
+
+def _path_sha256(path: Path) -> str:
+    if path.is_file():
+        return file_sha256(path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Expected model source path for SHA-256 digest: {path}")
+
+    files = sorted(
+        candidate
+        for candidate in path.rglob("*")
+        if candidate.is_file()
+        and candidate.suffix in _SOURCE_SUFFIXES
+        and not (_IGNORED_PARTS & set(candidate.relative_to(path).parts))
+    )
+    if not files:
+        raise ValueError(f"No model source files found under {path}")
+
+    digest = hashlib.sha256()
+    for candidate in files:
+        relative = candidate.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(file_sha256(candidate)))
+    return digest.hexdigest()
 
 
 class StubEncoder(torch.nn.Module):
@@ -423,7 +451,7 @@ def test_legacy_bundle_keys_values_and_identities(legacy) -> None:
     assert manifest["source_sha256"] == manifest_digest(manifest) == bundle["source_sha256"]
     assert _load_source(Path(".")).manifest["source_sha256"] == SOURCE_SHA256
     assert file_sha256(Path(bundle["weights"])) == bundle["weights_sha256"]
-    assert path_sha256(Path(bundle["dinov2_repo"])) == bundle["model_source_sha256"]
+    assert _path_sha256(Path(bundle["dinov2_repo"])) == bundle["model_source_sha256"]
     assert file_sha256(legacy / "model" / "model.joblib") == MODEL_SHA256
 
 

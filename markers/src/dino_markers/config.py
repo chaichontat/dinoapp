@@ -3,42 +3,38 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from functools import cache
 from importlib import resources
 from pathlib import Path
 
-from .colors import rgb_or_none
 from .contract import (
     RGB,
-    ContractMismatchError,
     Label,
     MarkerConfigError,
     MarkerContract,
-    MissingContractError,
-    UnsupportedArtifactError,
     check_version,
     key_problem,
     keys_problem,
-    require_same_contract,
 )
 
-__all__ = [
-    "BadgeColor",
-    "Channel",
-    "ContractMismatchError",
-    "Marker",
-    "MarkerConfig",
-    "MarkerConfigError",
-    "MissingContractError",
-    "Presentation",
-    "UnsupportedArtifactError",
-    "config_to_json",
-    "default_config",
-    "load_config",
-    "parse_config",
-    "require_same_contract",
-]
+_HEX = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def rgb_or_none(value: object) -> RGB | None:
+    """The color as three floats in [0, 1], or None when it is not a valid color."""
+    if isinstance(value, str):
+        if _HEX.fullmatch(value) is None:
+            return None
+        return (int(value[1:3], 16) / 255, int(value[3:5], 16) / 255, int(value[5:7], 16) / 255)
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and all(isinstance(e, (int, float)) and not isinstance(e, bool) and 0 <= e <= 1 for e in value)
+    ):
+        return (float(value[0]), float(value[1]), float(value[2]))
+    return None
 
 
 @dataclass(frozen=True)
@@ -174,12 +170,12 @@ def parse_config(value: object, *, source: str) -> MarkerConfig:
         return MarkerConfigError(f"{source}: {problem}")
 
     def obj(node: object, location: str, required: set[str], optional: frozenset[str] = frozenset()) -> dict:
+        prefix = f"{location}: " if location else ""
         if not isinstance(node, dict):
-            raise fail(f"{location}: expected a JSON object, got {node!r}" if location else
-                       f"expected a JSON object, got {node!r}")
+            raise fail(f"{prefix}expected a JSON object, got {node!r}")
         problem = keys_problem(node, required, optional)
         if problem is not None:
-            raise fail(f"{location}: {problem}" if location else problem)
+            raise fail(f"{prefix}{problem}")
         return node
 
     def color(node: object, location: str) -> RGB:
@@ -200,8 +196,9 @@ def parse_config(value: object, *, source: str) -> MarkerConfig:
     for index, node in enumerate(top["markers"]):
         item = obj(node, f"markers[{index}]", {"key", "label", "color"})
         markers.append(Marker(item["key"], item["label"], color(item["color"], f"markers[{index}].color")))
-    marker_keys = [marker.key for marker in markers]
-    problem = key_problem(reference.key, tuple(marker_keys))
+    markers = tuple(markers)
+    marker_keys = tuple(marker.key for marker in markers)
+    problem = key_problem(reference.key, marker_keys)
     if problem is not None:
         raise fail(problem)
     presentation_node = obj(
@@ -212,7 +209,7 @@ def parse_config(value: object, *, source: str) -> MarkerConfig:
     )
     panel_node = presentation_node["crop_panels"]
     if not isinstance(panel_node, list):
-        raise fail(_panels_problem((reference.key, *(marker.key for marker in markers))))
+        raise fail(_panels_problem((reference.key, *marker_keys)))
     badges = []
     badge_nodes = presentation_node.get("badge_colors", [])
     if not isinstance(badge_nodes, list):
@@ -242,11 +239,10 @@ def parse_config(value: object, *, source: str) -> MarkerConfig:
         color(presentation_node["uncalled_color"], "presentation.uncalled_color"),
         tuple(badges),
     )
-    markers_tuple = tuple(markers)
-    problem = config_problem(reference, markers_tuple, presentation)
+    problem = config_problem(reference, markers, presentation)
     if problem is not None:
         raise fail(problem)
-    return MarkerConfig(reference, markers_tuple, presentation)
+    return MarkerConfig(reference, markers, presentation)
 
 
 def load_config(path: Path) -> MarkerConfig:

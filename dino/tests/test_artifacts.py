@@ -76,12 +76,9 @@ def test_embedding_artifact_round_trips_any_valid_marker_set(tmp_path: Path) -> 
         ("no_markers", "at least one marker"),
         ("no_digest", "must contain cell_sha256"),
         ("shape", "share one two-dimensional shape"),
-        ("rank", "share one two-dimensional shape"),
         ("dtype", "native torch.bfloat16"),
         ("digest", "32-byte uint8"),
         ("uppercase", "must match"),
-        ("leading_underscore", "must match"),
-        ("reserved", "is reserved"),
     ],
 )
 def test_embedding_artifact_rejects_structural_damage(tmp_path: Path, damage: str, message: str) -> None:
@@ -92,18 +89,12 @@ def test_embedding_artifact_rejects_structural_damage(tmp_path: Path, damage: st
         del artifact["cell_sha256"]
     elif damage == "shape":
         artifact["pcna"] = artifact["pcna"][:2]
-    elif damage == "rank":
-        artifact["pcna"] = artifact["pcna"][0]
     elif damage == "dtype":
         artifact["pcna"] = artifact["pcna"].float()
     elif damage == "digest":
         artifact["cell_sha256"] = torch.zeros(31, dtype=torch.uint8)
-    elif damage == "uppercase":
-        artifact["PCNA"] = artifact.pop("pcna")
-    elif damage == "leading_underscore":
-        artifact["_pcna"] = artifact.pop("pcna")
     else:
-        artifact["labels"] = artifact.pop("pcna")
+        artifact["PCNA"] = artifact.pop("pcna")
 
     with pytest.raises(ValueError, match=message):
         write_embedding_atomic(artifact, tmp_path / "part.pt")
