@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from collections.abc import Iterable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping
+
+import joblib
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+if TYPE_CHECKING:
+    import torch
+
+
+PARQUET_METADATA_KEY = b"fishtools.dino"
+_SOURCE_SUFFIXES = {".json", ".py", ".toml", ".yaml", ".yml"}
+_IGNORED_PARTS = {".git", ".pytest_cache", "__pycache__"}
+
+
+def _dump_joblib_atomic(value: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        joblib.dump(value, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def row_feature_cache_key(row: pd.Series) -> str:
+    payload = "|".join(
+        [
+            str(row["dataset"]),
+            str(row["roi"]),
+            str(row["cell"]),
+            str(int(np.rint(float(row["x"])))),
+            str(int(np.rint(float(row["y"])))),
+            str(int(np.rint(float(row["z"])))),
+        ]
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def write_csv_atomic(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        frame.to_csv(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def file_sha256(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"Expected file for SHA-256 digest: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def path_sha256(path: Path) -> str:
+    """Hash a model source tree without binding it to its absolute location."""
+
+    if path.is_file():
+        return file_sha256(path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Expected model source path for SHA-256 digest: {path}")
+
+    files = sorted(
+        candidate
+        for candidate in path.rglob("*")
+        if candidate.is_file()
+        and candidate.suffix in _SOURCE_SUFFIXES
+        and not (_IGNORED_PARTS & set(candidate.relative_to(path).parts))
+    )
+    if not files:
+        raise ValueError(f"No model source files found under {path}")
+
+    digest = hashlib.sha256()
+    for candidate in files:
+        relative = candidate.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(file_sha256(candidate)))
+    return digest.hexdigest()
+
+
+def array_sha256(array: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(contiguous.dtype.str.encode("ascii"))
+    digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+    digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def validate_model_artifacts(
+    *,
+    bundle: Mapping[str, Any],
+    weights: Path,
+    model_source: Path,
+) -> None:
+    expected_weights = bundle.get("weights_sha256")
+    expected_source = bundle.get("model_source_sha256")
+    if not isinstance(expected_weights, str) or not isinstance(expected_source, str):
+        raise ValueError("Model bundle is missing required content hashes; retrain the classifier bundle.")
+    if file_sha256(weights) != expected_weights:
+        raise ValueError(f"Cell-DINO checkpoint content does not match the trained bundle: {weights}")
+    if path_sha256(model_source) != expected_source:
+        raise ValueError(f"Cell-DINO source content does not match the trained bundle: {model_source}")
+
+
+def write_parquet_atomic(frame: pd.DataFrame, path: Path, *, provenance: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing Cell-DINO artifact: {path}")
+    table = pa.Table.from_pandas(frame, preserve_index=True)
+    metadata = dict(table.schema.metadata or {})
+    metadata[PARQUET_METADATA_KEY] = json.dumps(dict(provenance), sort_keys=True).encode("utf-8")
+    table = table.replace_schema_metadata(metadata)
+
+    with tempfile.NamedTemporaryFile(prefix=".dino-", suffix=".tmp", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        pq.write_table(table, temporary)
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_parquet_artifact(path: Path) -> tuple[dict[str, Any], int]:
+    try:
+        parquet = pq.ParquetFile(path)
+        metadata = parquet.schema_arrow.metadata or {}
+        encoded = metadata.get(PARQUET_METADATA_KEY)
+        if encoded is None:
+            raise ValueError(f"Parquet is missing Cell-DINO completion metadata: {path}")
+        provenance = json.loads(encoded.decode("utf-8"))
+        if not isinstance(provenance, dict):
+            raise ValueError(f"Invalid Cell-DINO completion metadata in {path}")
+        return provenance, parquet.metadata.num_rows
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Unable to read Cell-DINO parquet artifact {path}: {exc}") from exc
+
+
+def ordered_cell_sha256(cells: Iterable[str]) -> torch.Tensor:
+    """Hash an ordered cell sequence with length framing to prevent ambiguous joins."""
+
+    import torch
+
+    digest = hashlib.sha256()
+    for cell in cells:
+        encoded = cell.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return torch.tensor(list(digest.digest()), dtype=torch.uint8)
+
+
+def _validate_embedding_artifact(artifact: Mapping[str, torch.Tensor]) -> None:
+    import torch
+
+    required = {"brdu", "edu", "cell_sha256"}
+    if set(artifact) != required:
+        raise ValueError(f"Embedding artifact keys must be {sorted(required)}")
+    brdu = artifact["brdu"]
+    edu = artifact["edu"]
+    cell_sha256 = artifact["cell_sha256"]
+    if brdu.device.type != "cpu" or edu.device.type != "cpu":
+        raise ValueError("Embedding tensors must be stored on CPU")
+    if brdu.dtype != torch.bfloat16 or edu.dtype != torch.bfloat16:
+        raise ValueError("Embedding tensors must use native torch.bfloat16")
+    if brdu.ndim != 2 or edu.shape != brdu.shape:
+        raise ValueError("BrdU and EdU embedding tensors must have the same two-dimensional shape")
+    if cell_sha256.dtype != torch.uint8 or cell_sha256.shape != (32,):
+        raise ValueError("cell_sha256 must be a 32-byte uint8 tensor")
+
+
+def write_embedding_atomic(artifact: Mapping[str, torch.Tensor], path: Path) -> None:
+    """Publish a validated, native-BF16 embedding partition without overwriting data."""
+
+    import torch
+
+    _validate_embedding_artifact(artifact)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing Cell-DINO artifact: {path}")
+    with tempfile.NamedTemporaryFile(prefix=".dino-", suffix=".tmp", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        torch.save(dict(artifact), temporary)
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_embedding_artifact(path: Path) -> dict[str, torch.Tensor]:
+    import torch
+
+    try:
+        artifact = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if not isinstance(artifact, dict):
+            raise ValueError("Embedding artifact must contain a tensor dictionary")
+        _validate_embedding_artifact(artifact)
+        return artifact
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Unable to read Cell-DINO embedding artifact {path}: {exc}") from exc

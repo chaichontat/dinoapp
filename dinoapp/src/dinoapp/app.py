@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import importlib
-import json
 import os
 import subprocess
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,6 +16,18 @@ import streamlit as st
 from streamlit.components.v2 import component
 
 from dinoapp.label_store import Label, LabelConflictError
+from dinoapp.review_session import (
+    activate_target,
+    activate_view,
+    capture_queue,
+    navigate,
+    get_context,
+    remember_widget,
+    retire_active_view,
+    save_assignment,
+    undo_edit as persist_undo,
+    widget_key,
+)
 from dinoapp.sources import (
     AnnotationFiles,
     BarrageSource,
@@ -33,10 +42,7 @@ from dinoapp.sources import (
 
 GALLERY_PAGE_SIZE = 24
 GALLERY_IDENTITIES: dict[str, Label] = {
-    "BrdU− / EdU−": (0, 0),
-    "BrdU− / EdU+": (0, 1),
-    "BrdU+ / EdU−": (1, 0),
-    "BrdU+ / EdU+": (1, 1),
+    state_label(value): value for value in ((0, 0), (0, 1), (1, 0), (1, 1))
 }
 
 
@@ -134,79 +140,26 @@ def gallery_prefetch_executor() -> ThreadPoolExecutor:
 
 @st.cache_resource
 def get_barrage_source(root: str) -> BarrageSource:
+    if (Path(root) / "display.json").is_file():
+        from dinoapp.corrected_barrage import CorrectedBarrageSource
+
+        return CorrectedBarrageSource(Path(root))
     return BarrageSource(Path(root))
 
 
+NATIVE_SOURCES = {
+    "Prod2": "dinoapp.native",
+    "Prod3": "dinoapp.prod3",
+    "Prod2-2": "dinoapp.prod2_2",
+    "Prod3-2": "dinoapp.prod3_2",
+}
+
+
 @st.cache_resource
-def get_native_modules(
-    native_dir: str, dependency_dirs: tuple[str, ...] = ()
-) -> tuple[Any, Any]:
-    directories = (native_dir, *dependency_dirs)
-    for directory in reversed(directories):
-        resolved = str(Path(directory).expanduser().resolve())
-        if resolved in sys.path:
-            sys.path.remove(resolved)
-        sys.path.insert(0, resolved)
-    native = importlib.import_module("cell_review")
-    native_app = importlib.import_module("cell_review_app")
-    return native, native_app
-
-
-def get_context(source_id: str) -> dict[str, Any]:
-    contexts = st.session_state.setdefault("review_contexts", {})
-    return contexts.setdefault(
-        source_id,
-        {
-            "history": [],
-            "galleries": {},
-            "cell_queues": {},
-            "notice": "",
-            "client_token": None,
-            "session_id": uuid4().hex[:8],
-        },
-    )
-
-
-def source_key(source_id: str) -> str:
-    return hashlib.sha256(source_id.encode()).hexdigest()[:16]
-
-
-def journal(state_dir: Path, session_id: str, record: dict[str, Any]) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    payload = {**record, "time_utc": datetime.now(timezone.utc).isoformat()}
-    with (state_dir / f"changes-{session_id}.jsonl").open("a") as stream:
-        stream.write(json.dumps(payload) + "\n")
-
-
-def save_assignment(
-    annotations: AnnotationFiles,
-    state_dir: Path,
-    context: dict[str, Any],
-    cell: str,
-    value: Label,
-    *,
-    expected: Label | None,
-    record: dict[str, Any],
-) -> Edit:
-    target = annotations.destination(cell)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    backup = state_dir / f"{target.parent.name}-{context['session_id']}.csv"
-    if target.exists() and not backup.exists():
-        backup.write_bytes(target.read_bytes())
-    edit = annotations.assign(cell, value, expected=expected)
-    context["history"].append(edit)
-    journal(
-        state_dir,
-        context["session_id"],
-        {
-            **record,
-            "cell": cell,
-            "previous": edit.previous,
-            "value": value,
-            "path": str(edit.path),
-        },
-    )
-    return edit
+def get_native_modules(dataset: str) -> tuple[Any, Any]:
+    if dataset not in NATIVE_SOURCES:
+        raise ValueError(f"Unknown native dataset: {dataset}")
+    return importlib.import_module(NATIVE_SOURCES[dataset]), importlib.import_module("dinoapp.native_app")
 
 
 def new_gallery_state(
@@ -328,21 +281,8 @@ def undo_edit(
     state_dir: Path,
     edit: Edit,
 ) -> None:
-    annotations.undo(edit)
-    context["history"].pop()
+    persist_undo(annotations, context, state_dir, edit)
     update_resident_cards(context, edit.cell, edit.previous)
-    journal(
-        state_dir,
-        context["session_id"],
-        {
-            "action": "undo",
-            "cell": edit.cell,
-            "previous": edit.value,
-            "value": edit.previous,
-            "path": str(edit.path),
-        },
-    )
-    context["notice"] = f"Undid the last edit to {edit.cell}."
 
 
 def render_gallery(
@@ -354,7 +294,6 @@ def render_gallery(
     state_dir: Path,
 ) -> None:
     marker = str(gallery["marker"])
-    widget_source = source_key(source.source_id)
     marker_name = {"brdu": "BrdU", "edu": "EdU"}[marker]
     other_name = {"brdu": "EdU", "edu": "BrdU"}[marker]
     cells = gallery["cells"]
@@ -363,6 +302,7 @@ def render_gallery(
     page = min(int(gallery["page"]), page_count - 1)
     gallery["page"] = page
 
+    view_token = activate_view(context, ("gallery", source.source_id, gallery["queue_id"], page))
     st.title(f"{marker_name} correction gallery")
     st.caption(
         f"Click a crop to flip {marker_name} while keeping {other_name} unchanged. "
@@ -379,7 +319,7 @@ def render_gallery(
     if undo_column.button(
         undo_label,
         disabled=last_edit is None,
-        key=f"undo-{widget_source}",
+        key=f"undo-{context['session_id']}:{view_token}",
         width="stretch",
     ):
         try:
@@ -414,9 +354,10 @@ def render_gallery(
             cards.append(card)
         gallery["pages"][page_key] = cards
     cards = gallery["pages"][page_key]
+    for card in cards:
+        update_gallery_card(card, annotations.values.get(card["cell"]), gallery["initial"][card["cell"]])
     prefetch_gallery_page(source, gallery, page + 1)
 
-    view_token = f"{source.source_id}:{gallery['queue_id']}:{page}"
     patch_existing = context["client_token"] == view_token
     items = cards
     if patch_existing:
@@ -428,7 +369,7 @@ def render_gallery(
             "patch": patch_existing,
             "galleryLabel": f"{marker_name} correction cells",
         },
-        key=f"gallery-cards-{widget_source}",
+        key=f"gallery-cards-{context['session_id']}",
         on_flipped_change=lambda: None,
         on_needsFull_change=lambda: None,
     )
@@ -440,14 +381,21 @@ def render_gallery(
 
     navigation_label, previous, following = st.columns([3, 1, 1])
     navigation_label.write(f"**Cells {start + 1:,}–{stop:,} of {total:,} loaded**")
-    if previous.button("Previous", disabled=page == 0, width="stretch"):
+    if previous.button("Previous", disabled=page == 0, width="stretch", key=f"gallery-prev:{view_token}"):
         gallery["page"] = page - 1
         context["client_token"] = None
         st.rerun()
-    if following.button("Next", disabled=page == page_count - 1, width="stretch"):
+    if following.button("Next", disabled=page == page_count - 1, width="stretch", key=f"gallery-next:{view_token}"):
         gallery["page"] = page + 1
         context["client_token"] = None
         st.rerun()
+
+    if "combined" in source.crop_markers:
+        cells_to_inspect = [card["cell"] for card in cards]
+        chosen = st.selectbox("Cell to inspect", cells_to_inspect, key=f"gallery-open-choice:{view_token}")
+        if st.button("Review cell", key=f"gallery-open-cell:{view_token}"):
+            capture_queue(context, cells_to_inspect, source, position=cells_to_inspect.index(chosen))
+            st.rerun(scope="app")
 
     event = result.flipped
     if not event:
@@ -508,13 +456,12 @@ def review_marker_gallery(
     state_dir: Path,
 ) -> None:
     marker_name = {"brdu": "BrdU", "edu": "EdU"}[marker]
-    widget_source = source_key(source.source_id)
     with st.sidebar:
         st.header(f"{marker_name} correction gallery")
-        subset = st.selectbox("Examples", source.subsets, key=f"subset-{widget_source}")
-        dataset = st.selectbox("Dataset", source.datasets, key=f"dataset-{widget_source}")
+        subset = st.selectbox("Examples", source.subsets, key=widget_key(context, "gallery_subset", source.subsets[0]), on_change=remember_widget, args=(context, "gallery_subset"))
+        dataset = st.selectbox("Dataset", source.datasets, key=widget_key(context, "gallery_dataset", source.datasets[0]), on_change=remember_widget, args=(context, "gallery_dataset"))
         identity_name = st.selectbox(
-            "Saved state", tuple(GALLERY_IDENTITIES), key=f"identity-{widget_source}"
+            "Saved state", tuple(GALLERY_IDENTITIES), key=widget_key(context, "gallery_identity", next(iter(GALLERY_IDENTITIES))), on_change=remember_widget, args=(context, "gallery_identity")
         )
         st.caption("Matches use current saved labels. The queue stays fixed while you edit.")
     identity = GALLERY_IDENTITIES[identity_name]
@@ -550,44 +497,48 @@ def review_barrage_cell(
     context: dict[str, Any],
     *,
     state_dir: Path,
+    queue: dict[str, Any] | None = None,
 ) -> None:
     filter_values: dict[str, Label | None | str] = {
         "Unlabeled": None,
         "All cells": "all",
         **GALLERY_IDENTITIES,
     }
-    widget_source = source_key(source.source_id)
-    with st.sidebar:
-        st.header("Cell review")
-        dataset = st.selectbox(
-            "Dataset", source.datasets, key=f"cell-dataset-{widget_source}"
-        )
-        filter_name = st.selectbox(
-            "Saved state", tuple(filter_values), key=f"cell-filter-{widget_source}"
-        )
-        st.caption("Choose one explicit BrdU/EdU identity for each displayed cell.")
-    signature = (source.source_id, dataset, filter_name)
-    queues = context["cell_queues"]
-    if st.sidebar.button("Refresh cells", width="stretch"):
-        queues.pop(signature, None)
-        st.rerun()
-    if signature not in queues:
-        rows = source.review_rows(dataset=dataset)
-        wanted = filter_values[filter_name]
-        if wanted is None:
-            rows = rows[~rows["cell"].isin(annotations.values)]
-        elif wanted != "all":
-            rows = rows[
-                rows["cell"].map(
-                    lambda cell: annotations.values.get(str(cell)) == wanted
-                )
-            ]
-        queues[signature] = {
-            "cells": rows["cell"].astype(str).tolist(),
-            "position": 0,
-        }
-    queue = queues[signature]
+    dataset = "All datasets"
+    if queue is None:
+        with st.sidebar:
+            st.header("Cell review")
+            dataset = st.selectbox(
+                "Dataset", source.datasets, key=widget_key(context, "cell_dataset", source.datasets[0]), on_change=remember_widget, args=(context, "cell_dataset")
+            )
+            filter_name = st.selectbox(
+                "Saved state", tuple(filter_values), key=widget_key(context, "cell_filter", next(iter(filter_values))), on_change=remember_widget, args=(context, "cell_filter")
+            )
+            st.caption("Choose one explicit BrdU/EdU identity for each displayed cell.")
+        signature = (source.source_id, dataset, filter_name)
+        queues = context["cell_queues"]
+        if st.sidebar.button("Refresh cells", width="stretch"):
+            queues.pop(signature, None)
+            st.rerun()
+        if signature not in queues:
+            rows = source.review_rows(dataset=dataset)
+            wanted = filter_values[filter_name]
+            if wanted is None:
+                rows = rows[~rows["cell"].isin(annotations.values)]
+            elif wanted != "all":
+                rows = rows[
+                    rows["cell"].map(
+                        lambda cell: annotations.values.get(str(cell)) == wanted
+                    )
+                ]
+            queues[signature] = {
+                "cells": rows["cell"].astype(str).tolist(),
+                "position": 0,
+                "queue_id": uuid4().hex,
+            }
+        queue = queues[signature]
     cells: list[str] = queue["cells"]
+    view_token = activate_view(context, ("cell", source.source_id, queue["queue_id"], int(queue["position"])))
     st.title("Cell review")
     st.caption("Assign the displayed cell directly from its real combined crop.")
     if not cells:
@@ -599,24 +550,44 @@ def review_barrage_cell(
     crop = source.crop(cell, "combined")
     current = annotations.values.get(cell)
 
+    return_to = queue.get("return_to")
+    if return_to is not None and st.button("Return to previous view", key=f"cell-return:{view_token}"):
+        if queue.get("origin_field") is not None:
+            context["workspace"]["located_field"] = queue["origin_field"]
+        navigate(context, *return_to)
+        st.rerun()
+    if isinstance(source, NativeSource) or context["workspace"].get("spatial_source") is not None:
+        if st.button("Show in field", key=f"cell-locate:{view_token}"):
+            width = float(context["widgets"].get("field_width", 200))
+            if isinstance(source, NativeSource):
+                reader = source.field_source
+                located = source.field_at_cell(cell, width)
+            else:
+                reader, label = context["workspace"]["spatial_source"].resolve_cell(cell)
+                located = reader.field_at_cell(label, width)
+            context["workspace"]["located_field"] = (reader, located)
+            context["workspace"]["focus_cell"] = cell
+            context["workspace"]["crop_return"] = (context["widgets"]["scope"], "Cell review")
+            navigate(context, "Dataset cells", "Spatial field")
+            st.rerun()
+
     previous, count, following, undo_column = st.columns([1, 2, 1, 1])
-    if previous.button("Previous", disabled=position == 0, width="stretch"):
+    if previous.button("Previous", disabled=position == 0, width="stretch", key=f"cell-prev:{view_token}"):
         queue["position"] = position - 1
         st.rerun()
     count.write(f"**Cell {position + 1:,} of {len(cells):,}**")
     if following.button(
-        "Next", disabled=position == len(cells) - 1, width="stretch"
+        "Next", disabled=position == len(cells) - 1, width="stretch", key=f"cell-next:{view_token}"
     ):
         queue["position"] = position + 1
         st.rerun()
-    history: list[Edit] = context["history"]
     if undo_column.button(
         "Undo last edit",
-        disabled=not history,
-        key=f"cell-undo-{widget_source}",
+        disabled=not context["history"],
+        key=f"cell-undo-{context['session_id']}:{view_token}",
         width="stretch",
     ):
-        edit = history[-1]
+        edit = context["history"][-1]
         try:
             undo_edit(annotations, context, state_dir, edit)
         except LabelConflictError as error:
@@ -632,104 +603,99 @@ def review_barrage_cell(
         st.subheader("Saved identity")
         st.write(state_label(current) if current is not None else "No saved call")
         for name, value in GALLERY_IDENTITIES.items():
-            if st.button(
+            if not st.button(
                 name,
-                key=f"assign-{widget_source}-{cell}-{value}",
+                key=f"assign-{context['session_id']}-{cell}-{value}:{current}:{view_token}",
                 type="primary" if current == value else "secondary",
                 width="stretch",
             ):
-                try:
-                    edit = save_assignment(
-                        annotations,
-                        state_dir,
-                        context,
-                        cell,
-                        value,
-                        expected=current,
-                        record={
-                            "action": "assign",
-                            "source_id": source.source_id,
-                            "dataset_filter": dataset,
-                        },
-                    )
-                except LabelConflictError as error:
-                    context["notice"] = str(error)
-                else:
-                    update_resident_cards(context, cell, value)
-                    context["notice"] = (
-                        f"Saved {cell} as {state_label(value)} in {edit.path}."
-                    )
-                    queue["position"] = min(position + 1, len(cells) - 1)
-                st.rerun()
+                continue
+            try:
+                edit = save_assignment(
+                    annotations,
+                    state_dir,
+                    context,
+                    cell,
+                    value,
+                    expected=current,
+                    record={
+                        "action": "assign",
+                        "source_id": source.source_id,
+                        "dataset_filter": dataset,
+                    },
+                )
+            except LabelConflictError as error:
+                context["notice"] = str(error)
+            else:
+                update_resident_cards(context, cell, value)
+                context["notice"] = (
+                    f"Saved {cell} as {state_label(value)} in {edit.path}."
+                )
+                queue["position"] = min(position + 1, len(cells) - 1)
+            st.rerun()
         if context["notice"]:
             st.info(context["notice"])
 
 
-def load_native_source(
-    native_dir: str,
-    label_root: Path,
-    dependency_dirs: tuple[str, ...] = (),
-) -> tuple[NativeSource, Any, Any]:
-    native, native_app = get_native_modules(native_dir, dependency_dirs)
-    field_source = native_app.get_source(native.FieldSource)
-    return NativeSource(field_source, label_root=label_root), native, native_app
-
-
 def native_field_mode(source: NativeSource, native: Any, native_app: Any) -> None:
-    """Reuse the prod2 field renderer while the shared app owns navigation."""
-    for key, value in (
-        ("position", 0),
-        ("seed", 0),
-        ("selection", None),
-        ("history", []),
-        ("session_id", uuid4().hex[:8]),
-        ("notice", ""),
-    ):
-        st.session_state.setdefault(key, value)
+    """Use the packaged spatial renderer with the selected dataset."""
+    context = get_context(source.target_id)
+    located_view = context["workspace"]["located_field"] is not None
     with st.sidebar:
+        if located_view:
+            st.caption("Viewing a located cell. Return to sampled fields to change the sampling cursor.")
         st.header("Field")
         seed = int(
             st.number_input(
                 "Seed",
                 min_value=0,
                 max_value=2**31 - 1,
+                disabled=located_view,
                 step=1,
-                key="seed",
-                on_change=native_app.reset_position,
+                key=widget_key(context, "seed", 0),
+                on_change=native_app.change_field_widget, args=(context, "seed"),
             )
         )
-        st.number_input("Position", min_value=0, step=1, key="position")
+        position = int(st.number_input("Position", min_value=0, step=1, disabled=located_view, key=widget_key(context, "position", 0), on_change=remember_widget, args=(context, "position")))
         previous, following = st.columns(2)
         previous.button(
             "Previous",
             on_click=native_app.move_position,
-            args=(-1,),
-            disabled=st.session_state.position == 0,
+            args=(-1, context), key=f"field-prev:{context['session_id']}",
+            disabled=located_view or position == 0,
             width="stretch",
         )
         following.button(
-            "Next", on_click=native_app.move_position, args=(1,), width="stretch"
+            "Next", disabled=located_view, on_click=native_app.move_position, args=(1, context), width="stretch", key=f"field-next:{context['session_id']}"
         )
         width = float(
-            st.select_slider("Field width (µm)", options=[100, 150, 200, 250, 300], value=200)
+            st.select_slider("Field width (µm)", disabled=located_view, options=[100, 150, 200, 250, 300], key=widget_key(context, "field_width", 200), on_change=remember_widget, args=(context, "field_width"))
         )
         z_um = float(
             st.number_input(
-                "Z (µm)",
-                value=float(source.field_source.default_z),
+                "Z (µm)", disabled=located_view,
+                key=widget_key(context, "field_z", float(source.field_source.default_z)), on_change=remember_widget, args=(context, "field_z"),
                 step=float(source.field_source.scale[0]),
                 format="%.1f",
             )
         )
-        border_alpha = st.slider("Cell border opacity", 0.0, 1.0, 0.35, 0.05)
-        boundary_alpha = st.slider("Boundary opacity", 0.0, 1.0, 0.45, 0.05)
-        right_view = st.selectbox("Right panel view", ("Cell identities", "Model uncertainty"))
-    field = native_app.get_field(
-        native.FieldSource, seed, st.session_state.position, z_um, width
-    )
-    if st.session_state.get("field_token") != field.token:
-        st.session_state.field_token = field.token
-        st.session_state.selection = None
+        border_alpha = st.slider("Cell border opacity", 0.0, 1.0, step=0.05, key=widget_key(context, "field_border_alpha", 0.35), on_change=remember_widget, args=(context, "field_border_alpha"))
+        boundary_alpha = st.slider("Boundary opacity", 0.0, 1.0, step=0.05, key=widget_key(context, "field_boundary_alpha", 0.45), on_change=remember_widget, args=(context, "field_boundary_alpha"))
+        right_view = st.selectbox("Right panel view", ("Cell identities", "Model uncertainty"), key=widget_key(context, "field_view", "Cell identities"), on_change=remember_widget, args=(context, "field_view"))
+    located = context["workspace"]["located_field"]
+    if located is None:
+        field = native_app.get_field(native.FieldSource, seed, position, z_um, width)
+    else:
+        _, field = located
+        if st.button("Return to sampled fields"):
+            context["workspace"]["located_field"] = None
+            navigate(context, "Dataset cells", "Spatial field")
+            st.rerun()
+        if context["workspace"].get("crop_return") and st.button("Return to cell review"):
+            navigate(context, *context["workspace"]["crop_return"])
+            st.rerun()
+    context["workspace"]["field_crop_source"] = source
+    context["workspace"]["active_field"] = (source.field_source, field)
     annotations = native.AnnotationFiles(
         source.annotation_paths, source.default_annotation_path
     )
@@ -772,106 +738,111 @@ def launch() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Cell review", layout="wide")
-    source_options = ("Barrage", "Prod2 native")
-    configured_source = os.environ.get("DINO_REVIEW_SOURCE", "Barrage")
-    source_index = (
-        source_options.index(configured_source) if configured_source in source_options else 0
-    )
+    configured_dataset = os.environ.get("DINO_NATIVE_DATASET", "Prod2")
+    target_options = ("Crop directory", *NATIVE_SOURCES)
+    configured_target = configured_dataset if os.environ.get("DINO_REVIEW_SOURCE") == "Native fields" else "Crop directory"
+    if configured_target not in target_options:
+        st.error(f"Unknown review target: {configured_target}")
+        st.stop()
     with st.sidebar:
-        source_kind = st.selectbox(
-            "Review source", source_options, index=source_index
-        )
+        target = st.selectbox("Review target", target_options, index=target_options.index(configured_target), on_change=retire_active_view)
     native = native_app = None
-    if source_kind == "Barrage":
-        default_root = os.environ.get(
-            "DINO_REVIEW_BARRAGE_DIR",
-            os.environ.get("DINO_BARRAGE_DIR", "output/brdu_edu_barrage"),
-        )
-        root = Path(st.sidebar.text_input("Barrage directory", default_root)).resolve()
+    if target == "Crop directory":
+        default_root = os.environ.get("DINO_REVIEW_BARRAGE_DIR", os.environ.get("DINO_BARRAGE_DIR", "output/brdu_edu_barrage"))
+        root = Path(st.sidebar.text_input("Barrage directory", default_root, on_change=retire_active_view)).expanduser().resolve()
         try:
             source: ReviewSource = get_barrage_source(str(root))
         except (FileNotFoundError, ValueError) as error:
+            retire_active_view()
             st.error(str(error))
             st.stop()
-        modes = (
-            "EdU correction gallery",
-            "BrdU correction gallery",
-            "Cell review",
-        )
         state_dir = root / "cell-review"
+        spatial_path = root / "spatial.json"
+        revision = source.source_id
+        if spatial_path.is_file():
+            revision += f":spatial:{spatial_path.stat().st_mtime_ns}"
     else:
-        native_dir = st.sidebar.text_input(
-            "Native app directory",
-            os.environ.get(
-                "DINO_NATIVE_REVIEW_DIR",
-                "/working/eduseg/20260808-prod2/full-run/vz-rates",
-            ),
-        )
-        label_root = Path(
-            st.sidebar.text_input(
-                "Native label root",
-                os.environ.get(
-                    "DINO_REVIEW_LABEL_ROOT",
-                    "/working/eduseg/20260808-prod2/full-run2",
-                ),
-            )
-        ).resolve()
-        default_native_pythonpath = str(Path(native_dir).resolve().parent / "svz-cut")
-        native_dependency_dirs = tuple(
-            path
-            for path in os.environ.get(
-                "DINO_NATIVE_PYTHONPATH", default_native_pythonpath
-            ).split(os.pathsep)
-            if path
-        )
         try:
-            source, native, native_app = load_native_source(
-                native_dir, label_root, native_dependency_dirs
-            )
+            native, native_app = get_native_modules(target)
+            label_root = Path(st.sidebar.text_input("Review state directory", os.environ.get("DINO_REVIEW_LABEL_ROOT", str(native.REVIEW_ROOT)), key=f"native-label-root:{target}", on_change=retire_active_view)).expanduser().resolve()
+            source = NativeSource(native_app.get_source(native.FieldSource), label_root=label_root)
         except (FileNotFoundError, ImportError, ValueError) as error:
+            retire_active_view()
             st.error(str(error))
             st.stop()
-        modes = (
-            "Ventricular fields",
-            "Training miscalls",
-            "EdU correction gallery",
-            "BrdU correction gallery",
-        )
         state_dir = label_root / "cell-review"
-
+        revision = source.source_id
+    context = activate_target(source.target_id, revision=revision)
+    context["workspace"]["review_source"] = source
+    spatial = isinstance(source, NativeSource)
+    if target == "Crop directory" and spatial_path.is_file():
+        from dinoapp.rhu2_app import get_source as get_spatial_source
+        context["workspace"]["spatial_source"] = get_spatial_source(str(root), spatial_path.stat().st_mtime_ns)
+        spatial = True
+    scopes = ["Dataset cells"]
+    if isinstance(source, NativeSource):
+        scopes.append("Training miscalls")
+    if context["workspace"]["queue"] is not None:
+        scopes.append("Captured cells")
+    pending = context.pop("navigation", None)
+    if pending:
+        for name, value in zip(("scope", "view"), pending, strict=True):
+            context["widgets"][name] = value
+            st.session_state[f"review:{context['session_id']}:{name}"] = value
+    if context["widgets"].get("scope") not in scopes:
+        context["widgets"]["scope"] = scopes[0]
+        st.session_state[f"review:{context['session_id']}:scope"] = scopes[0]
     with st.sidebar:
-        review_mode = st.selectbox("Review mode", modes)
-        st.caption(f"Source: {source.display_name}")
-    if review_mode == "Ventricular fields":
-        native_field_mode(source, native, native_app)
+        scope = st.selectbox("Review scope", scopes, key=widget_key(context, "scope", scopes[0]), on_change=remember_widget, args=(context, "scope"))
+        if scope == "Training miscalls":
+            views = ["Correction gallery"]
+        elif scope == "Captured cells":
+            views = ["Cell review"]
+        else:
+            views = []
+            if spatial:
+                views.append("Spatial field")
+            if "combined" in source.crop_markers:
+                views.append("Cell review")
+            for marker, label in (("edu", "EdU correction gallery"), ("brdu", "BrdU correction gallery")):
+                if marker in source.crop_markers:
+                    views.append(label)
+        if pending is None and context["workspace"].get("active_scope") != scope:
+            restored = context["workspace"].setdefault("scope_views", {}).get(scope, views[0] if views else None)
+            context["widgets"]["view"] = restored
+            st.session_state[f"review:{context['session_id']}:view"] = restored
+        if not views:
+            st.error("This target has no supported review crops or spatial fields.")
+            st.stop()
+        if context["widgets"].get("view") not in views:
+            context["widgets"]["view"] = views[0]
+            st.session_state[f"review:{context['session_id']}:view"] = views[0]
+        view = st.selectbox("Review view", views, key=widget_key(context, "view", views[0]), on_change=remember_widget, args=(context, "view"))
+        context["workspace"]["active_scope"] = scope
+        context["workspace"].setdefault("scope_views", {})[scope] = view
+        st.caption(f"Target: {source.display_name}")
+        if isinstance(source, NativeSource):
+            st.caption(source.field_source.classifier_caption)
+    if view == "Spatial field":
+        if isinstance(source, NativeSource):
+            native_field_mode(source, native, native_app)
+        else:
+            from dinoapp.rhu2_app import spatial_mode
+            spatial_mode(root, target_id=source.target_id)
         return
-    if review_mode == "Training miscalls":
-        native_app.review_training_miscalls(
-            source.field_source,
-            source.annotation_paths,
-            state_dir,
-        )
+    if scope == "Training miscalls":
+        native_app.review_training_miscalls(source.field_source, source.annotation_paths, state_dir)
         return
-    annotations = AnnotationFiles(
-        source.annotation_paths, source.default_annotation_path
-    )
-    context = get_context(source.source_id)
-    if review_mode == "Cell review":
+    annotations = AnnotationFiles(source.annotation_paths, source.default_annotation_path)
+    if view == "Cell review":
+        queue = context["workspace"]["queue"] if scope == "Captured cells" else None
         review_barrage_cell(
-            source,
-            annotations,
-            context,
-            state_dir=state_dir,
+            queue["source"] if queue is not None else source,
+            annotations, context, state_dir=state_dir, queue=queue,
         )
         return
-    marker = "edu" if review_mode.startswith("EdU") else "brdu"
-    review_marker_gallery(
-        source,
-        annotations,
-        context,
-        marker,
-        state_dir=state_dir,
-    )
+    marker = "edu" if view.startswith("EdU") else "brdu"
+    review_marker_gallery(source, annotations, context, marker, state_dir=state_dir)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "thesis-dino"
+version = "0.2.0"
+description = "Cell-DINO BrdU/EdU classification workflows for the thesis"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click",
+    "contourpy",
+    "joblib",
+    "loguru",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "pillow",
+    "polars",
+    "pyarrow",
+    "scikit-image",
+    "scikit-learn",
+    "scipy",
+    "squisher",
+    "zarr",
+]
+
+[project.optional-dependencies]
+compute = [
+    "dinov2",
+    "osqp",
+    "squisher-segment",
+    "torch",
+    "torchvision",
+]
+workspace = [
+    "anndata",
+    "fishtools",
+    "tifffile",
+]
+dev = [
+    "pytest>=8.4.1",
+    "ruff",
+]
+
+[project.scripts]
+dino = "dino.cli:main"
+dino-zarr = "dino.zarr_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dino"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: public workflow and artifact behavior"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+ignore = ["E501", "E713", "E731"]

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,8 +121,16 @@ def test_native_adapter_keeps_numeric_parsing_inside_source():
 
         return read
 
+    annotation_paths = tuple(
+        Path("/tmp/native-labels") / name / "labels.csv"
+        for name in ("barrage-cortex", "barrage-vz-svz", "barrage-pixel")
+    )
     field_source = SimpleNamespace(
-        training_predictions=predictions,
+        annotation_paths=annotation_paths,
+        default_annotation_path=annotation_paths[-1],
+        display_name="Prod2 native",
+        cell_id=lambda label: f"full-run2|{label}",
+        gallery_predictions=predictions,
         model_version="model-1",
         origin=[100.0],
         scale=[2.0],
@@ -143,6 +150,30 @@ def test_native_adapter_keeps_numeric_parsing_inside_source():
     result = source.crop("full-run2|10", "edu")
     assert calls == [("edu", 10)]
     assert result.detail == "Training · cortex · Z 106.0 µm"
+
+
+def test_native_adapter_uses_dataset_annotation_ownership(tmp_path: Path):
+    paths = (tmp_path / "cortex.csv", tmp_path / "vz_svz.csv")
+    update_label(paths[0], "prod3|10", (0, 0))
+    field_source = SimpleNamespace(
+        annotation_paths=paths,
+        default_annotation_path=paths[-1],
+        display_name="Prod3 native",
+        gallery_predictions=pd.DataFrame({"cell": ["prod3|10", "prod3|20"]}),
+        model_version="model-3",
+    )
+
+    source = NativeSource(field_source, label_root=tmp_path / "review-state")
+
+    assert source.annotation_paths == paths
+    assert source.default_annotation_path == paths[-1]
+    assert source.display_name == "Prod3 native"
+    annotations = AnnotationFiles(source.annotation_paths, source.default_annotation_path)
+    annotations.assign("prod3|10", (1, 0), expected=(0, 0))
+    annotations.assign("prod3|20", (0, 1), expected=None)
+    assert load_labels(paths[0])[["cell", "brdu", "edu"]].values.tolist() == [["prod3|10", 1, 0]]
+    assert load_labels(paths[1])[["cell", "brdu", "edu"]].values.tolist() == [["prod3|20", 0, 1]]
+    assert not (tmp_path / "review-state").exists()
 
 
 def test_gallery_queue_is_stable_and_cards_change_only_one_marker(tmp_path: Path):
@@ -239,13 +270,7 @@ def test_gallery_rejects_disagreement_between_item_and_cell(
         "prefetches": {},
         "initial": {"cell|1": (0, 0), "cell|2": (0, 0)},
     }
-    context = {
-        "history": [],
-        "galleries": {},
-        "notice": "",
-        "client_token": None,
-        "session_id": "session",
-    }
+    context = app.get_context("event-test")
     event = {
         "itemId": "cell|1",
         "cell": "cell|2",
@@ -269,7 +294,7 @@ def test_gallery_rejects_disagreement_between_item_and_cell(
 
     with pytest.raises(Rerun):
         app.render_gallery(
-            SimpleNamespace(source_id="source"),
+            SimpleNamespace(source_id="source", crop_markers=("edu",)),
             SimpleNamespace(values={"cell|1": (0, 0), "cell|2": (0, 0)}),
             context,
             gallery,
@@ -282,23 +307,28 @@ def test_gallery_rejects_disagreement_between_item_and_cell(
     )
 
 
-def test_native_loader_adds_external_dependency_directories(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    native_dir = tmp_path / "native"
-    dependency_dir = tmp_path / "dependency"
-    native_dir.mkdir()
-    dependency_dir.mkdir()
-    (dependency_dir / "profiles.py").write_text("VALUE = 7\n")
-    (native_dir / "cell_review.py").write_text("from profiles import VALUE\n")
-    (native_dir / "cell_review_app.py").write_text("LOADED = True\n")
-    for name in ("cell_review", "cell_review_app", "profiles"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
+@pytest.mark.parametrize("dataset", ["Prod2", "Prod3"])
+def test_native_loader_uses_packaged_modules(dataset, monkeypatch):
+    imports = []
 
-    native, native_app = get_native_modules(str(native_dir), (str(dependency_dir),))
+    def load(name):
+        imports.append(name)
+        return SimpleNamespace(__name__=name)
 
-    assert native.VALUE == 7
-    assert native_app.LOADED is True
+    monkeypatch.setattr(app.importlib, "import_module", load)
+    get_native_modules.clear()
+    try:
+        native, native_app = get_native_modules(dataset)
+        assert native.__name__ == app.NATIVE_SOURCES[dataset]
+        assert native_app.__name__ == "dinoapp.native_app"
+        assert imports == [app.NATIVE_SOURCES[dataset], "dinoapp.native_app"]
+    finally:
+        get_native_modules.clear()
+
+
+def test_native_loader_rejects_unknown_datasets():
+    with pytest.raises(ValueError, match="Unknown native dataset"):
+        get_native_modules("Other")
 
 
 def test_launch_starts_universal_streamlit_app(monkeypatch: pytest.MonkeyPatch):
@@ -326,3 +356,58 @@ def test_launch_starts_universal_streamlit_app(monkeypatch: pytest.MonkeyPatch):
             True,
         )
     ]
+
+
+@pytest.mark.parametrize('marker', ['edu', 'brdu'])
+@pytest.mark.parametrize('empty_reason', ['source', 'annotations', 'split', 'identity'])
+def test_native_empty_gallery_preserves_row_schema(tmp_path, marker, empty_reason):
+    columns = ['cell', 'label', 'tranche', 'split', 'p_brdu', 'pred_brdu', 'p_edu', 'pred_edu']
+    frame = pd.DataFrame([['prod3|10', 10, 'vz_svz', 'training', .2, False, .7, True]], columns=columns)
+    if empty_reason == 'source':
+        frame = pd.DataFrame(columns=columns)  # The live Prod3 adapter's original schema.
+    path = tmp_path / 'labels.csv'
+    pd.DataFrame([{'cell': 'prod3|10', 'brdu': 0, 'edu': 1}]).to_csv(path, index=False)
+    annotations = AnnotationFiles((path,), path)
+    if empty_reason == 'annotations':
+        annotations.values.clear()
+    field_source = SimpleNamespace(annotation_paths=(path,), default_annotation_path=path,
+                                   display_name='Prod3 native', gallery_predictions=frame,
+                                   model_version='baseline')
+    source = NativeSource(field_source, label_root=tmp_path)
+    subset = 'Validation' if empty_reason == 'split' else 'All labeled'
+    identity = (1, 0) if empty_reason == 'identity' else (0, 1)
+    rows = source.correction_rows(annotations.values, identity=identity, subset=subset, dataset='All datasets')
+    assert rows.empty
+    assert rows.columns.tolist() == columns
+    gallery = new_gallery_state(source, annotations, marker=marker, subset=subset,
+                                dataset='All datasets', identity=identity)
+    assert gallery['cells'] == []
+    assert gallery['initial'] == {}
+
+
+def test_native_target_identity_tracks_annotation_ownership_not_review_revisions(tmp_path):
+    paths = (tmp_path / 'cortex' / 'labels.csv', tmp_path / 'pixel' / 'labels.csv')
+    predictions = pd.DataFrame({'cell': ['prod3|1'], 'split': ['training'], 'tranche': ['cortex']})
+
+    def reader(model, pixels, owners=paths):
+        return SimpleNamespace(annotation_paths=owners, default_annotation_path=owners[-1],
+                               gallery_predictions=predictions, display_name='Native',
+                               model_version=model, pixel_version=pixels)
+
+    first = NativeSource(reader('model-1', 'display-1'), label_root=tmp_path / 'session-one')
+    second = NativeSource(reader('model-2', 'display-2'), label_root=tmp_path / 'session-two')
+    separate = NativeSource(reader('model-1', 'display-1', (tmp_path / 'other' / 'labels.csv',)),
+                            label_root=tmp_path / 'session-one')
+    assert first.target_id == second.target_id
+    assert first.source_id != second.source_id
+    assert first.target_id != separate.target_id
+
+
+def test_barrage_revision_does_not_replace_its_annotation_target(tmp_path):
+    write_barrage(tmp_path)
+    first = BarrageSource(tmp_path)
+    (tmp_path / 'complete.json').write_text('{"revision": 2}')
+    second = BarrageSource(tmp_path)
+    assert first.target_id == second.target_id
+    assert first.source_id != second.source_id
+    assert first.annotation_paths == second.annotation_paths

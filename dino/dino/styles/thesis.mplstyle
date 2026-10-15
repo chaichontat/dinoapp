@@ -1,0 +1,31 @@
+# Shared Matplotlib style for dissertation figures.
+#
+# Usage:
+#   plt.style.use("styles/thesis.mplstyle")
+#
+# Arial is required. Matplotlib style sheets cannot disable font fallback, so
+# figure scripts should still verify the resolved font with fallback_to_default=False.
+
+# Typography
+font.sans-serif: Arial
+font.size: 9
+axes.titlesize: 10
+axes.labelsize: 10
+axes.spines.top: False
+axes.spines.right: False
+xtick.labelsize: 9
+ytick.labelsize: 9
+mathtext.fontset: custom
+mathtext.rm: Arial
+mathtext.it: Arial:italic
+mathtext.bf: Arial:bold
+
+# Legends
+legend.fontsize: 9
+legend.frameon: False
+
+# Export
+savefig.dpi: 300
+pdf.fonttype: 42
+ps.fonttype: 42
+svg.fonttype: none

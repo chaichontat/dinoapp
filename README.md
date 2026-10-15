@@ -1,61 +1,62 @@
-# dinoapp
+# dinoinfer
 
-`dinoapp` is a standalone Streamlit application for reviewing BrdU and EdU
-cell calls. It opens indexed barrage datasets, keeps review queues stable while
-labels change, writes labels atomically with compare-and-set conflict checks,
-and records backups and JSONL change journals.
+Cell image review, classifier fitting, and inference live in two independently
+installable Python packages:
+
+| Directory | Distribution | Commands | Documentation |
+| --- | --- | --- | --- |
+| `dinoapp/` | `dinoapp` | `dinoapp`, `dinoapp-legacy` | [Reviewer](dinoapp/README.md) |
+| `dino/` | `thesis-dino` | `dino`, `dino-zarr` | [Fitting and inference](dino/README.md) |
+
+The reviewer uses DINO's public source readers, pixel corrections, rendering, and
+review contracts. DINO owns training, inference, and model activation. Editing
+labels in the reviewer does not automatically retrain a model or run inference.
 
 ## Install
 
-Python 3.10 or newer is required on Linux or another POSIX system.
+Run these commands from the repository root. Basic crop review supports Python
+3.10 or newer:
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ./dinoapp
 ```
 
-For development:
+Native review and DINO require Python 3.12 or newer. Install both local packages
+in the same environment:
 
 ```bash
-python -m pip install -e '.[dev]'
-pytest
-ruff check .
+python -m pip install -e ./dino -e './dinoapp[native]'
 ```
 
-## Run
-
-Point the app at a barrage directory and launch it:
+For fitting and encoder execution, install `./dino[compute]`; H5AD and microscopy
+workspace commands also require `./dino[workspace]`. See the package documentation
+for the local DINOv2, fishtools, and squisher dependencies and checkpoint setup.
+The uv workspace resolves `thesis-dino` from `dino/` for native reviewer installs.
 
 ```bash
 export DINO_REVIEW_BARRAGE_DIR=/path/to/barrage
 dinoapp --server.port 8502
+dino-zarr train --help
+dino-zarr infer --help
 ```
 
-You can also run `python -m dinoapp`. Any extra arguments are forwarded to
-Streamlit.
+## Development
 
-The barrage directory must contain `index.csv` with unique `cell` and `rank`
-columns. Crop files are resolved from `brdu_image_path`, `edu_image_path`, and
-`combined_image_path`; a legacy `image_path` column is accepted as a fallback.
-Labels are read from and written to `labels.csv` without dropping unrelated
-rows or extra columns.
-
-## Prod2 native source
-
-Choose **Prod2 native** in the sidebar to load the existing native field and
-training-review implementation lazily. Configure its external location with:
+Install the development extras in the environment with the required local
+dependencies:
 
 ```bash
-export DINO_NATIVE_REVIEW_DIR=/path/to/native/app
-export DINO_REVIEW_LABEL_ROOT=/path/to/native/labels
-export DINO_NATIVE_PYTHONPATH=/path/to/native/dependencies
+python -m pip install --no-deps -e './dino[dev]' -e './dinoapp[dev]'
+conda run -n seq pytest dino/tests/test_cli.py dino/tests/test_zarr_cli.py dinoapp/tests/test_label_store.py
+conda run -n seq ruff check dino/dino/roc.py
 ```
 
-The native directory must provide importable `cell_review.py` and
-`cell_review_app.py` modules with the interfaces used by the adapter. Multiple
-native dependency directories in `DINO_NATIVE_PYTHONPATH` use the platform path
-separator. By default, the app adds a sibling `svz-cut` directory beside the
-configured native app directory, matching the prod2 layout.
+Both package test directories are configured at the root. Run focused tests for
+the behavior being changed. To build both source distributions and wheels:
 
-## License
+```bash
+uv build --all-packages
+```
 
-[MIT](LICENSE)
+Reviewer documentation and format details are in `dinoapp/`; DINO documentation
+and tests are in `dino/`.

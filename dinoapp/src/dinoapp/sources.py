@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,12 +29,14 @@ class Crop:
 
 
 class ReviewSource(Protocol):
+    target_id: str
     source_id: str
     display_name: str
     annotation_paths: tuple[Path, ...]
     default_annotation_path: Path
     subsets: tuple[str, ...]
     datasets: tuple[str, ...]
+    crop_markers: tuple[str, ...]
 
     def review_rows(self, *, dataset: str) -> pd.DataFrame: ...
 
@@ -130,6 +133,10 @@ class BarrageSource:
             raise ValueError("Barrage ranks must be unique")
         self.rows = self.rows.sort_values(["rank", "cell"], kind="stable").reset_index(drop=True)
         self._by_cell = self.rows.set_index("cell", drop=False)
+        self.crop_markers = tuple(
+            marker for marker in ("combined", "edu", "brdu")
+            if f"{marker}_image_path" in self.rows or "image_path" in self.rows
+        )
         self.annotation_paths = (self.root / "labels.csv",)
         self.default_annotation_path = self.annotation_paths[0]
         self.subsets = ("All labeled",)
@@ -140,7 +147,8 @@ class BarrageSource:
             self.datasets = ("All datasets",)
         self.display_name = self.root.name
         completion = self.root / "complete.json"
-        self.source_id = f"barrage:{self.root}:{_path_digest(completion)}"
+        self.target_id = f"barrage:{self.root}"
+        self.source_id = f"{self.target_id}:{_path_digest(completion)}"
 
     def review_rows(self, *, dataset: str) -> pd.DataFrame:
         if dataset not in self.datasets:
@@ -160,13 +168,9 @@ class BarrageSource:
     ) -> pd.DataFrame:
         if subset not in self.subsets:
             raise ValueError(f"Unsupported barrage subset: {subset}")
-        if dataset not in self.datasets:
-            raise ValueError(f"Unknown barrage dataset: {dataset}")
+        selected = self.review_rows(dataset=dataset)
         cells = [cell for cell, value in live_labels.items() if value == identity]
-        selected = self.rows[self.rows["cell"].isin(cells)]
-        if dataset != "All datasets":
-            selected = selected[selected["dataset"].astype(str) == dataset]
-        return selected.sort_values(["rank", "cell"], kind="stable").reset_index(drop=True)
+        return selected[selected["cell"].isin(cells)].reset_index(drop=True)
 
     def _image_path(self, row: pd.Series, marker: str) -> Path:
         explicit = f"{marker}_image_path"
@@ -201,7 +205,9 @@ class BarrageSource:
 
 
 class NativeSource:
-    """Adapt the prod2 native source to the opaque-cell gallery contract."""
+    """Adapt native datasets to opaque-cell crops and fixed gallery rosters."""
+
+    crop_markers = ("combined", "edu", "brdu")
 
     def __init__(
         self,
@@ -211,18 +217,23 @@ class NativeSource:
     ):
         self.field_source = field_source
         self.label_root = label_root.resolve()
-        self.annotation_paths = tuple(
-            self.label_root / name / "labels.csv"
-            for name in ("barrage-cortex", "barrage-vz-svz", "barrage-pixel")
-        )
-        self.default_annotation_path = self.annotation_paths[-1]
+        self.annotation_paths = tuple(field_source.annotation_paths)
+        self.default_annotation_path = field_source.default_annotation_path
         self.subsets = ("Training", "Validation", "All labeled")
         self.datasets = ("All datasets",)
-        self.display_name = "Prod2 native"
+        self.display_name = field_source.display_name
+        self.target_id = "native:" + json.dumps({
+            "reader": f"{type(field_source).__module__}.{type(field_source).__qualname__}",
+            "paths": [str(path.resolve()) for path in self.annotation_paths],
+            "default": str(self.default_annotation_path.resolve()),
+        }, sort_keys=True)
         self.source_id = (
-            f"native:{self.label_root}:{getattr(field_source, 'model_version', 'unknown')}"
+            f"{self.target_id}:state:{self.label_root}:model:{getattr(field_source, 'model_version', 'unknown')}"
         )
-        self._predictions = field_source.training_predictions.copy()
+        pixel_version = getattr(field_source, 'pixel_version', None)
+        if pixel_version is not None:
+            self.source_id += f":display:{pixel_version}"
+        self._predictions = field_source.gallery_predictions.copy()
         if self._predictions["cell"].duplicated().any():
             raise ValueError("Native review prediction cells must be unique")
         self._by_cell = self._predictions.set_index("cell", drop=False)
@@ -245,26 +256,37 @@ class NativeSource:
         selected = self._predictions[self._predictions["cell"].isin(live_labels)]
         if subset != "All labeled":
             selected = selected[selected["split"] == subset.lower()]
-        selected = selected[
+        selected = selected.loc[
             selected["cell"].map(lambda cell: live_labels[str(cell)] == identity)
         ]
         return selected.sort_values("cell", kind="stable").reset_index(drop=True)
 
+    def cell_label(self, cell: str) -> int:
+        _, separator, value = cell.rpartition("|")
+        if not separator or not value.isascii() or not value.isdecimal():
+            raise ValueError(f"Invalid native cell identity: {cell}")
+        label = int(value)
+        if label <= 0 or self.field_source.cell_id(label) != cell:
+            raise ValueError(f"Invalid native cell identity: {cell}")
+        return label
+
+    def field_at_cell(self, cell: str, width_um: float):
+        return self.field_source.field_at_cell(self.cell_label(cell), width_um)
+
     def crop(self, cell: str, marker: str) -> Crop:
         if marker not in {"brdu", "edu", "combined"}:
             raise ValueError(f"Unexpected crop marker: {marker}")
-        if cell not in self._by_cell.index:
-            raise KeyError(f"Cell is absent from native review predictions: {cell}")
-        label = int(cell.rsplit("|", 1)[1])
+        label = self.cell_label(cell)
         crop_method = {
             "brdu": self.field_source.brdu_cell_crop,
             "edu": self.field_source.edu_cell_crop,
             "combined": self.field_source.cell_crop,
         }[marker]
         image, plane_z = crop_method(label)
-        row = self._by_cell.loc[cell]
         z_um = self.field_source.origin[0] + plane_z * self.field_source.scale[0]
-        detail = (
-            f"{str(row['split']).capitalize()} · {row['tranche']} · Z {z_um:.1f} µm"
-        )
-        return Crop(image, f"Cell {label}", detail)
+        parts = []
+        if cell in self._by_cell.index:
+            row = self._by_cell.loc[cell]
+            parts.extend([str(row["split"]).capitalize(), str(row["tranche"])])
+        parts.append(f"Z {z_um:.1f} µm")
+        return Crop(image, f"Cell {label}", " · ".join(parts))
