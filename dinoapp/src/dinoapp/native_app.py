@@ -217,7 +217,7 @@ def gallery_picker():
 
 @st.cache_resource
 def gallery_prefetch_executor() -> ThreadPoolExecutor:
-    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="edu-gallery")
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="gallery")
 
 
 def reset_position(context: dict) -> None:

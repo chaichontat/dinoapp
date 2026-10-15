@@ -71,15 +71,19 @@ class FieldSource(NativeFieldSource):
         self.sources = {
             "561": root
             / "235-2-561638514-3/fusion-561-preibisch-v1/fused.ch0.ome.zarr",
-            "EdU": Path(source["channels"]["edu"]["root"]),
-            "BrdU": Path(source["channels"]["brdu"]["root"]),
+            **{
+                name: Path(source["channels"][key]["root"])
+                for name, key in self.raw_channels.items()
+                if key in self.config.contract.markers
+            },
         }
-        geometry = source["channels"]["edu"]["ome"]["coordinate_transformations"]
+        grid = source["channels"][self.config.contract.markers[0]]
+        geometry = grid["ome"]["coordinate_transformations"]
         self.scale = np.asarray(next(v["scale"] for v in geometry if v["type"] == "scale"))
         self.origin = np.asarray(
             next(v["translation"] for v in geometry if v["type"] == "translation")
         )
-        self.shape = tuple(source["channels"]["edu"]["shape"])
+        self.shape = tuple(grid["shape"])
         self.default_z = float(
             self.origin[0] + round((679.05868151 - self.origin[0]) / self.scale[0]) * self.scale[0]
         )
@@ -100,8 +104,9 @@ class FieldSource(NativeFieldSource):
         self.display_pixels.validate_native_grid(
             labels=labels_meta["root"], shape=self.shape, scale=self.scale, origin=self.origin,
         )
-        self.arrays["BrdU"] = self.display_pixels.source.channels["brdu"]
-        self.arrays["EdU"] = self.display_pixels.source.channels["edu"]
+        for name, key in self.raw_channels.items():
+            if key in self.config.contract.markers:
+                self.arrays[name] = self.display_pixels.source.channels[key]
         self.crop_reader = CellCropReader(
             labels=self.labels,
             channels={
