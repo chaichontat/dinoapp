@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import os
-import sys
 import json
+import os
+import re
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,7 +12,21 @@ import pytest
 import zarr
 
 from dino import zarr_prepare
+from dino.artifacts import file_sha256
 from dino.zarr_prepare import measure_block, reduce_measurements
+from dino_markers import (
+    DEFAULT_CONTRACT,
+    ContractMismatchError,
+    MarkerConfigError,
+    MissingContractError,
+    config_to_json,
+    contract_of,
+    default_config,
+    load_config,
+    parse_config,
+)
+
+DEFAULT_KEYS = DEFAULT_CONTRACT.channel_keys
 
 
 def test_max_area_plane_tie_prefers_centroid_then_lower_z() -> None:
@@ -45,37 +60,39 @@ def preparation_run(tmp_path, monkeypatch):
     )
 
     channel_paths = {}
-    for name in ("pi", "edu", "brdu"):
+    for name in ("pi", "edu", "brdu", "dapi", "pcna"):
         path = tmp_path / f"{name}.zarr"
         array = zarr.open_array(path, mode="w", shape=(4, 10, 10), chunks=(1, 4, 4), dtype="u2")
         array[:] = 1
         channel_paths[name] = path
     out_dir = tmp_path / "source"
-    monkeypatch.setattr(
-        "sys.argv",
-        [
+
+    def argv(keys=DEFAULT_KEYS, *extra, out=None):
+        return [
             "dino-zarr prepare",
             "--labels",
             str(labels_path),
-            "--pi",
-            str(channel_paths["pi"]),
-            "--edu",
-            str(channel_paths["edu"]),
-            "--brdu",
-            str(channel_paths["brdu"]),
+            *(arg for key in keys for arg in ("--channel", f"{key}={channel_paths[key]}")),
             "--offset-zyx",
             "0",
             "2",
             "3",
             "--out-dir",
-            str(out_dir),
+            str(out or out_dir),
             "--workers",
             "1",
-        ],
-    )
+            *extra,
+        ]
+
+    monkeypatch.setattr("sys.argv", argv())
 
     return SimpleNamespace(
-        out_dir=out_dir, expected=expected, channel_paths=channel_paths, labels_path=labels_path
+        out_dir=out_dir,
+        expected=expected,
+        channel_paths=channel_paths,
+        labels_path=labels_path,
+        argv=argv,
+        tmp_path=tmp_path,
     )
 
 
@@ -136,6 +153,7 @@ def test_prepare_reuses_postprocessed_measurements_without_scanning_labels(measu
     assert not (measured_run.out_dir / "partials").exists()
     before = (measured_run.out_dir / "complete.json").read_bytes()
     assert "measured_props_sha256" in json.loads(before)
+    assert json.loads(before)["artifact"] == "dino-zarr-source-complete-v2"
     zarr_prepare.main()
     assert (measured_run.out_dir / "complete.json").read_bytes() == before
     props = pl.read_parquet(measured_run.props_path).with_columns(pl.lit(1.0).alias("extra"))
@@ -232,3 +250,283 @@ def test_prepare_resumes_partial_pair_and_rejects_changed_source(preparation_run
     assert {
         path.relative_to(run.out_dir): path.read_bytes() for path in run.out_dir.rglob("*") if path.is_file()
     } == after
+
+
+THREE_MARKER_KEYS = ("dapi", "edu", "brdu", "pcna")
+LABELS = {"pi": "PI", "dapi": "DAPI", "brdu": "BrdU", "edu": "EdU", "pcna": "PCNA"}
+
+
+def write_markers(path, reference, markers, *, colors=("#ff0000", "#00ff00", "#0000ff")):
+    """Write a valid markers.json for the given contract and return its path."""
+    value = {
+        "version": 1,
+        "reference": {"key": reference, "label": LABELS[reference]},
+        "markers": [
+            {"key": key, "label": LABELS[key], "color": color} for key, color in zip(markers, colors)
+        ],
+        "presentation": {
+            "crop_panels": [reference, *reversed(markers)],
+            "negative_color": "#404040",
+            "uncalled_color": "#999999",
+        },
+    }
+    parse_config(value, source=str(path))
+    path.write_text(json.dumps(value))
+    return path
+
+
+def tree_bytes(directory):
+    return {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
+def run_main(run, monkeypatch, keys=DEFAULT_KEYS, *extra, out=None):
+    monkeypatch.setattr(sys, "argv", run.argv(keys, *extra, out=out))
+    zarr_prepare.main()
+
+
+def read_json(path):
+    return json.loads(path.read_text())
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def make_legacy(out_dir):
+    """Turn a completed default output into the form older code wrote: v1 completion, no markers.json."""
+    complete = read_json(out_dir / "complete.json")
+    del complete["marker_contract"]
+    complete["artifact"] = "dino-zarr-source-complete-v1"
+    write_json(out_dir / "complete.json", complete)
+    (out_dir / "markers.json").unlink()
+
+
+@pytest.mark.integration
+def test_default_prepare_records_contract_and_stores_the_default_config(preparation_run) -> None:
+    out_dir = preparation_run.out_dir
+    zarr_prepare.main()
+
+    source = read_json(out_dir / "source.json")
+    assert read_json(out_dir / "complete.json") == {
+        "artifact": "dino-zarr-source-complete-v2",
+        "cells": 2,
+        "cells_sha256": file_sha256(out_dir / "cells.parquet"),
+        "marker_contract": {"version": 1, "reference": "pi", "markers": ["brdu", "edu"]},
+        "source_sha256": source["source_sha256"],
+    }
+    assert read_json(out_dir / "markers.json") == config_to_json(default_config())
+    assert "marker_contract" not in source
+
+
+@pytest.mark.integration
+def test_three_marker_prepare_records_contract_and_config(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    markers = write_markers(run.tmp_path / "three.json", "dapi", ["edu", "brdu", "pcna"])
+
+    run_main(run, monkeypatch, THREE_MARKER_KEYS, "--markers", str(markers))
+
+    complete = read_json(run.out_dir / "complete.json")
+    assert complete["artifact"] == "dino-zarr-source-complete-v2"
+    assert complete["marker_contract"] == {"version": 1, "reference": "dapi", "markers": ["edu", "brdu", "pcna"]}
+    assert read_json(run.out_dir / "markers.json") == config_to_json(load_config(markers))
+    assert list(read_json(run.out_dir / "source.json")["channels"]) == ["brdu", "dapi", "edu", "pcna"]
+    assert pl.read_parquet(run.out_dir / "cells.parquet")["label"].to_list() == [7, 9]
+    assert contract_of(run.out_dir).markers == ("edu", "brdu", "pcna")
+
+
+@pytest.mark.integration
+def test_source_json_bytes_do_not_depend_on_the_marker_config(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    reordered = write_markers(run.tmp_path / "reordered.json", "pi", ["edu", "brdu"], colors=("#123456", "#abcdef"))
+    other = run.tmp_path / "other"
+
+    run_main(run, monkeypatch)
+    run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(reordered), out=other)
+
+    assert (other / "source.json").read_bytes() == (run.out_dir / "source.json").read_bytes()
+    assert read_json(other / "complete.json")["source_sha256"] == read_json(run.out_dir / "complete.json")[
+        "source_sha256"
+    ]
+    assert read_json(other / "complete.json")["marker_contract"]["markers"] == ["edu", "brdu"]
+    assert read_json(run.out_dir / "complete.json")["marker_contract"]["markers"] == ["brdu", "edu"]
+
+
+@pytest.mark.parametrize(
+    "channels,message",
+    [
+        (["pi=P", "edu=E"], r"missing \['brdu'\], unexpected \[\]"),
+        (["pi=P", "edu=E", "brdu=B", "dapi=D"], r"missing \[\], unexpected \['dapi'\]"),
+        (["PI=P", "edu=E", "brdu=B"], r"missing \['pi'\], unexpected \['PI'\]"),
+        (["pi=P", "pi=P2", "edu=E", "brdu=B"], "'pi' given more than once"),
+        (["pi", "edu=E", "brdu=B"], "expects KEY=PATH, got 'pi'"),
+        (["=P", "edu=E", "brdu=B"], "expects KEY=PATH, got '=P'"),
+        (["pi=", "edu=E", "brdu=B"], "expects KEY=PATH, got 'pi='"),
+    ],
+)
+def test_prepare_rejects_invalid_channel_arguments(tmp_path, monkeypatch, capsys, channels, message) -> None:
+    argv = ["dino-zarr prepare", "--labels", "L", "--offset-zyx", "0", "0", "0", "--out-dir", str(tmp_path / "o")]
+    for channel in channels:
+        argv += ["--channel", channel]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as raised:
+        zarr_prepare.main()
+
+    assert raised.value.code == 2
+    err = capsys.readouterr().err
+    assert re.search(r"--channel .*" + message, err)
+    assert not (tmp_path / "o").exists()
+
+
+def test_prepare_requires_exactly_the_channels_of_a_custom_contract(preparation_run, monkeypatch, capsys) -> None:
+    run = preparation_run
+    markers = write_markers(run.tmp_path / "three.json", "dapi", ["edu", "brdu", "pcna"])
+
+    with pytest.raises(SystemExit):
+        run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(markers))
+
+    assert (
+        "--channel keys must be exactly ['dapi', 'edu', 'brdu', 'pcna']: "
+        "missing ['dapi', 'pcna'], unexpected ['pi']"
+    ) in capsys.readouterr().err
+    assert not run.out_dir.exists()
+
+
+def test_prepare_rejects_an_invalid_markers_file(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    bad = run.tmp_path / "bad.json"
+    bad.write_text(json.dumps({"version": 1}))
+
+    with pytest.raises(MarkerConfigError, match="missing keys"):
+        run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(bad))
+
+    assert not run.out_dir.exists()
+
+
+@pytest.mark.integration
+def test_prepare_rejects_reordered_markers_for_a_completed_default_output(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    reordered = write_markers(run.tmp_path / "reordered.json", "pi", ["edu", "brdu"])
+    zarr_prepare.main()
+    before = tree_bytes(run.out_dir)
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract") as raised:
+        run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(reordered))
+
+    assert str(run.out_dir) in str(raised.value)
+    assert str(reordered) in str(raised.value)
+    assert tree_bytes(run.out_dir) == before
+
+
+@pytest.mark.integration
+def test_prepare_rejects_a_stored_config_that_disagrees_with_the_completion(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    zarr_prepare.main()
+    reordered = write_markers(run.out_dir / "markers.json.new", "pi", ["edu", "brdu"])
+    reordered.replace(run.out_dir / "markers.json")
+    before = tree_bytes(run.out_dir)
+
+    with pytest.raises(ContractMismatchError) as raised:
+        zarr_prepare.main()
+
+    assert "complete.json" in str(raised.value)
+    assert "markers.json" in str(raised.value)
+    assert tree_bytes(run.out_dir) == before
+
+
+@pytest.mark.integration
+def test_prepare_rejects_a_current_completion_without_its_contract(preparation_run) -> None:
+    run = preparation_run
+    zarr_prepare.main()
+    complete = read_json(run.out_dir / "complete.json")
+    del complete["marker_contract"]
+    write_json(run.out_dir / "complete.json", complete)
+    before = tree_bytes(run.out_dir)
+
+    with pytest.raises(MissingContractError, match="complete.json"):
+        zarr_prepare.main()
+
+    assert tree_bytes(run.out_dir) == before
+
+
+@pytest.mark.integration
+def test_prepare_skips_a_legacy_completed_output_and_adds_no_config(preparation_run, monkeypatch, capsys) -> None:
+    run = preparation_run
+    zarr_prepare.main()
+    make_legacy(run.out_dir)
+    before = tree_bytes(run.out_dir)
+    capsys.readouterr()
+
+    zarr_prepare.main()
+
+    assert capsys.readouterr().out.splitlines() == [f"source_dir={run.out_dir}", "status=skipped_complete"]
+    assert tree_bytes(run.out_dir) == before
+    assert not (run.out_dir / "markers.json").exists()
+    default = run.tmp_path / "default.json"
+    write_json(default, config_to_json(default_config()))
+    run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(default))
+    assert tree_bytes(run.out_dir) == before
+
+
+@pytest.mark.integration
+def test_prepare_rejects_reordered_markers_for_a_legacy_completed_output(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    zarr_prepare.main()
+    make_legacy(run.out_dir)
+    reordered = write_markers(run.tmp_path / "reordered.json", "pi", ["edu", "brdu"])
+    before = tree_bytes(run.out_dir)
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
+        run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(reordered))
+
+    assert tree_bytes(run.out_dir) == before
+
+
+@pytest.mark.integration
+def test_prepare_completes_a_partial_output_without_versioned_records_as_current(
+    preparation_run, monkeypatch
+) -> None:
+    run = preparation_run
+    real_link = os.link
+
+    def interrupted_link(source, destination):
+        if destination.name.startswith("p-"):
+            raise OSError("publication interrupted between partial files")
+        real_link(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "link", interrupted_link)
+        with pytest.raises(OSError, match="publication interrupted"):
+            zarr_prepare.main()
+    assert not (run.out_dir / "complete.json").exists()
+    (run.out_dir / "markers.json").unlink()
+    reordered = write_markers(run.tmp_path / "reordered.json", "pi", ["edu", "brdu"])
+
+    run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(reordered))
+
+    complete = read_json(run.out_dir / "complete.json")
+    assert complete["artifact"] == "dino-zarr-source-complete-v2"
+    assert complete["marker_contract"]["markers"] == ["edu", "brdu"]
+    assert read_json(run.out_dir / "markers.json") == config_to_json(load_config(reordered))
+
+
+@pytest.mark.integration
+def test_prepare_rejects_a_changed_presentation_for_a_partial_output(preparation_run, monkeypatch) -> None:
+    run = preparation_run
+    real_link = os.link
+
+    def interrupted_link(source, destination):
+        if destination.name.startswith("p-"):
+            raise OSError("publication interrupted between partial files")
+        real_link(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "link", interrupted_link)
+        with pytest.raises(OSError, match="publication interrupted"):
+            zarr_prepare.main()
+    recolored = write_markers(run.tmp_path / "recolored.json", "pi", ["brdu", "edu"], colors=("#111111", "#222222"))
+
+    with pytest.raises(MarkerConfigError, match="differs from this run's marker configuration"):
+        run_main(run, monkeypatch, DEFAULT_KEYS, "--markers", str(recolored))
+
+    assert not (run.out_dir / "complete.json").exists()

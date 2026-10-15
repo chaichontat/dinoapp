@@ -27,6 +27,7 @@ from dino.zarr_source import (
     open_review_source,
     write_json_atomic,
 )
+from dino_markers import DEFAULT_CONTRACT
 
 FIXTURE = Path(__file__).parent / "fixtures" / "legacy_source"
 FROZEN_PREFIX = "/tmp/wf0-source/legacy_source"
@@ -132,8 +133,8 @@ def run_prepare(
 ) -> list[str]:
     """Run ``dino-zarr prepare`` once and return its stdout lines."""
     argv = ["dino-zarr prepare", "--labels", str(labels)]
-    for key in ("pi", "edu", "brdu"):
-        argv += [f"--{key}", str(channels[key])]
+    for key in DEFAULT_CONTRACT.channel_keys:
+        argv += ["--channel", f"{key}={channels[key]}"]
     argv += ["--offset-zyx", *(str(value) for value in offset_zyx)]
     argv += ["--out-dir", str(out_dir), "--workers", "1"]
     capsys.readouterr()
@@ -148,7 +149,12 @@ def build_manifest(
     channels: Mapping[str, Path],
     offset_zyx: tuple[int, int, int],
 ) -> dict[str, Any]:
-    return build_source_manifest(labels_path=labels, channel_paths=channels, offset_zyx=offset_zyx)
+    return build_source_manifest(
+        labels_path=labels,
+        channel_paths=channels,
+        offset_zyx=offset_zyx,
+        required_channels=DEFAULT_CONTRACT.channel_keys,
+    )
 
 
 # Test-side reference implementations and fixture relocation.

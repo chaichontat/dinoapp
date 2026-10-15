@@ -1,7 +1,7 @@
 """Read and render cell crops for saved barrages and native review."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
 import contourpy
@@ -19,7 +19,8 @@ DISPLAY_MIN = 0.0
 BARRAGE_CMAP = "magma"
 FIGURE_DPI = 200
 BASE_CROP_SIZE = 100
-BASE_FIGURE_SIZE = (12.0, 4.0)
+BASE_PANEL_WIDTH = 4.0
+BASE_FIGURE_HEIGHT = 4.0
 
 
 def read_crop(reader: CellCropReader, row: pd.Series, *, size: int, pixel_correction=None) -> CellCrop:
@@ -38,7 +39,7 @@ def read_crop(reader: CellCropReader, row: pd.Series, *, size: int, pixel_correc
         )
         crop = replace(
             crop,
-            channels=correct_channels(crop.channels, origin, reference="pi", pixel_correction=pixel_correction),
+            channels=correct_channels(crop.channels, origin, pixel_correction=pixel_correction),
         )
     return crop
 
@@ -48,15 +49,21 @@ def render_crop(
     *,
     cell: str,
     display_max: Mapping[str, float],
+    panels: Sequence[tuple[str, str]],
 ) -> Image.Image:
-    """Render the direct-Zarr crop with the legacy barrage presentation."""
+    """Render one panel per (channel key, title) of `panels`, in order."""
+    if not panels:
+        raise ValueError("Crop rendering requires at least one panel")
+    absent = [key for key, _ in panels if key not in crop.channels]
+    if absent:
+        raise ValueError(f"Crop has no channel for panels {absent}; channels are {sorted(crop.channels)}")
     height, width = crop.mask.shape
     if height != width:
         raise ValueError(f"Expected square crop, got shape={crop.mask.shape}")
 
     scale = height / BASE_CROP_SIZE
-    output_width = round(BASE_FIGURE_SIZE[0] * scale * FIGURE_DPI)
-    output_height = round(BASE_FIGURE_SIZE[1] * scale * FIGURE_DPI)
+    output_width = round(BASE_PANEL_WIDTH * len(panels) * scale * FIGURE_DPI)
+    output_height = round(BASE_FIGURE_HEIGHT * scale * FIGURE_DPI)
     # Matplotlib truncates floating-point inches; nudge upward to preserve the exact pixel target.
     figure = Figure(
         figsize=(
@@ -66,7 +73,7 @@ def render_crop(
         dpi=FIGURE_DPI,
     )
     canvas = FigureCanvasAgg(figure)
-    axes = figure.subplots(nrows=1, ncols=3)
+    axes = figure.subplots(nrows=1, ncols=len(panels), squeeze=False)[0]
     title_size = 12.0 * scale
     has_mask = bool(crop.mask.any())
 
@@ -79,11 +86,7 @@ def render_crop(
     ]
     target = contourpy.contour_generator(z=crop.mask, name="mpl2014").lines(0.5)[0]
 
-    for axis, (name, title) in zip(
-        axes,
-        (("pi", "PI"), ("edu", "EdU"), ("brdu", "BrdU")),
-        strict=True,
-    ):
+    for axis, (name, title) in zip(axes, panels, strict=True):
         channel = crop.channels[name]
         if channel.shape != crop.mask.shape:
             raise ValueError(f"Channel/mask shape mismatch for {name}: {channel.shape} != {crop.mask.shape}")

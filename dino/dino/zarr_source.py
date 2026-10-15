@@ -9,7 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import zarr
@@ -176,6 +176,7 @@ def build_source_manifest(
     labels_path: Path,
     channel_paths: Mapping[str, Path],
     offset_zyx: tuple[int, int, int],
+    required_channels: Sequence[str],
     dataset: str | None = None,
     roi: str | None = None,
 ) -> dict[str, Any]:
@@ -187,7 +188,6 @@ def build_source_manifest(
     ):
         raise ValueError("Source identity must contain nonempty names without the cell delimiter")
     labels, labels_array_path = resolve_array(labels_path)
-    required_channels = ("pi", "edu", "brdu")
     missing_channels = sorted(set(required_channels) - set(channel_paths))
     if missing_channels:
         raise ValueError(f"Missing required channel sources: {missing_channels}")

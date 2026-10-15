@@ -187,3 +187,16 @@ A slice that needs a change in a file it does not own reports it instead of edit
 - Silent cache invalidation: caught by WF0's feature-cache and resume characterization tests.
 - Tests passing against the wrong checkout: prevented by the PYTHONPATH proof step in every worktree agent.
 - Large dinoapp UI change (D2): G is the biggest slice; if its review finds structural problems, split it into gallery and cell-review sub-slices in a follow-up workflow.
+
+## 8. Integration carry-over
+
+Items reported by finished waves that later slices must pick up (their spec sections already require them; listed so the briefs name them).
+
+| From | Owner | Item |
+| --- | --- | --- |
+| WF3 E | C (WF4) | `zarr_model.py`: call `require_spatial_subtraction_contract(bundle_contract(...))` and `require_periodic_targets(...)` when binding corrections; use `subtraction.reference` instead of the literal `"pi"`; pass the reference only when a subtraction exists. |
+| WF3 E | C (WF4) | `test_periodic.py` `IntensityContext.load(..., markers=DEFAULT_CONTRACT.markers)`; `test_periodic_pixels.py` schema-less bundle gains `schema="dino-zarr-model-v6"` once `iter_model_image_batches` reads the bundle contract. |
+| WF3 E | D (WF4) | `zarr_infer._load_bundle`: call `require_spatial_subtraction_contract` with the bundle contract. |
+| WF3 E | H (WF5) | `display_pixels.py`: call `require_periodic_targets` and `require_spatial_subtraction_contract`; pass `reference=self.spatial.reference` to `correct_channels`. |
+| WF3 A | I (WF5) | `dino/README.md` Direct Zarr workflow: `--channel pi=P --channel edu=E --channel brdu=B`, optional `--markers`; barrage invocation docs. |
+| WF3 B | H (WF5) | `render_crop` callers in `native.py`, `prod3.py`, `rhu2.py`, `corrected_barrage.py` carry the bridge `panels=default_config().panels`; replace with the spec form. |

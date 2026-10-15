@@ -220,6 +220,7 @@ class FieldSource(NativeFieldSource):
     @lru_cache(maxsize=32)
     def cell_crop(self, label: int):
         from dino.crop_rendering import render_crop
+        from dino_markers import default_config
 
         crop, plane_z = self._read_cell_crop(label)
         output = io.BytesIO()
@@ -227,6 +228,7 @@ class FieldSource(NativeFieldSource):
             crop,
             cell=self.cell_id(label),
             display_max=self.crop_contract["display_max"],
+            panels=default_config().panels,
         ).save(output, format="PNG")
         return output.getvalue(), plane_z
 

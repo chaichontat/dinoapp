@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import pytest
+from dino_markers import DEFAULT_CONTRACT, default_config
 from sklearn.preprocessing import SplineTransformer
 
 from dino import crop_rendering, pixel_corrections, zarr_barrage, zarr_train
@@ -98,19 +99,56 @@ def _run_barrage(source_dir: Path, out_dir: Path, *extra: str) -> None:
 
 
 def _parse_display_max(values: list[str]) -> dict[str, float]:
-    return zarr_barrage.parse_display_overrides(values)
+    return zarr_barrage.parse_display_overrides(values, keys=DEFAULT_CONTRACT.channel_keys)
 
 
 def _feature_columns() -> tuple[str, ...]:
-    return zarr_barrage.FEATURE_COLUMNS
+    return zarr_barrage.feature_columns(DEFAULT_CONTRACT.markers)
 
 
 def _render_combined_crop(crop: CellCrop, *, cell: str, display_max: dict[str, float]):
-    return crop_rendering.render_crop(crop, cell=cell, display_max=display_max)
+    return crop_rendering.render_crop(
+        crop, cell=cell, display_max=display_max, panels=default_config().panels
+    )
+
+
+class _MarkerCorrection:
+    """The plain-function fake as the object the correction protocol expects."""
+
+    targets = ("brdu", "edu")
+
+    def __init__(self, function):
+        self.function = function
+
+    def __call__(self, name, pixels, origin):
+        return self.function(name, pixels, origin)
 
 
 def _read_crop(reader, row: pd.Series, *, size: int, pixel_correction):
-    return crop_rendering.read_crop(reader, row, size=size, pixel_correction=pixel_correction)
+    return crop_rendering.read_crop(
+        reader, row, size=size, pixel_correction=_MarkerCorrection(pixel_correction)
+    )
+
+
+class _Subtraction:
+    target = "brdu"
+    reference = "pi"
+
+    def __init__(self, function):
+        self._function = function
+
+    def __call__(self, target, reference, origin):
+        return self._function(target, reference, origin)
+
+
+class _Correction:
+    targets = ("brdu", "edu")
+
+    def __init__(self, function):
+        self._function = function
+
+    def __call__(self, name, pixels, origin):
+        return self._function(name, pixels, origin)
 
 
 def _correct_channels(channels, origin, *, spatial_subtraction, pixel_correction):
@@ -118,8 +156,8 @@ def _correct_channels(channels, origin, *, spatial_subtraction, pixel_correction
         channels,
         origin,
         reference="pi",
-        spatial_subtraction=spatial_subtraction,
-        pixel_correction=pixel_correction,
+        spatial_subtraction=None if spatial_subtraction is None else _Subtraction(spatial_subtraction),
+        pixel_correction=None if pixel_correction is None else _Correction(pixel_correction),
     )
 
 

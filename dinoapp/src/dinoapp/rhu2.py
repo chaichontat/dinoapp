@@ -15,6 +15,7 @@ import zarr
 from dinoapp.native import Field, FieldSource, combined_uncertainty
 from dinoapp.sources import Crop
 from dino.crop_rendering import render_crop
+from dino_markers import default_config
 from dino.zarr_source import CellCrop
 
 
@@ -238,7 +239,8 @@ class RoiSource(FieldSource):
         crop = CellCrop(plane, plane == label, (plane > 0) & (plane != label),
                         {name: raw[..., index] for name, index in self.channels.items()})
         image = render_crop(crop, cell=self.cell_id(label),
-                             display_max=dict(zip(('pi', 'brdu', 'edu'), limits, strict=True)))
+                             display_max=dict(zip(('pi', 'brdu', 'edu'), limits, strict=True)),
+                             panels=default_config().panels)
         buffer = io.BytesIO()
         image.save(buffer, format='PNG')
         return buffer.getvalue(), zi

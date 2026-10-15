@@ -6,13 +6,25 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+from dino_markers import (
+    BARRAGE,
+    BARRAGE_STATS,
+    MarkerConfig,
+    declared_contract,
+    image_path_column,
+    load_config,
+    require_same_contract,
+    resolve_directory,
+    save_config,
+    stat_column,
+)
 from loguru import logger
 from PIL import Image
 
@@ -31,16 +43,11 @@ DISPLAY_PERCENTILE = 99.9
 DISPLAY_SAMPLE_Z_PLANES = 32
 DISPLAY_SAMPLE_XY_STRIDE = 8
 RENDERER_VERSION = "v3"
-FEATURE_COLUMNS = (
-    "brdu_mean",
-    "brdu_std",
-    "edu_mean",
-    "edu_std",
-)
 
 
 @dataclass(frozen=True)
 class BarrageConfig:
+    config: MarkerConfig
     source_dir: Path
     out_dir: Path
     candidate_cells: int
@@ -58,13 +65,18 @@ class BarrageConfig:
     display_overrides: Mapping[str, float] | None = None
 
 
-def parse_display_overrides(values: list[str]) -> dict[str, float]:
+def feature_columns(markers: Sequence[str]) -> tuple[str, ...]:
+    """The mean and standard deviation columns that stratify the feature sample, per marker."""
+    return tuple(stat_column(marker, stat) for marker in markers for stat in ("mean", "std"))
+
+
+def parse_display_overrides(values: list[str], *, keys: Sequence[str]) -> dict[str, float]:
     """Parse explicit channel display maxima without changing the source cache."""
     overrides: dict[str, float] = {}
     for value in values:
         channel, separator, maximum_text = value.partition("=")
-        if separator != "=" or channel not in {"pi", "edu", "brdu"}:
-            raise ValueError("Display maximum must be pi=VALUE, edu=VALUE, or brdu=VALUE")
+        if separator != "=" or channel not in keys:
+            raise ValueError(f"Display maximum must be KEY=VALUE for one of {keys}")
         try:
             maximum = float(maximum_text)
         except ValueError as error:
@@ -153,11 +165,7 @@ def _load_or_measure_display_max(source_dir: Path, source: OpenSource) -> dict[s
             raise ValueError(f"Display cache must contain a JSON object: {cache_path}")
         if all(cached.get(key) == value for key, value in contract.items()):
             cached_maxima = cached.get("vmax")
-            if not isinstance(cached_maxima, Mapping) or set(cached_maxima) != {
-                "pi",
-                "edu",
-                "brdu",
-            }:
+            if not isinstance(cached_maxima, Mapping) or set(cached_maxima) != set(source.channels):
                 raise ValueError(f"Invalid display maxima in cache: {cache_path}")
             maxima = {name: float(maximum) for name, maximum in cached_maxima.items()}
             if not all(np.isfinite(maximum) and maximum > DISPLAY_MIN for maximum in maxima.values()):
@@ -223,10 +231,12 @@ def _geometry_sample(cells: pd.DataFrame, *, n_rows: int, seed: int) -> pd.DataF
     return sampled.drop(columns="_log_area")
 
 
-def _feature_sample(cells: pd.DataFrame, *, n_rows: int, n_bins: int, seed: int) -> pd.DataFrame:
+def _feature_sample(
+    cells: pd.DataFrame, *, markers: Sequence[str], n_rows: int, n_bins: int, seed: int
+) -> pd.DataFrame:
     work = cells.copy()
     columns = []
-    for column in FEATURE_COLUMNS:
+    for column in feature_columns(markers):
         transformed = f"_log_{column}"
         work[transformed] = np.log1p(work[column].to_numpy(dtype=np.float64))
         columns.append(transformed)
@@ -272,6 +282,7 @@ def _measure_candidates(
     *,
     reader: CellCropReader,
     size: int,
+    markers: Sequence[str],
     pixel_correction=None,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
@@ -281,13 +292,20 @@ def _measure_candidates(
         if not crop.mask.any():
             raise ValueError(f"Target cell mask is empty on plane_z for {row['cell']}")
         output = row.to_dict()
-        for channel in ("brdu", "edu"):
-            stats = masked_channel_stats(crop.channels[channel], crop.mask)
-            output.update({f"{channel}_{name}": value for name, value in stats.items()})
+        for marker in markers:
+            stats = masked_channel_stats(crop.channels[marker], crop.mask)
+            output.update({stat_column(marker, name): value for name, value in stats.items()})
         rows.append(output)
         if index % 1000 == 0:
             logger.info(f"Measured candidate cells={index}/{len(ordered)}")
     return pd.DataFrame(rows)
+
+
+def _read_record(path: Path) -> dict[str, object]:
+    record = json.loads(path.read_text())
+    if not isinstance(record, dict):
+        raise ValueError(f"Barrage record must be a JSON object: {path}")
+    return record
 
 
 def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
@@ -347,8 +365,13 @@ def _exclude_index(cells: pd.DataFrame, path: Path) -> tuple[pd.DataFrame, int, 
 
 
 def _parse_args() -> BarrageConfig:
-    parser = argparse.ArgumentParser(description="Generate a direct-Zarr BrdU/EdU labeling barrage.")
+    parser = argparse.ArgumentParser(description="Generate a direct-Zarr marker labeling barrage.")
     parser.add_argument("--source-dir", type=Path, required=True)
+    parser.add_argument(
+        "--markers",
+        type=Path,
+        help="Marker configuration asserted against the source; its contract must equal the source's.",
+    )
     parser.add_argument(
         "--pixel-model",
         type=Path,
@@ -370,7 +393,7 @@ def _parse_args() -> BarrageConfig:
         "--display-max",
         action="append",
         default=[],
-        metavar="CHANNEL=VALUE",
+        metavar="KEY=VALUE",
         help="Override a rendered channel maximum without changing the source display cache.",
     )
     parser.add_argument("--eligibility-table", type=Path)
@@ -382,12 +405,17 @@ def _parse_args() -> BarrageConfig:
         parser.error("--candidate-cells must be at least --n-cells")
     if args.n_cells <= 0 or args.size <= 0 or args.cache_gb <= 0:
         parser.error("cell counts, crop size, and cache size must be positive")
+    source_dir = args.source_dir.expanduser()
+    config = resolve_directory(
+        source_dir, supplied=load_config(args.markers.expanduser()) if args.markers else None
+    )
     try:
-        display_overrides = parse_display_overrides(args.display_max)
+        display_overrides = parse_display_overrides(args.display_max, keys=config.contract.channel_keys)
     except ValueError as error:
         parser.error(str(error))
     return BarrageConfig(
-        source_dir=args.source_dir.expanduser(),
+        config=config,
+        source_dir=source_dir,
         out_dir=args.out_dir.expanduser(),
         candidate_cells=args.candidate_cells,
         n_cells=args.n_cells,
@@ -410,6 +438,18 @@ def main() -> None:
     if not cfg.resume and cfg.out_dir.exists() and any(cfg.out_dir.iterdir()):
         raise ValueError("Output directory is nonempty; enable --resume or use a new directory")
     source = load_source(cfg.source_dir)
+    contract = cfg.config.contract
+    missing_channels = [key for key in contract.channel_keys if key not in source.channels]
+    if missing_channels:
+        raise ValueError(
+            f"Source {cfg.source_dir} has no channels {missing_channels} required by the marker contract: "
+            f"{contract}"
+        )
+    declared = declared_contract(cfg.out_dir)
+    if declared is not None:
+        require_same_contract(
+            contract, declared, expected_from=str(cfg.source_dir), actual_from=str(cfg.out_dir)
+        )
     manifest = source.manifest
     reader = CellCropReader(
         labels=source.labels,
@@ -420,7 +460,7 @@ def main() -> None:
     pixel_correction = None
     pixel_contract = {}
     if cfg.pixel_model is not None:
-        from dino.periodic_pixels import PeriodicPixels
+        from dino.periodic_pixels import PeriodicPixels, require_periodic_targets
 
         bundle = joblib.load(cfg.pixel_model)
         if bundle["source_sha256"] != manifest["source_sha256"]:
@@ -431,6 +471,7 @@ def main() -> None:
             correction["model_sha256"],
             tuple(correction["scale_zyx_um"]),
         )
+        require_periodic_targets(pixel_correction, contract, artifact=str(cfg.pixel_model))
         pixel_contract = {"pixel_correction": correction}
     source_sha256 = str(manifest["source_sha256"])
     display_max = _load_or_measure_display_max(cfg.source_dir, source)
@@ -484,44 +525,57 @@ def main() -> None:
         }
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     complete_path = cfg.out_dir / "complete.json"
-    run_contract = {
-        "artifact": "dino-zarr-barrage-v3",
-        "source_sha256": source_sha256,
-        "candidate_cells": cfg.candidate_cells,
-        "n_cells": cfg.n_cells,
-        "size": cfg.size,
-        "seed": cfg.seed,
-        "n_bins": cfg.n_bins,
-        "display_min": DISPLAY_MIN,
-        "display_percentile": DISPLAY_PERCENTILE,
-        "display_max": display_max,
-        "display_overrides": display_overrides,
-        "cmap": BARRAGE_CMAP,
-        "figure_dpi": FIGURE_DPI,
-        "renderer": RENDERER_VERSION,
-        **eligibility_contract,
-        **exclusion_contract,
-        **pixel_contract,
-        **reuse_contract,
-    }
+    run_path = cfg.out_dir / "run.json"
+    expected = BARRAGE.stamp(
+        {
+            "source_sha256": source_sha256,
+            "candidate_cells": cfg.candidate_cells,
+            "n_cells": cfg.n_cells,
+            "size": cfg.size,
+            "seed": cfg.seed,
+            "n_bins": cfg.n_bins,
+            "display_min": DISPLAY_MIN,
+            "display_percentile": DISPLAY_PERCENTILE,
+            "display_max": display_max,
+            "display_overrides": display_overrides,
+            "cmap": BARRAGE_CMAP,
+            "figure_dpi": FIGURE_DPI,
+            "renderer": RENDERER_VERSION,
+            "crop_panels": [list(panel) for panel in cfg.config.panels],
+            **eligibility_contract,
+            **exclusion_contract,
+            **pixel_contract,
+            **reuse_contract,
+        },
+        contract,
+    )
+    run_record = _read_record(run_path) if run_path.exists() else None
     if complete_path.is_file():
-        if json.loads(complete_path.read_text()) == run_contract:
+        complete = _read_record(complete_path)
+        if BARRAGE.normalize(complete, where=str(complete_path)) == expected and run_record in (
+            None,
+            complete,
+        ):
             print(f"barrage_dir={cfg.out_dir}")
             print("status=skipped_complete")
             return
         raise ValueError("Existing barrage has a different rendering contract; use a new output directory")
 
-    run_path = cfg.out_dir / "run.json"
-    if run_path.exists() and json.loads(run_path.read_text()) != run_contract:
+    if run_record is None:
+        run_record = expected
+    elif BARRAGE.normalize(run_record, where=str(run_path)) != expected:
         raise ValueError("Partial barrage has a different rendering contract")
-    write_json_atomic(run_contract, run_path)
+    if run_record["artifact"] == BARRAGE.current:
+        save_config(cfg.config, cfg.out_dir)
+    write_json_atomic(run_record, run_path)
     write_json_atomic(manifest, cfg.out_dir / "source.json")
     labels_path = cfg.out_dir / "labels.csv"
     existing_cells: list[str] = []
     if labels_path.is_file():
         labels = pd.read_csv(labels_path)
-        if "cell" not in labels.columns:
-            raise ValueError(f"Existing labels.csv is missing cell column: {labels_path}")
+        missing_columns = [column for column in ("cell", *contract.markers) if column not in labels.columns]
+        if missing_columns:
+            raise ValueError(f"Existing labels.csv is missing columns {missing_columns}: {labels_path}")
         existing_cells = labels["cell"].astype(str).drop_duplicates().tolist()
 
     candidates = _prioritize_existing(
@@ -531,14 +585,16 @@ def main() -> None:
         sampler=lambda frame, n: _geometry_sample(frame, n_rows=n, seed=cfg.seed),
     )
     measured = _measure_candidates(
-        candidates, reader=reader, size=cfg.size, pixel_correction=pixel_correction
+        candidates, reader=reader, size=cfg.size, markers=contract.markers, pixel_correction=pixel_correction
     )
     _atomic_parquet(measured, cfg.out_dir / "candidates.parquet")
     selected = _prioritize_existing(
         measured,
         existing_cells=existing_cells,
         n_rows=min(cfg.n_cells, len(measured)),
-        sampler=lambda frame, n: _feature_sample(frame, n_rows=n, n_bins=cfg.n_bins, seed=cfg.seed),
+        sampler=lambda frame, n: _feature_sample(
+            frame, markers=contract.markers, n_rows=n, n_bins=cfg.n_bins, seed=cfg.seed
+        ),
     ).reset_index(drop=True)
 
     if reference is not None:
@@ -568,7 +624,9 @@ def main() -> None:
             with tempfile.NamedTemporaryFile(dir=image_path.parent, suffix=".tmp", delete=False) as f:
                 temporary = Path(f.name)
             try:
-                render_crop(crop, cell=cell, display_max=display_max).save(temporary, format="PNG")
+                render_crop(crop, cell=cell, display_max=display_max, panels=cfg.config.panels).save(
+                    temporary, format="PNG"
+                )
                 os.replace(temporary, image_path)
             finally:
                 temporary.unlink(missing_ok=True)
@@ -591,18 +649,19 @@ def main() -> None:
             "image_path": rendered[str(row["cell"])],
             "source_sha256": source_sha256,
         }
-        for channel in ("brdu", "edu"):
-            for statistic in ("mean", "min", "max", "median", "std"):
-                output[f"{channel}_{statistic}"] = float(row[f"{channel}_{statistic}"])
+        for marker in contract.markers:
+            for statistic in BARRAGE_STATS:
+                column = stat_column(marker, statistic)
+                output[column] = float(row[column])
         index_rows.append(output)
     index = pd.DataFrame(index_rows)
     if reference is not None:
         # Retain native-frame bins and review rounds while refreshing measured intensities.
-        artifact_paths = {"combined_image_path", "brdu_image_path", "edu_image_path"}
+        artifact_paths = {"combined_image_path", *(image_path_column(marker) for marker in contract.markers)}
         for column in reference.columns.difference([*index.columns, *artifact_paths], sort=False):
             index[column] = reference[column].to_numpy()
     write_csv_atomic(index, cfg.out_dir / "index.csv")
-    write_json_atomic(run_contract, complete_path)
+    write_json_atomic(run_record, complete_path)
     print(f"barrage_dir={cfg.out_dir}")
     print(f"candidates={len(measured)}")
     print(f"cells={len(selected)}")

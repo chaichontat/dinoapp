@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from dino_markers import MarkerContract, bundle_contract, derive_bundle
+
 from dino.artifacts import file_sha256
 from dino.spatial_subtraction import SpatialSubtraction
 
@@ -36,10 +38,18 @@ class SpatialPixels:
             raise ValueError("Spatial pixels require a finite physical ZYX origin")
 
     @property
+    def target(self) -> str:
+        return "brdu"
+
+    @property
+    def reference(self) -> str:
+        return "pi"
+
+    @property
     def identity(self) -> dict[str, Any]:
         return dict(model=self.path, model_sha256=self.sha256,
                     scale_zyx_um=list(self.scale_zyx_um), origin_zyx_um=list(self.origin_zyx_um),
-                    target="brdu", reference="pi", reference_identity="true 405 nm DAPI",
+                    target=self.target, reference=self.reference, reference_identity="true 405 nm DAPI",
                     operation="uint16(clip(rint(raw BrdU - alpha(physical XY) * raw pi - beta(physical XY)), 0, 65535)); zero paired-unsupported pixels",
                     order="before periodic gains and DINO preprocessing")
 
@@ -65,6 +75,14 @@ class SpatialPixels:
         return np.clip(np.rint(signed), 0, 65535).astype(np.uint16)
 
 
+def require_spatial_subtraction_contract(contract: MarkerContract, *, artifact: str) -> None:
+    if contract.reference != "pi" or "brdu" not in contract.markers:
+        raise ValueError(
+            f"{artifact}: spatial subtraction supports only BrdU against the pi channel verified as 405 nm DAPI; "
+            f"contract is {contract}"
+        )
+
+
 def bind_spatial_subtraction(
     bundle: Mapping[str, Any], *, model_path: Path, source_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -74,6 +92,7 @@ def bind_spatial_subtraction(
     must have been verified as the true 405 nm DAPI source by the run producer.
     This API binds metadata only and writes neither source pixels nor artifacts.
     """
+    require_spatial_subtraction_contract(bundle_contract(bundle, where="model bundle"), artifact="model bundle")
     if "spatial_subtraction" in bundle:
         raise ValueError("Model bundle already has spatial subtraction")
     if bundle["source_sha256"] != source_manifest["source_sha256"]:
@@ -95,4 +114,4 @@ def bind_spatial_subtraction(
     path = model_path.resolve()
     transform = SpatialPixels(str(path), file_sha256(path), scale, origin)
     _load_model(transform.path, transform.sha256)
-    return {**bundle, "spatial_subtraction": transform.identity}
+    return derive_bundle(bundle, {"spatial_subtraction": transform.identity}, where="model bundle")

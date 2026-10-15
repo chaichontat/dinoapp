@@ -1,20 +1,62 @@
 from __future__ import annotations
 
 import json
+import shutil
 from types import SimpleNamespace
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from dino_markers import (
+    DEFAULT_CONTRACT,
+    ContractMismatchError,
+    MarkerConfigError,
+    config_to_json,
+    default_config,
+    load_config,
+    parse_config,
+    save_config,
+)
+from sklearn.preprocessing import SplineTransformer
 
-from dino import zarr_barrage
+from dino import crop_rendering, zarr_barrage
+from dino.artifacts import file_sha256
+from dino.periodic_pixels import PeriodicPixels
 from dino.zarr_barrage import (
+    feature_columns,
     masked_channel_stats,
     parse_display_overrides,
     stratified_sample,
 )
 from dino.zarr_source import CellCrop, build_source_manifest, write_json_atomic
+
+BARRAGE_STATS = ("mean", "min", "max", "median", "std")
+LEGACY_PANELS = [["pi", "PI"], ["edu", "EdU"], ["brdu", "BrdU"]]
+
+
+def _config(reference, markers, panels):
+    labels = {"pi": "PI", "dapi": "DAPI", "edu": "EdU", "brdu": "BrdU", "pcna": "PCNA"}
+    colors = {"edu": "#00ff00", "brdu": "#ff00ff", "pcna": "#00ffff"}
+    return parse_config(
+        {
+            "version": 1,
+            "reference": {"key": reference, "label": labels[reference]},
+            "markers": [{"key": k, "label": labels[k], "color": colors[k]} for k in markers],
+            "presentation": {
+                "crop_panels": panels,
+                "negative_color": [0.25, 0.25, 0.25],
+                "uncalled_color": "#999999",
+            },
+        },
+        source="test",
+    )
+
+
+THREE_MARKERS = _config("dapi", ["edu", "brdu", "pcna"], ["dapi", "pcna", "edu", "brdu"])
+REORDERED = _config("pi", ["edu", "brdu"], ["pi", "edu", "brdu"])
+REPANELED = _config("pi", ["brdu", "edu"], ["brdu", "pi", "edu"])
 
 
 def test_masked_channel_stats_excludes_neighbors_without_thresholding() -> None:
@@ -70,6 +112,7 @@ def test_render_crop_matches_scaled_legacy_presentation() -> None:
         crop,
         cell="roi|1",
         display_max={"pi": 4096.0, "edu": 8192.0, "brdu": 16_384.0},
+        panels=default_config().panels,
     )
 
     assert image.size == (1440, 480)
@@ -84,7 +127,8 @@ def test_display_max_cache_reuses_matching_source_and_replaces_stale_value(tmp_p
             "source_sha256": "source-a",
             "labels": {"shape": [4, 20, 20]},
             "offset_zyx": [0, 0, 0],
-        }
+        },
+        channels=dict.fromkeys(("pi", "edu", "brdu")),
     )
     measured = {"pi": 100.0, "edu": 200.0, "brdu": 300.0}
     calls = 0
@@ -140,6 +184,7 @@ def test_barrage_writes_existing_labeler_schema(tmp_path, monkeypatch) -> None:
         labels_path=labels_path,
         channel_paths=channel_paths,
         offset_zyx=(0, 5, 5),
+        required_channels=DEFAULT_CONTRACT.channel_keys,
     )
     write_json_atomic(manifest, source_dir / "source.json")
     pd.DataFrame(
@@ -219,31 +264,167 @@ def test_barrage_writes_existing_labeler_schema(tmp_path, monkeypatch) -> None:
 
 
 def test_parse_display_overrides() -> None:
-    assert parse_display_overrides(["brdu=22199", "edu=20000.5"]) == {
+    keys = DEFAULT_CONTRACT.channel_keys
+    assert parse_display_overrides(["brdu=22199", "edu=20000.5"], keys=keys) == {
         "brdu": 22199.0,
         "edu": 20000.5,
     }
 
     with pytest.raises(ValueError, match="Duplicate"):
-        parse_display_overrides(["brdu=1", "brdu=2"])
+        parse_display_overrides(["brdu=1", "brdu=2"], keys=keys)
     with pytest.raises(ValueError, match="finite and positive"):
-        parse_display_overrides(["brdu=0"])
+        parse_display_overrides(["brdu=0"], keys=keys)
+    with pytest.raises(ValueError, match="Invalid display maximum"):
+        parse_display_overrides(["brdu=high"], keys=keys)
 
 
-@pytest.fixture
-def barrage_run(tmp_path, monkeypatch):
+def test_display_overrides_accept_exactly_the_contract_channel_keys() -> None:
+    keys = THREE_MARKERS.contract.channel_keys
+
+    assert parse_display_overrides(["dapi=1", "pcna=2.5", "edu=3", "brdu=4"], keys=keys) == {
+        "dapi": 1.0,
+        "pcna": 2.5,
+        "edu": 3.0,
+        "brdu": 4.0,
+    }
+    for rejected in ("pi=1", "PCNA=1", "pcna"):
+        with pytest.raises(ValueError, match=r"Display maximum must be KEY=VALUE for one of"):
+            parse_display_overrides([rejected], keys=keys)
+
+
+def test_feature_columns_follow_marker_order() -> None:
+    assert feature_columns(("edu", "brdu", "pcna")) == (
+        "edu_mean",
+        "edu_std",
+        "brdu_mean",
+        "brdu_std",
+        "pcna_mean",
+        "pcna_std",
+    )
+
+
+def _crop(size: int, channels: dict[str, int]) -> CellCrop:
+    labels = np.zeros((size, size), dtype=np.uint32)
+    labels[5:11, 5:11] = 1
+    return CellCrop(
+        labels=labels,
+        mask=labels == 1,
+        neighbor_mask=np.zeros((size, size), dtype=bool),
+        channels={name: np.full((size, size), value, dtype=np.uint16) for name, value in channels.items()},
+    )
+
+
+def test_render_crop_draws_one_titled_panel_per_crop_panel(monkeypatch) -> None:
+    import matplotlib.axes
+
+    titles: list[str] = []
+    vmax: list[float] = []
+    original_title = matplotlib.axes.Axes.set_title
+    original_imshow = matplotlib.axes.Axes.imshow
+
+    def record_title(self, label, *args, **kwargs):
+        titles.append(label)
+        return original_title(self, label, *args, **kwargs)
+
+    def record_imshow(self, data, *args, **kwargs):
+        vmax.append(kwargs["vmax"])
+        return original_imshow(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_title", record_title)
+    monkeypatch.setattr(matplotlib.axes.Axes, "imshow", record_imshow)
+    crop = _crop(16, {"dapi": 10, "edu": 20, "brdu": 30, "pcna": 40})
+
+    image = crop_rendering.render_crop(
+        crop,
+        cell="roi|1",
+        display_max={"dapi": 100.0, "edu": 200.0, "brdu": 300.0, "pcna": 400.0},
+        panels=THREE_MARKERS.panels,
+    )
+
+    assert image.size == (512, 128)
+    assert titles == [
+        "cell=roi|1\nch=DAPI mean=10.0",
+        "cell=roi|1\nch=PCNA mean=40.0",
+        "cell=roi|1\nch=EdU mean=20.0",
+        "cell=roi|1\nch=BrdU mean=30.0",
+    ]
+    assert vmax == [100.0, 400.0, 200.0, 300.0]
+
+
+def test_render_crop_rejects_empty_panels_and_absent_channels() -> None:
+    crop = _crop(16, {"pi": 10, "edu": 20})
+    display_max = {"pi": 1.0, "edu": 1.0, "brdu": 1.0}
+
+    with pytest.raises(ValueError, match="panel"):
+        crop_rendering.render_crop(crop, cell="roi|1", display_max=display_max, panels=())
+    with pytest.raises(ValueError, match="brdu"):
+        crop_rendering.render_crop(
+            crop, cell="roi|1", display_max=display_max, panels=default_config().panels
+        )
+
+
+def test_display_cache_round_trips_the_source_channel_set(tmp_path, monkeypatch) -> None:
+    channels = ("dapi", "edu", "brdu", "pcna")
+    source = SimpleNamespace(
+        manifest={"source_sha256": "source-a", "labels": {"shape": [4, 20, 20]}, "offset_zyx": [0, 0, 0]},
+        channels=dict.fromkeys(channels),
+    )
+    measured = dict(zip(channels, (100.0, 200.0, 300.0, 400.0), strict=True))
+    calls = 0
+
+    def measure(_source):
+        nonlocal calls
+        calls += 1
+        return measured, 400
+
+    monkeypatch.setattr(zarr_barrage, "_measure_display_max", measure)
+
+    assert zarr_barrage._load_or_measure_display_max(tmp_path, source) == measured
+    assert zarr_barrage._load_or_measure_display_max(tmp_path, source) == measured
+    assert calls == 1
+    assert set(json.loads((tmp_path / "display.json").read_text())["vmax"]) == set(channels)
+
+
+def test_display_cache_rejects_a_channel_set_other_than_the_source(tmp_path, monkeypatch) -> None:
+    channels = ("dapi", "edu", "brdu", "pcna")
+    source = SimpleNamespace(
+        manifest={"source_sha256": "source-a", "labels": {"shape": [4, 20, 20]}, "offset_zyx": [0, 0, 0]},
+        channels=dict.fromkeys(channels),
+    )
+    monkeypatch.setattr(
+        zarr_barrage, "_measure_display_max", lambda _source: (dict.fromkeys(channels, 100.0), 400)
+    )
+    zarr_barrage._load_or_measure_display_max(tmp_path, source)
+    cache_path = tmp_path / "display.json"
+    cached = json.loads(cache_path.read_text())
+    del cached["vmax"]["pcna"]
+    cache_path.write_text(json.dumps(cached))
+
+    with pytest.raises(ValueError, match="Invalid display maxima in cache"):
+        zarr_barrage._load_or_measure_display_max(tmp_path, source)
+
+
+DEFAULT_CHANNEL_VALUES = {"pi": 100, "brdu": 300, "edu": 200}
+THREE_MARKER_CHANNEL_VALUES = {"dapi": 100, "edu": 200, "brdu": 300, "pcna": 400}
+
+
+def _write_source(tmp_path, channel_values, *, config=None):
+    """A one-cell prepared source holding `channel_values`; `config` is stored as its markers.json."""
     labels_path = tmp_path / "dataset" / "roi" / "masked" / "labels.zarr"
     labels = zarr.open_array(labels_path, mode="w", shape=(1, 16, 16), chunks=(1, 8, 8), dtype="u4")
     labels[0, 6:10, 6:10] = 1
     channels = {}
-    for name, value in (("pi", 100), ("brdu", 300), ("edu", 200)):
+    for name, value in channel_values.items():
         path = tmp_path / f"{name}.zarr"
         array = zarr.open_array(path, mode="w", shape=(1, 16, 16), chunks=(1, 8, 8), dtype="u2")
         array[:] = value
         channels[name] = path
     source_dir = tmp_path / "source"
     manifest = build_source_manifest(
-        labels_path=labels_path, channel_paths=channels, offset_zyx=(0, 0, 0)
+        labels_path=labels_path,
+        channel_paths=channels,
+        offset_zyx=(0, 0, 0),
+        required_channels=tuple(channel_values),
     )
     write_json_atomic(manifest, source_dir / "source.json")
     pd.DataFrame([{
@@ -251,8 +432,14 @@ def barrage_run(tmp_path, monkeypatch):
         "area": 16, "centroid_z": 0.0, "centroid_y": 8.0, "centroid_x": 8.0,
         "plane_z": 0, "plane_area": 16,
     }]).to_parquet(source_dir / "cells.parquet", index=False)
+    if config is not None:
+        save_config(config, source_dir)
+    return source_dir
 
-    def run(out_dir, *extra):
+
+@pytest.fixture
+def run_barrage(monkeypatch):
+    def run(source_dir, out_dir, *extra):
         monkeypatch.setattr("sys.argv", [
             "barrage", "--source-dir", str(source_dir), "--out-dir", str(out_dir),
             "--candidate-cells", "1", "--n-cells", "1", "--size", "8",
@@ -261,6 +448,282 @@ def barrage_run(tmp_path, monkeypatch):
         zarr_barrage.main()
 
     return run
+
+
+@pytest.fixture
+def barrage_run(tmp_path, run_barrage):
+    source_dir = _write_source(tmp_path, DEFAULT_CHANNEL_VALUES)
+
+    def run(out_dir, *extra):
+        run_barrage(source_dir, out_dir, *extra)
+
+    run.source_dir = source_dir
+    return run
+
+
+@pytest.fixture
+def three_marker_source(tmp_path):
+    return _write_source(tmp_path / "three", THREE_MARKER_CHANNEL_VALUES, config=THREE_MARKERS)
+
+
+def _legacy_record(record):
+    """The dino-zarr-barrage-v3 form of a fresh default barrage record."""
+    legacy = {key: value for key, value in record.items() if key not in ("marker_contract", "crop_panels")}
+    legacy["artifact"] = "dino-zarr-barrage-v3"
+    return legacy
+
+
+def _tree(root):
+    return {path.relative_to(root): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def test_fresh_default_barrage_writes_v4_records_and_markers(barrage_run, tmp_path) -> None:
+    out_dir = tmp_path / "barrage"
+
+    barrage_run(out_dir)
+
+    run = json.loads((out_dir / "run.json").read_text())
+    assert run["artifact"] == "dino-zarr-barrage-v4"
+    assert run["marker_contract"] == DEFAULT_CONTRACT.to_json()
+    assert run["crop_panels"] == LEGACY_PANELS
+    assert json.loads((out_dir / "complete.json").read_text()) == run
+    assert load_config(out_dir / "markers.json") == default_config()
+
+
+def test_three_marker_barrage_measures_every_marker_and_renders_crop_panels(
+    run_barrage, three_marker_source, tmp_path
+) -> None:
+    from PIL import Image
+
+    out_dir = tmp_path / "barrage"
+
+    run_barrage(three_marker_source, out_dir)
+
+    run = json.loads((out_dir / "run.json").read_text())
+    assert run["marker_contract"] == THREE_MARKERS.contract.to_json()
+    assert run["crop_panels"] == [["dapi", "DAPI"], ["pcna", "PCNA"], ["edu", "EdU"], ["brdu", "BrdU"]]
+    assert run["display_max"] == {name: float(value) for name, value in THREE_MARKER_CHANNEL_VALUES.items()}
+    assert load_config(out_dir / "markers.json") == THREE_MARKERS
+    statistics = [f"{marker}_{stat}" for marker in ("edu", "brdu", "pcna") for stat in BARRAGE_STATS]
+    index = pd.read_csv(out_dir / "index.csv")
+    assert index.columns.tolist()[-len(statistics) :] == statistics
+    assert not {"dapi_mean", "pi_mean"} & set(index.columns)
+    assert index.loc[0, ["edu_mean", "brdu_mean", "pcna_mean"]].tolist() == [200.0, 300.0, 400.0]
+    candidates = pd.read_parquet(out_dir / "candidates.parquet")
+    assert candidates.columns.tolist()[-len(statistics) :] == statistics
+    with Image.open(out_dir / index.loc[0, "image_path"]) as image:
+        assert image.size == (256, 64)
+
+
+def test_three_marker_destination_with_seeded_labels_inherits_the_source_contract(
+    run_barrage, three_marker_source, tmp_path
+) -> None:
+    out_dir = tmp_path / "barrage"
+    out_dir.mkdir()
+    seeded = b"cell,edu,brdu,pcna\nroi|1,1,0,1\n"
+    (out_dir / "labels.csv").write_bytes(seeded)
+
+    run_barrage(three_marker_source, out_dir)
+
+    assert json.loads((out_dir / "run.json").read_text())["marker_contract"] == (
+        THREE_MARKERS.contract.to_json()
+    )
+    assert (out_dir / "labels.csv").read_bytes() == seeded
+    assert pd.read_csv(out_dir / "index.csv").loc[0, "cell"] == "roi|1"
+
+
+def test_existing_labels_must_hold_every_marker_column(run_barrage, three_marker_source, tmp_path) -> None:
+    out_dir = tmp_path / "barrage"
+    out_dir.mkdir()
+    (out_dir / "labels.csv").write_text("cell,edu,brdu\nroi|1,1,0\n")
+
+    with pytest.raises(ValueError, match="pcna"):
+        run_barrage(three_marker_source, out_dir)
+
+    assert not (out_dir / "complete.json").exists()
+
+
+def test_display_max_follows_the_contract_channels(run_barrage, three_marker_source, tmp_path) -> None:
+    out_dir = tmp_path / "barrage"
+
+    run_barrage(three_marker_source, out_dir, "--display-max", "pcna=5000", "--display-max", "dapi=900.5")
+
+    run = json.loads((out_dir / "run.json").read_text())
+    assert run["display_overrides"] == {"pcna": 5000.0, "dapi": 900.5}
+    assert run["display_max"] == {"dapi": 900.5, "edu": 200.0, "brdu": 300.0, "pcna": 5000.0}
+    with pytest.raises(SystemExit):
+        run_barrage(three_marker_source, tmp_path / "rejected", "--display-max", "pi=1")
+
+
+def test_source_channels_must_cover_the_contract(barrage_run, tmp_path) -> None:
+    save_config(THREE_MARKERS, barrage_run.source_dir)
+
+    with pytest.raises(ValueError, match=r"dapi.*pcna"):
+        barrage_run(tmp_path / "barrage")
+
+    assert not (tmp_path / "barrage" / "run.json").exists()
+
+
+def test_reordered_markers_file_is_rejected_for_a_default_source(barrage_run, tmp_path) -> None:
+    markers = tmp_path / "markers.json"
+    markers.write_text(json.dumps(config_to_json(REORDERED)))
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
+        barrage_run(tmp_path / "barrage", "--markers", str(markers))
+
+    assert not (tmp_path / "barrage" / "run.json").exists()
+
+
+def test_reordered_source_contract_is_rejected_for_an_existing_default_barrage(barrage_run, tmp_path) -> None:
+    out_dir = tmp_path / "barrage"
+    barrage_run(out_dir)
+    save_config(REORDERED, barrage_run.source_dir)
+    before = _tree(out_dir)
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
+        barrage_run(out_dir)
+
+    assert _tree(out_dir) == before
+
+
+def test_three_marker_source_is_rejected_for_an_existing_default_barrage(
+    barrage_run, run_barrage, three_marker_source, tmp_path
+) -> None:
+    out_dir = tmp_path / "barrage"
+    barrage_run(out_dir)
+    before = _tree(out_dir)
+
+    with pytest.raises(ContractMismatchError):
+        run_barrage(three_marker_source, out_dir)
+
+    assert _tree(out_dir) == before
+
+
+def test_supplied_markers_must_match_the_source_contract(run_barrage, three_marker_source, tmp_path) -> None:
+    markers = tmp_path / "markers.json"
+    markers.write_text(json.dumps(config_to_json(default_config())))
+
+    with pytest.raises(ContractMismatchError, match="--markers"):
+        run_barrage(three_marker_source, tmp_path / "barrage", "--markers", str(markers))
+
+
+def test_invalid_markers_file_is_rejected(barrage_run, tmp_path) -> None:
+    markers = tmp_path / "markers.json"
+    markers.write_text("{}")
+
+    with pytest.raises(MarkerConfigError):
+        barrage_run(tmp_path / "barrage", "--markers", str(markers))
+
+
+def test_legacy_partial_run_resumes_as_v3_without_markers(barrage_run, tmp_path) -> None:
+    baseline = tmp_path / "baseline"
+    barrage_run(baseline)
+    legacy = _legacy_record(json.loads((baseline / "run.json").read_text()))
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    (partial / "run.json").write_text(json.dumps(legacy))
+
+    barrage_run(partial)
+
+    assert json.loads((partial / "run.json").read_text()) == legacy
+    assert json.loads((partial / "complete.json").read_text()) == legacy
+    assert not (partial / "markers.json").exists()
+    assert (partial / "index.csv").read_bytes() == (baseline / "index.csv").read_bytes()
+
+
+def test_legacy_partial_run_rejects_custom_crop_panels(barrage_run, tmp_path) -> None:
+    baseline = tmp_path / "baseline"
+    barrage_run(baseline)
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    legacy = _legacy_record(json.loads((baseline / "run.json").read_text()))
+    (partial / "run.json").write_text(json.dumps(legacy))
+    save_config(REPANELED, barrage_run.source_dir)
+
+    with pytest.raises(ValueError, match="different rendering contract"):
+        barrage_run(partial)
+
+    assert not (partial / "complete.json").exists()
+
+
+def test_resume_rejects_changed_crop_panels(barrage_run, tmp_path) -> None:
+    baseline = tmp_path / "baseline"
+    barrage_run(baseline)
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    shutil.copy2(baseline / "run.json", partial / "run.json")
+    save_config(REPANELED, barrage_run.source_dir)
+
+    with pytest.raises(ValueError, match="different rendering contract"):
+        barrage_run(partial)
+
+    assert not (partial / "complete.json").exists()
+
+
+def test_completed_legacy_barrage_without_run_record_is_skipped(barrage_run, tmp_path, capsys) -> None:
+    baseline = tmp_path / "baseline"
+    barrage_run(baseline)
+    completed = tmp_path / "completed"
+    completed.mkdir()
+    legacy = _legacy_record(json.loads((baseline / "complete.json").read_text()))
+    (completed / "complete.json").write_text(json.dumps(legacy))
+    capsys.readouterr()
+
+    barrage_run(completed)
+
+    assert capsys.readouterr().out.splitlines()[-1] == "status=skipped_complete"
+    assert [path.name for path in completed.iterdir()] == ["complete.json"]
+
+
+@pytest.mark.parametrize("complete_version", ["v3", "v4"])
+def test_completed_barrage_whose_run_record_has_another_version_is_not_skipped(
+    barrage_run, tmp_path, complete_version
+) -> None:
+    baseline = tmp_path / "baseline"
+    barrage_run(baseline)
+    current = json.loads((baseline / "run.json").read_text())
+    legacy = _legacy_record(current)
+    completed = tmp_path / "completed"
+    completed.mkdir()
+    complete, run = (legacy, current) if complete_version == "v3" else (current, legacy)
+    (completed / "complete.json").write_text(json.dumps(complete))
+    (completed / "run.json").write_text(json.dumps(run))
+    before = _tree(completed)
+
+    with pytest.raises(ValueError, match="different rendering contract"):
+        barrage_run(completed)
+
+    assert _tree(completed) == before
+
+
+def _write_field(directory, targets):
+    spline = SplineTransformer(
+        knots=np.tile(np.linspace(0, 1, 5)[:, None], (1, 2)), extrapolation="periodic"
+    ).fit([[0.0, 0.0], [1.0, 1.0]])
+    field = directory / "field.joblib"
+    joblib.dump(
+        dict(
+            period_xy_um=np.array([11.0, 17.0]),
+            periodic_spline=spline,
+            periodic_center=np.full(16, 1 / 16),
+            coefficient=np.random.default_rng(7).normal(0, 0.5, (16, len(targets))),
+            targets=list(targets),
+        ),
+        field,
+    )
+    return PeriodicPixels(str(field), file_sha256(field), (1.0, 1.0, 1.0)).identity
+
+
+def test_pixel_model_with_other_periodic_targets_is_rejected(barrage_run, tmp_path) -> None:
+    manifest = json.loads((barrage_run.source_dir / "source.json").read_text())
+    identity = _write_field(tmp_path, ("edu", "brdu"))
+    model = tmp_path / "model.joblib"
+    joblib.dump({"source_sha256": manifest["source_sha256"], "pixel_correction": identity}, model)
+
+    with pytest.raises(ContractMismatchError, match="model.joblib"):
+        barrage_run(tmp_path / "barrage", "--pixel-model", str(model))
+
+    assert not (tmp_path / "barrage" / "run.json").exists()
 
 
 def test_interrupted_render_does_not_publish_png(barrage_run, tmp_path, monkeypatch) -> None:

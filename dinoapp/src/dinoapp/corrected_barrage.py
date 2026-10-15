@@ -11,6 +11,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from dino.crop_rendering import read_crop, render_crop
+from dino_markers import default_config
 from dino.zarr_source import CellCropReader
 from dinoapp.display_pixels import DisplayPixels
 from dinoapp.native import render_brdu_crop, render_edu_crop
@@ -66,7 +67,8 @@ class CorrectedBarrageSource(BarrageSource):
             raise ValueError(f'Cell {cell} has no mask on its saved crop plane')
         if marker == 'combined':
             output = io.BytesIO()
-            render_crop(crop, cell=cell, display_max=self.contract['display_max']).save(output, format='PNG')
+            render_crop(crop, cell=cell, display_max=self.contract['display_max'],
+                        panels=default_config().panels).save(output, format='PNG')
             image = output.getvalue()
         else:
             render = {'brdu': render_brdu_crop, 'edu': render_edu_crop}[marker]

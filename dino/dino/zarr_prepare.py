@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,14 +24,23 @@ from dino.zarr_source import (
     resolve_array,
     write_json_atomic,
 )
+from dino_markers import (
+    PREPARED_SOURCE,
+    MarkerConfig,
+    declared_contract,
+    default_config,
+    load_config,
+    require_same_contract,
+    save_config,
+)
 
 
 @dataclass(frozen=True)
 class PrepareConfig:
     labels: Path
-    pi: Path
-    edu: Path
-    brdu: Path
+    channels: Mapping[str, Path]
+    config: MarkerConfig
+    config_from: str
     offset_zyx: tuple[int, int, int]
     out_dir: Path
     workers: int
@@ -143,9 +153,18 @@ def _validate_areas(cells: pl.DataFrame, *, labels_path: Path) -> None:
 def _parse_args() -> PrepareConfig:
     parser = argparse.ArgumentParser(description="Index masked labels for direct-Zarr Cell-DINO.")
     parser.add_argument("--labels", type=Path, required=True)
-    parser.add_argument("--pi", type=Path, required=True)
-    parser.add_argument("--edu", type=Path, required=True)
-    parser.add_argument("--brdu", type=Path, required=True)
+    parser.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        metavar="KEY=PATH",
+        help="Fused channel source, once per key of the marker contract (reference and markers).",
+    )
+    parser.add_argument(
+        "--markers",
+        type=Path,
+        help="Marker configuration defining this source; the packaged default when omitted.",
+    )
     parser.add_argument("--offset-zyx", type=int, nargs=3, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=2)
@@ -158,11 +177,29 @@ def _parse_args() -> PrepareConfig:
     args = parser.parse_args()
     if args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.markers is None:
+        config, config_from = default_config(), "packaged default markers.json"
+    else:
+        config, config_from = load_config(args.markers.expanduser()), str(args.markers)
+    channels: dict[str, Path] = {}
+    for value in args.channel:
+        key, separator, path = value.partition("=")
+        if not separator or not key or not path:
+            parser.error(f"--channel expects KEY=PATH, got {value!r}")
+        if key in channels:
+            parser.error(f"--channel {key!r} given more than once")
+        channels[key] = Path(path).expanduser()
+    keys = config.contract.channel_keys
+    if set(channels) != set(keys):
+        parser.error(
+            f"--channel keys must be exactly {list(keys)}: "
+            f"missing {sorted(set(keys) - set(channels))}, unexpected {sorted(set(channels) - set(keys))}"
+        )
     return PrepareConfig(
         labels=args.labels.expanduser(),
-        pi=args.pi.expanduser(),
-        edu=args.edu.expanduser(),
-        brdu=args.brdu.expanduser(),
+        channels=channels,
+        config=config,
+        config_from=config_from,
         offset_zyx=tuple(args.offset_zyx),
         out_dir=args.out_dir.expanduser(),
         workers=args.workers,
@@ -271,8 +308,9 @@ def main() -> None:
     config = _parse_args()
     manifest = build_source_manifest(
         labels_path=config.labels,
-        channel_paths={"pi": config.pi, "edu": config.edu, "brdu": config.brdu},
+        channel_paths=config.channels,
         offset_zyx=config.offset_zyx,
+        required_channels=config.config.contract.channel_keys,
         dataset=config.dataset,
         roi=config.roi,
     )
@@ -289,6 +327,14 @@ def main() -> None:
             raise ValueError(f"Output directory belongs to a different source: {config.out_dir}")
     elif any(config.out_dir.iterdir()):
         raise ValueError(f"Occupied preparation directory has no source manifest: {config.out_dir}")
+    declared = declared_contract(config.out_dir)
+    if declared is not None:
+        require_same_contract(
+            config.config.contract,
+            declared,
+            expected_from=config.config_from,
+            actual_from=str(config.out_dir),
+        )
     if complete_path.exists():
         complete = json.loads(complete_path.read_text())
         if complete.get("source_sha256") != source_sha256 or complete.get("cells_sha256") != file_sha256(
@@ -304,6 +350,7 @@ def main() -> None:
         return
     if not source_path.exists():
         write_json_atomic(manifest, source_path, overwrite=False)
+    save_config(config.config, config.out_dir)
 
     if config.measured_props is not None:
         cells = _load_measured_cells(config.measured_props, config.labels)
@@ -335,15 +382,14 @@ def main() -> None:
             raise ValueError(f"Prepared cell table differs from measured labels: {cells_path}")
     else:
         _write_polars_atomic(cells, cells_path)
-    complete = {
-        "artifact": "dino-zarr-source-complete-v1",
+    fields = {
         "source_sha256": source_sha256,
         "cells": cells.height,
         "cells_sha256": file_sha256(cells_path),
     }
     if config.measured_props is not None:
-        complete["measured_props_sha256"] = file_sha256(config.measured_props)
-    write_json_atomic(complete, complete_path, overwrite=False)
+        fields["measured_props_sha256"] = file_sha256(config.measured_props)
+    write_json_atomic(PREPARED_SOURCE.stamp(fields, config.config.contract), complete_path, overwrite=False)
     print(f"source_dir={config.out_dir}")
     print(f"cells={cells.height}")
     print("status=complete")

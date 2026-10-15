@@ -447,11 +447,12 @@ class FieldSource:
     def cell_crop(self, label: int):
         """Use the barrage's maximal-area plane, crop reader, and display contract."""
         from dino.crop_rendering import render_crop
+        from dino_markers import default_config
 
         crop, plane_z, contract = self._read_cell_crop(label)
         output = io.BytesIO()
         render_crop(
-            crop, cell=self.cell_id(label), display_max=contract["display_max"]
+            crop, cell=self.cell_id(label), display_max=contract["display_max"], panels=default_config().panels
         ).save(output, format="PNG")
         return output.getvalue(), plane_z
 

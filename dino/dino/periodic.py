@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import click
@@ -17,9 +19,19 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import SplineTransformer
 
+from dino_markers import (
+    INTENSITY_MODEL,
+    MarkerContract,
+    bundle_contract,
+    default_config,
+    derive_bundle,
+    intensity_column,
+    load_config,
+    require_same_contract,
+)
+
 from dino.artifacts import file_sha256
 
-TARGETS = ("brdu", "edu")
 MARKER = b"dino_periodic_correction"
 
 
@@ -60,21 +72,21 @@ def balanced_sample(frame, edges, count, seed):
     )
 
 
-def fit_field(frame, periods, folds):
+def fit_field(frame, periods, folds, *, targets: Sequence[str]):
     """Select a shared periodic field by original-tile-held-out intensity error."""
     periods = np.asarray(periods, dtype=float)
     if periods.shape != (2,) or not np.isfinite(periods).all() or np.any(periods <= 0):
         raise ValueError("XY periods must be finite and positive")
     columns = ["u", "v", "r_vz", "centroid_z"]
-    numeric = frame[columns + ["x_um", "y_um", *[f"intensity_{t}_mean" for t in TARGETS]]]
+    numeric = frame[columns + ["x_um", "y_um", *[intensity_column(t) for t in targets]]]
     if not np.isfinite(numeric.to_numpy()).all() or frame.tile_index.isna().any():
         raise ValueError("Fit coordinates, intensities and tile groups must be present and finite")
-    intensity = frame[[f"intensity_{t}_mean" for t in TARGETS]].to_numpy()
+    intensity = frame[[intensity_column(t) for t in targets]].to_numpy()
     if np.any(intensity <= 0):
         raise ValueError("Fit intensities must be positive")
     response = np.log(intensity)
     if np.any(np.var(response, axis=0) == 0):
-        raise ValueError("Both targets must have varying intensities")
+        raise ValueError("Every target must have varying intensities")
     spline = SplineTransformer(n_knots=6, extrapolation="linear").fit(frame[columns])
     values = spline.transform(frame[columns])
     width = values.shape[1] // 4
@@ -124,7 +136,7 @@ def fit_field(frame, periods, folds):
         periodic_spline=periodic_spline,
         periodic_center=center,
         coefficient=fit.coef_[:, anatomy.shape[1] :].T,
-        targets=list(TARGETS),
+        targets=list(targets),
     )
     metrics = dict(
         selected_knots=knots,
@@ -146,7 +158,7 @@ def main():
     "--cells",
     type=click.Path(exists=True, path_type=Path),
     required=True,
-    help="Population Parquet: label, centroid_z/y/x (pixels), u, v, r_vz (um), tile_index, intensity_brdu/edu_mean.",
+    help="Population Parquet: label, centroid_z/y/x (pixels), u, v, r_vz (um), tile_index, intensity_<marker>_mean.",
 )
 @click.option("--period-xy-um", type=(float, float), required=True)
 @click.option("--scale-zyx-um", type=(float, float, float), required=True)
@@ -160,8 +172,14 @@ def main():
 @click.option("--cells-per-z", type=click.IntRange(min=1), default=20000, show_default=True)
 @click.option("--folds", type=click.IntRange(min=2), default=5)
 @click.option("--seed", type=int, default=73)
+@click.option(
+    "--markers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Marker configuration whose markers are the fitted targets, in order; default: the packaged configuration.",
+)
 @click.option("--out-dir", type=click.Path(path_type=Path), required=True)
-def fit_command(cells, period_xy_um, scale_zyx_um, z_edge, cells_per_z, folds, seed, out_dir):
+def fit_command(cells, period_xy_um, scale_zyx_um, z_edge, cells_per_z, folds, seed, markers, out_dir):
+    targets = (default_config() if markers is None else load_config(markers)).contract.markers
     scale = np.asarray(scale_zyx_um)
     if not np.isfinite(scale).all() or np.any(scale <= 0):
         raise ValueError("Voxel spacing must be finite and positive")
@@ -173,7 +191,7 @@ def fit_command(cells, period_xy_um, scale_zyx_um, z_edge, cells_per_z, folds, s
     frame = balanced_sample(pd.read_parquet(cells), z_edge, cells_per_z, seed)
     frame["x_um"] = frame.centroid_x * scale[2]
     frame["y_um"] = frame.centroid_y * scale[1]
-    bundle, metrics, frame["fold"] = fit_field(frame, period_xy_um, folds)
+    bundle, metrics, frame["fold"] = fit_field(frame, period_xy_um, folds, targets=targets)
     bundle["scale_zyx_um"] = scale
     metrics.update(
         cells=str(cells.resolve()),
@@ -212,9 +230,10 @@ def apply_command(model, props, scale_zyx_um, classifier, out_dir):
     scale = np.asarray(scale_zyx_um)
     if not np.isfinite(scale).all() or np.any(scale <= 0):
         raise ValueError("Voxel spacing must be finite and positive")
+    from dino.periodic_pixels import PeriodicPixels
+
     bundle = joblib.load(model)
-    if list(bundle["targets"]) != list(TARGETS):
-        raise ValueError("Correction target order must be brdu, edu")
+    targets = list(PeriodicPixels(str(model.resolve()), file_sha256(model), tuple(scale_zyx_um)).targets)
     if "scale_zyx_um" in bundle and not np.array_equal(bundle["scale_zyx_um"], scale):
         raise ValueError("Correction and props voxel spacings differ")
     parquet = pq.ParquetFile(props)
@@ -223,14 +242,19 @@ def apply_command(model, props, scale_zyx_um, classifier, out_dir):
         raise ValueError("Intensity table is already periodically corrected")
     classifier_bundle = None
     if classifier is not None:
-        from dino.intensity_context import MODEL_SCHEMA
-
         classifier_bundle = joblib.load(classifier)
         if (
-            classifier_bundle["schema"] != MODEL_SCHEMA
+            not INTENSITY_MODEL.recognizes(classifier_bundle)
             or Path(classifier_bundle["intensity_props"]).resolve() != props.resolve()
         ):
             raise ValueError("Classifier must use this uncorrected intensity table")
+        classifier_contract = bundle_contract(classifier_bundle, where=str(classifier))
+        require_same_contract(
+            MarkerContract(classifier_contract.reference, tuple(targets)),
+            classifier_contract,
+            expected_from=f"periodic field {model}",
+            actual_from=f"classifier {classifier}",
+        )
         if not np.array_equal(classifier_bundle["intensity_scale_zyx_um"], scale):
             raise ValueError("Classifier and props voxel spacings differ")
         if "periodic_correction" in classifier_bundle or "pixel_correction" in classifier_bundle:
@@ -246,16 +270,18 @@ def apply_command(model, props, scale_zyx_um, classifier, out_dir):
     metadata[MARKER] = json.dumps(record).encode()
     schema = parquet.schema_arrow.with_metadata(metadata)
     # Use float64 even when raw intensity statistics were integer-valued.
-    columns = [
-        f"intensity_{t}_{stat}"
-        for t in TARGETS
-        for stat in ("min", "mean", "max")
-        if f"intensity_{t}_{stat}" in schema.names
+    target_columns = [
+        [
+            intensity_column(t, stat)
+            for stat in ("min", "mean", "max")
+            if intensity_column(t, stat) in schema.names
+        ]
+        for t in targets
     ]
-    for target in TARGETS:
-        if f"intensity_{target}_mean" not in columns:
+    for target, columns in zip(targets, target_columns):
+        if intensity_column(target) not in columns:
             raise ValueError(f"Missing mean intensity for {target}")
-    for column in columns:
+    for column in itertools.chain.from_iterable(target_columns):
         schema = schema.set(schema.get_field_index(column), pa.field(column, pa.float64()))
     out_dir.mkdir(parents=True)
     output = out_dir / "props-corrected.parquet"
@@ -269,22 +295,24 @@ def apply_command(model, props, scale_zyx_um, classifier, out_dir):
                 ]
             )
             gain = correction_gain(xy, bundle)
-            for j, target in enumerate(TARGETS):
+            for j, columns in enumerate(target_columns):
                 for column in columns:
-                    if column.startswith(f"intensity_{target}_"):
-                        values = table[column].to_numpy() * gain[:, j]
-                        if not np.isfinite(values).all() or np.any(values < 0):
-                            raise ValueError(f"Invalid corrected intensity: {column}")
-                        table = table.set_column(
-                            table.schema.get_field_index(column),
-                            column,
-                            pa.array(values),
-                        )
+                    values = table[column].to_numpy() * gain[:, j]
+                    if not np.isfinite(values).all() or np.any(values < 0):
+                        raise ValueError(f"Invalid corrected intensity: {column}")
+                    table = table.set_column(
+                        table.schema.get_field_index(column),
+                        column,
+                        pa.array(values),
+                    )
             writer.write_table(table.cast(schema))
     if classifier_bundle is not None:
-        classifier_bundle["intensity_props"] = str(output.resolve())
-        classifier_bundle["periodic_correction"] = record
-        joblib.dump(classifier_bundle, out_dir / "model.joblib")
+        derived = derive_bundle(
+            classifier_bundle,
+            {"intensity_props": str(output.resolve()), "periodic_correction": record},
+            where=str(classifier),
+        )
+        joblib.dump(derived, out_dir / "model.joblib")
     (out_dir / "correction.json").write_text(json.dumps(record, indent=2) + "\n")
     click.echo(str(output))
 
@@ -310,13 +338,12 @@ def measure_command(source_dir, model, classifier, scale_zyx_um, workers, out_di
     """Measure lazy corrected pixels and bind the same correction for DINO."""
     from squisher_segment.segment.regionprops import measure_zarr
 
-    from dino.intensity_context import MODEL_SCHEMA
-    from dino.periodic_pixels import PeriodicPixels
+    from dino.periodic_pixels import PeriodicPixels, require_periodic_targets
     from dino.zarr_source import load_source, write_json_atomic
 
     source = load_source(source_dir)
     bundle = joblib.load(classifier)
-    if bundle["schema"] != MODEL_SCHEMA or bundle["source_sha256"] != source.manifest["source_sha256"]:
+    if not INTENSITY_MODEL.recognizes(bundle) or bundle["source_sha256"] != source.manifest["source_sha256"]:
         raise ValueError("Classifier must be an intensity-context model for this source")
     if "pixel_correction" in bundle or "periodic_correction" in bundle:
         raise ValueError("Classifier already has correction; supply the original classifier")
@@ -324,12 +351,13 @@ def measure_command(source_dir, model, classifier, scale_zyx_um, workers, out_di
         raise ValueError("Pixel-corrected regionprops requires aligned image and label grids")
     if not np.allclose(bundle["intensity_scale_zyx_um"], scale_zyx_um, rtol=1e-12, atol=0):
         raise ValueError("Classifier and correction voxel spacings differ")
-    for target in TARGETS:
+    correction = PeriodicPixels(str(model.resolve()), file_sha256(model), tuple(scale_zyx_um))
+    require_periodic_targets(correction, bundle_contract(bundle, where=str(classifier)), artifact=f"classifier {classifier}")
+    for target in correction.targets:
         transforms = source.manifest["channels"][target]["ome"]["coordinate_transformations"]
         scales = [entry["scale"] for entry in transforms if entry["type"] == "scale"]
         if len(scales) != 1 or not np.allclose(scales[0], scale_zyx_um, rtol=1e-12, atol=0):
             raise ValueError(f"Image and correction voxel spacings differ: {target}")
-    correction = PeriodicPixels(str(model.resolve()), file_sha256(model), tuple(scale_zyx_um))
     record = dict(
         source_sha256=source.manifest["source_sha256"],
         classifier=str(classifier.resolve()),
@@ -364,7 +392,7 @@ def measure_command(source_dir, model, classifier, scale_zyx_um, workers, out_di
     measure_zarr(
         Path(source.manifest["labels"]["root"]),
         props,
-        intensity_paths={target: Path(source.manifest["channels"][target]["root"]) for target in TARGETS},
+        intensity_paths={target: Path(source.manifest["channels"][target]["root"]) for target in correction.targets},
         intensity_transform=correction,
         workers=workers,
     )
@@ -381,9 +409,12 @@ def measure_command(source_dir, model, classifier, scale_zyx_um, workers, out_di
         os.replace(temporary_path, props)
     finally:
         temporary_path.unlink(missing_ok=True)
-    bundle["intensity_props"] = str(props.resolve())
-    bundle["pixel_correction"] = correction.identity
-    joblib.dump(bundle, output_model)
+    derived = derive_bundle(
+        bundle,
+        {"intensity_props": str(props.resolve()), "pixel_correction": correction.identity},
+        where=str(classifier),
+    )
+    joblib.dump(derived, output_model)
     write_json_atomic(
         dict(
             **record,

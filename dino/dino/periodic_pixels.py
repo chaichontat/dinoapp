@@ -9,6 +9,7 @@ from threading import Lock
 
 import joblib
 import numpy as np
+from dino_markers import ContractMismatchError, MarkerContract
 
 from dino.artifacts import file_sha256
 
@@ -21,8 +22,19 @@ def _load_field(path: str, sha256: str):
     if file_sha256(Path(path)) != sha256:
         raise ValueError(f"Periodic pixel model hash mismatch: {path}")
     bundle = joblib.load(path)
-    if bundle["targets"] != ["brdu", "edu"]:
-        raise ValueError("Periodic pixel targets must be brdu, edu")
+    targets = bundle["targets"]
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or not all(isinstance(target, str) for target in targets)
+        or len(set(targets)) != len(targets)
+    ):
+        raise ValueError(f"Periodic pixel targets must be a nonempty list of unique keys: {path}")
+    if bundle["coefficient"].shape[1] != len(targets):
+        raise ValueError(
+            f"Periodic pixel coefficient has {bundle['coefficient'].shape[1]} columns "
+            f"for {len(targets)} targets: {path}"
+        )
     return bundle
 
 
@@ -37,7 +49,7 @@ def _gain_tile(path: str, sha256: str, scale_yx: tuple[float, float], ty: int, t
     bx = spline.transform(np.column_stack([np.remainder(x / period[0], 1), np.zeros(len(x))]))
     by = spline.transform(np.column_stack([np.zeros(len(y)), np.remainder(y / period[1], 1)]))
     width = bx.shape[1] // 2
-    coefficient = bundle["coefficient"].reshape(width, width, 2)
+    coefficient = bundle["coefficient"].reshape(width, width, len(bundle["targets"]))
     field = np.einsum("xi,ijt,yj->yxt", bx[:, :width], coefficient, by[:, width:], optimize=True)
     field -= bundle["periodic_center"] @ bundle["coefficient"]
     gain = np.exp(-field).astype(np.float32)
@@ -61,6 +73,10 @@ class PeriodicPixels:
             raise ValueError("Pixel correction requires positive finite ZYX voxel spacing")
 
     @property
+    def targets(self) -> tuple[str, ...]:
+        return tuple(_load_field(self.path, self.sha256)["targets"])
+
+    @property
     def identity(self):
         return dict(
             model=self.path,
@@ -72,11 +88,12 @@ class PeriodicPixels:
 
     def __call__(self, name: str, block: np.ndarray, origin_zyx: tuple[int, int, int]):
         """Multiply raw 2D/3D pixels using their global image-grid coordinates."""
-        if name not in ("brdu", "edu"):
+        targets = self.targets
+        if name not in targets:
             raise ValueError(f"Periodic pixel correction has no target {name!r}")
         if block.ndim not in (2, 3):
             raise ValueError("Periodic pixel correction expects 2D or 3D pixels")
-        target = ("brdu", "edu").index(name)
+        target = targets.index(name)
         y0, x0 = origin_zyx[-2:]
         y1, x1 = y0 + block.shape[-2], x0 + block.shape[-1]
         corrected = np.asarray(block, dtype=np.float32).copy()
@@ -93,3 +110,12 @@ class PeriodicPixels:
                     target,
                 ]
         return corrected
+
+
+def require_periodic_targets(correction: PeriodicPixels, contract: MarkerContract, *, artifact: str) -> None:
+    if correction.targets != contract.markers:
+        raise ContractMismatchError(
+            f"Marker contract mismatch: periodic pixel model {correction.path} records targets "
+            f"{list(correction.targets)}, but {artifact} requires markers {list(contract.markers)}; "
+            "marker order is part of the contract"
+        )

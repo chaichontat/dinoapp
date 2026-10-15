@@ -15,6 +15,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from dino import zarr_cli, zarr_infer, zarr_model
+from dino_markers import DEFAULT_CONTRACT
 from dino.artifacts import (
     file_sha256,
     ordered_cell_sha256,
@@ -44,7 +45,8 @@ def inference_run(tmp_path, monkeypatch):
 
     source_dir = tmp_path / "source"
     manifest = build_source_manifest(
-        labels_path=labels_path, channel_paths=channel_paths, offset_zyx=(0, 1, 2)
+        labels_path=labels_path, channel_paths=channel_paths, offset_zyx=(0, 1, 2),
+        required_channels=DEFAULT_CONTRACT.channel_keys,
     )
     write_json_atomic(manifest, source_dir / "source.json")
     cells = pd.DataFrame(

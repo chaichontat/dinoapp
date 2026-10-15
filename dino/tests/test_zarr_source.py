@@ -16,6 +16,7 @@ from dino.zarr_source import (
     neighbor_cell_intensity,
     write_json_atomic,
 )
+from dino_markers import DEFAULT_CONTRACT
 
 
 def test_crop_reader_uses_target_mask_and_fused_offset(tmp_path) -> None:
@@ -266,6 +267,7 @@ def test_load_source_rejects_recorded_chunk_mismatch(tmp_path) -> None:
         labels_path=labels_path,
         channel_paths=channels,
         offset_zyx=(0, 0, 0),
+        required_channels=DEFAULT_CONTRACT.channel_keys,
     )
     manifest["labels"]["chunks"] = [1, 4, 4]
     manifest["source_sha256"] = manifest_digest(manifest)
@@ -289,7 +291,12 @@ def test_source_fingerprints_stored_channel_and_label_content(tmp_path, zarr_for
     channel = group.create_array("0", shape=(1, 2, 2), chunks=(1, 2, 2), dtype="u2")
     channel[:] = 256
     paths = dict.fromkeys(("brdu", "edu", "pi"), channel_path)
-    original = build_source_manifest(labels_path=labels_path, channel_paths=paths, offset_zyx=(0, 0, 0))
+    original = build_source_manifest(
+        labels_path=labels_path,
+        channel_paths=paths,
+        offset_zyx=(0, 0, 0),
+        required_channels=DEFAULT_CONTRACT.channel_keys,
+    )
     source_dir = tmp_path / "source"
     write_json_atomic(original, source_dir / "source.json")
     load_source(source_dir)
@@ -301,12 +308,85 @@ def test_source_fingerprints_stored_channel_and_label_content(tmp_path, zarr_for
 
     with pytest.raises(ValueError, match="channel .*no longer matches source.json"):
         load_source(source_dir)
-    updated = build_source_manifest(labels_path=labels_path, channel_paths=paths, offset_zyx=(0, 0, 0))
+    updated = build_source_manifest(
+        labels_path=labels_path,
+        channel_paths=paths,
+        offset_zyx=(0, 0, 0),
+        required_channels=DEFAULT_CONTRACT.channel_keys,
+    )
     assert updated["source_sha256"] != original["source_sha256"]
     assert updated["channels"]["brdu"]["metadata_sha256"] == original["channels"]["brdu"]["metadata_sha256"]
     write_json_atomic(updated, source_dir / "source.json")
     labels[:] = 0  # Removing an encoded all-fill chunk must also change identity.
     with pytest.raises(ValueError, match="masked labels no longer matches source.json"):
         load_source(source_dir)
-    relabeled = build_source_manifest(labels_path=labels_path, channel_paths=paths, offset_zyx=(0, 0, 0))
+    relabeled = build_source_manifest(
+        labels_path=labels_path,
+        channel_paths=paths,
+        offset_zyx=(0, 0, 0),
+        required_channels=DEFAULT_CONTRACT.channel_keys,
+    )
     assert relabeled["source_sha256"] != updated["source_sha256"]
+
+
+def _source_inputs(tmp_path, names):
+    labels_path = tmp_path / "dataset" / "roi" / "masked" / "labels.zarr"
+    labels_path.parent.mkdir(parents=True)
+    zarr.open_array(labels_path, mode="w", shape=(1, 4, 4), chunks=(1, 2, 2), dtype="u4")
+    channels = {}
+    for name in names:
+        path = tmp_path / f"{name}.zarr"
+        zarr.open_array(path, mode="w", shape=(1, 4, 4), chunks=(1, 2, 2), dtype="u2")
+        channels[name] = path
+    return labels_path, channels
+
+
+def test_manifest_requires_the_channels_of_a_custom_contract(tmp_path) -> None:
+    labels_path, channels = _source_inputs(tmp_path, ("dapi", "edu", "brdu", "pcna"))
+
+    manifest = build_source_manifest(
+        labels_path=labels_path,
+        channel_paths=channels,
+        offset_zyx=(0, 0, 0),
+        required_channels=("dapi", "edu", "brdu", "pcna"),
+    )
+
+    assert set(manifest["channels"]) == {"dapi", "edu", "brdu", "pcna"}
+    with pytest.raises(ValueError, match=r"Missing required channel sources: \['pcna'\]"):
+        build_source_manifest(
+            labels_path=labels_path,
+            channel_paths={key: path for key, path in channels.items() if key != "pcna"},
+            offset_zyx=(0, 0, 0),
+            required_channels=("dapi", "edu", "brdu", "pcna"),
+        )
+
+
+def test_default_channels_are_not_required_by_a_custom_contract(tmp_path) -> None:
+    labels_path, channels = _source_inputs(tmp_path, ("dapi", "edu"))
+
+    manifest = build_source_manifest(
+        labels_path=labels_path, channel_paths=channels, offset_zyx=(0, 0, 0), required_channels=("dapi", "edu")
+    )
+
+    assert set(manifest["channels"]) == {"dapi", "edu"}
+    with pytest.raises(ValueError, match=r"Missing required channel sources: \['brdu', 'pi'\]"):
+        build_source_manifest(
+            labels_path=labels_path,
+            channel_paths=channels,
+            offset_zyx=(0, 0, 0),
+            required_channels=DEFAULT_CONTRACT.channel_keys,
+        )
+
+
+def test_required_channel_order_does_not_change_the_manifest_or_digest(tmp_path) -> None:
+    labels_path, channels = _source_inputs(tmp_path, ("pi", "edu", "brdu"))
+
+    manifests = [
+        build_source_manifest(
+            labels_path=labels_path, channel_paths=channels, offset_zyx=(0, 0, 0), required_channels=required
+        )
+        for required in (("pi", "brdu", "edu"), ("pi", "edu", "brdu"), ("edu", "brdu", "pi"))
+    ]
+
+    assert manifests[0] == manifests[1] == manifests[2]
+    assert manifests[0]["source_sha256"] == manifests[1]["source_sha256"] == manifests[2]["source_sha256"]
