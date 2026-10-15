@@ -2,6 +2,9 @@ import base64
 import hashlib
 import io
 import json
+from collections.abc import Callable
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +20,7 @@ from dino_markers import (
     DEFAULT_CONTRACT,
     INFERENCE,
     ContractMismatchError,
+    ReviewTarget,
     UnsupportedArtifactError,
     config_to_json,
     default_config,
@@ -31,7 +35,7 @@ from dinoapp.native import Field, render_field
 
 
 def test_prod3_2_is_a_native_dataset():
-    native, shared_app = get_native_modules('Prod3-2')
+    native, shared_app = get_native_modules('prod3_2')
     assert native.__name__ == 'dinoapp.prod3_2'
     assert shared_app.__name__ == 'dinoapp.native_app'
 
@@ -137,7 +141,7 @@ class Fixture:
             self.selected_contract = DEFAULT_CONTRACT
             self.review_frame = self.rows.assign(split='training', tranche='barrage-cortex-v1')
 
-    def build(self) -> type:
+    def build(self) -> Callable[[], prod3_2.FieldSource]:
         (self.run / 'complete.json').write_text(json.dumps(self.complete))
         (self.run / 'infer/shard-000/complete.json').write_text(json.dumps(self.shard))
         directory = self.scored if self.pointer is not None else self.run / 'infer/shard-000/predictions'
@@ -147,15 +151,11 @@ class Fixture:
         fixture = self
 
         class Adapter(prod3_2.FieldSource):
-            dataset_name = 'Test3-2'
-            dataset_root = fixture.root
-            review_directory = 'dino-test'
-            reembedding_run = fixture.run
-            surface_coordinates = fixture.run / 'vz-coordinates/cells.parquet'
-            cell_prefix = 'tst'
             prediction_pointer = fixture.pointer
 
-        return Adapter
+        target = ReviewTarget('Test3-2', 'prod3_2', self.root, self.review, 'tst',
+                              {'DAPI': 'pi', 'BrdU': 'brdu', 'EdU': 'edu'}, self.run)
+        return partial(Adapter, target)
 
     def write_markers(self, config) -> None:
         (self.review / 'barrage-cortex-v1/markers.json').write_text(json.dumps(config_to_json(config)))
@@ -310,3 +310,12 @@ def test_prod3_2_rejects_a_partition_cutoff_that_differs_from_the_classifier_for
 
     with pytest.raises(ValueError, match='prediction provenance differs'):
         fixture.build()()
+
+
+def test_prod3_2_requires_the_targets_embedding_run(tmp_path, monkeypatch):
+    fixture = Fixture(tmp_path, monkeypatch)
+    build = fixture.build()
+    target = replace(build.args[0], embedding_run=None)
+
+    with pytest.raises(ValueError, match="Review target 'Test3-2' needs the embedding_run its adapter reads"):
+        build.func(target)

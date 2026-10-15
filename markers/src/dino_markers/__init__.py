@@ -18,9 +18,11 @@ from .config import (
     Marker,
     MarkerConfig,
     Presentation,
+    ReviewTarget,
     config_to_json,
     default_config,
     load_config,
+    load_review_targets,
     parse_config,
 )
 from .contract import (
@@ -108,6 +110,7 @@ __all__ = [
     "MarkerContract",
     "MissingContractError",
     "Presentation",
+    "ReviewTarget",
     "SavedFilter",
     "UnsupportedArtifactError",
     "badge_colors",
@@ -127,6 +130,7 @@ __all__ = [
     "image_path_column",
     "intensity_column",
     "load_config",
+    "load_review_targets",
     "marker_revision",
     "matches_saved",
     "metric_key",

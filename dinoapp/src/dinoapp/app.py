@@ -18,6 +18,7 @@ from dino_markers import (
     ContractMismatchError,
     Label,
     MarkerConfig,
+    ReviewTarget,
     SavedFilter,
     matches_saved,
     state_label,
@@ -157,19 +158,19 @@ def get_barrage_source(root: str, marker_revision: str) -> BarrageSource:
     return BarrageSource(Path(root))
 
 
-NATIVE_SOURCES = {
-    "Prod2": "dinoapp.native",
-    "Prod3": "dinoapp.prod3",
-    "Prod2-2": "dinoapp.prod2_2",
-    "Prod3-2": "dinoapp.prod3_2",
+ADAPTERS = {
+    "prod2": "dinoapp.native",
+    "prod3": "dinoapp.prod3",
+    "prod2_2": "dinoapp.prod2_2",
+    "prod3_2": "dinoapp.prod3_2",
 }
 
 
 @st.cache_resource
-def get_native_modules(dataset: str) -> tuple[Any, Any]:
-    if dataset not in NATIVE_SOURCES:
-        raise ValueError(f"Unknown native dataset: {dataset}")
-    return importlib.import_module(NATIVE_SOURCES[dataset]), importlib.import_module("dinoapp.native_app")
+def get_native_modules(adapter: str) -> tuple[Any, Any]:
+    if adapter not in ADAPTERS:
+        raise ValueError(f"Unknown review adapter: {adapter}")
+    return importlib.import_module(ADAPTERS[adapter]), importlib.import_module("dinoapp.native_app")
 
 
 def new_gallery_state(
@@ -532,7 +533,7 @@ def review_barrage_cell(
                 saved_filter = saved_filter_controls(context, config, "cell_saved")
             st.caption(
                 f"Set {', '.join(config.label(key) for key in config.display_markers)} "
-                "for each displayed cell, then save."
+                "for each displayed cell; each choice is saved immediately."
             )
         signature = (source.source_id, contract, dataset, cells_option, saved_filter)
         queues = context["cell_queues"]
@@ -613,7 +614,6 @@ def review_barrage_cell(
             context["notice"] = str(error)
         st.rerun()
 
-    draft = cell_draft(context, cell, current, contract.markers)
     image_column, action_column = st.columns([3, 1], gap="large")
     with image_column:
         st.subheader(crop.title)
@@ -622,24 +622,35 @@ def review_barrage_cell(
     with action_column:
         st.subheader("Saved identity")
         st.write(state_label(config, current) if current is not None else "No saved call")
-        for key in config.display_markers:
-            draft["values"][key] = st.segmented_control(
-                config.label(key),
-                (0, 1),
-                format_func=lambda value: "+" if value else "−",
-                default=draft["values"][key],
-                key=f"cell-mark:{context['session_id']}:{cell}:{key}:{view_token}:{draft['expected']}",
-            )
-        value = draft_label(contract.markers, draft)
-        if st.button(
-            "Save and next",
-            disabled=value is None,
-            type="primary",
-            key=f"cell-save:{context['session_id']}:{cell}:{view_token}",
-            width="stretch",
-        ):
-            advance = value == current
-            if advance:
+        chosen = None
+        two_markers = len(contract.markers) == 2
+        if two_markers:
+            for value in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                if st.button(
+                    state_label(config, value),
+                    key=f"assign-{context['session_id']}-{cell}-{value}:{current}:{view_token}",
+                    type="primary" if current == value else "secondary",
+                    width="stretch",
+                ):
+                    chosen = value
+        else:
+            draft = cell_draft(context, cell, current, contract.markers)
+            for key in config.display_markers:
+                draft["values"][key] = st.segmented_control(
+                    config.label(key),
+                    (0, 1),
+                    format_func=lambda value: "+" if value else "−",
+                    default=draft["values"][key],
+                    key=f"cell-mark:{context['session_id']}:{cell}:{key}:{view_token}:{draft['expected']}",
+                )
+            value = draft_label(contract.markers, draft)
+            if value is None:
+                st.caption("Set every marker to save this cell.")
+            elif value != current:
+                chosen = value
+        if chosen is not None:
+            saved = chosen == current
+            if saved:
                 context["notice"] = f"{cell} is unchanged; nothing was written."
             else:
                 try:
@@ -648,8 +659,8 @@ def review_barrage_cell(
                         state_dir,
                         context,
                         cell,
-                        value,
-                        expected=draft["expected"],
+                        chosen,
+                        expected=current,
                         record={
                             "action": "assign",
                             "source_id": source.source_id,
@@ -662,18 +673,21 @@ def review_barrage_cell(
                 except ContractMismatchError as error:
                     context["notice"] = str(error)
                 else:
-                    advance = True
-                    update_resident_cards(context, cell, value)
-                    context["notice"] = f"Saved {cell} as {state_label(config, value)} in {edit.path}."
-            if advance:
-                del context["drafts"][cell]
-                queue["position"] = min(position + 1, len(cells) - 1)
+                    saved = True
+                    update_resident_cards(context, cell, chosen)
+                    context["notice"] = f"Saved {cell} as {state_label(config, chosen)} in {edit.path}."
+            if saved:
+                context["drafts"].pop(cell, None)
+                if two_markers:
+                    queue["position"] = min(position + 1, len(cells) - 1)
                 st.rerun()
         if context["notice"]:
             st.info(context["notice"])
 
 
-def native_field_mode(source: NativeSource, native: Any, native_app: Any, *, marker_revision: str) -> None:
+def native_field_mode(
+    source: NativeSource, native: Any, native_app: Any, *, target: ReviewTarget, marker_revision: str
+) -> None:
     """Use the packaged spatial renderer with the selected dataset."""
     context = get_context(source.target_id)
     located_view = context["workspace"]["located_field"] is not None
@@ -720,7 +734,7 @@ def native_field_mode(source: NativeSource, native: Any, native_app: Any, *, mar
         right_view = st.selectbox("Right panel view", ("Cell identities", "Model uncertainty"), key=widget_key(context, "field_view", "Cell identities"), on_change=remember_widget, args=(context, "field_view"))
     located = context["workspace"]["located_field"]
     if located is None:
-        field = native_app.get_field(native.FieldSource, marker_revision, seed, position, z_um, width)
+        field = native_app.get_field(native.FieldSource, target, marker_revision, seed, position, z_um, width)
     else:
         _, field = located
         if st.button("Return to sampled fields"):
@@ -775,9 +789,21 @@ def launch() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Cell review", layout="wide")
-    configured_dataset = os.environ.get("DINO_NATIVE_DATASET", "Prod2")
-    target_options = ("Crop directory", *NATIVE_SOURCES)
-    configured_target = configured_dataset if os.environ.get("DINO_REVIEW_SOURCE") == "Native fields" else "Crop directory"
+    config_path = os.environ.get("DINO_REVIEW_CONFIG")
+    try:
+        review_targets = {
+            review_target.name: review_target
+            for review_target in (dino_markers.load_review_targets(Path(config_path)) if config_path else ())
+        }
+    except (FileNotFoundError, ValueError) as error:
+        st.error(str(error))
+        st.stop()
+    target_options = ("Crop directory", *review_targets)
+    configured_target = (
+        os.environ.get("DINO_NATIVE_DATASET")
+        if os.environ.get("DINO_REVIEW_SOURCE") == "Native fields"
+        else "Crop directory"
+    )
     if configured_target not in target_options:
         st.error(f"Unknown review target: {configured_target}")
         st.stop()
@@ -797,12 +823,20 @@ def main() -> None:
         state_dir = root / "cell-review"
         spatial_path = root / "spatial.json"
     else:
+        review_target = review_targets[target]
+        if review_target.adapter not in ADAPTERS:
+            retire_active_view()
+            st.error(
+                f"Review target {target!r} names unknown adapter {review_target.adapter!r}; "
+                f"known adapters: {', '.join(ADAPTERS)}"
+            )
+            st.stop()
         try:
-            native, native_app = get_native_modules(target)
-            label_root = Path(st.sidebar.text_input("Review state directory", os.environ.get("DINO_REVIEW_LABEL_ROOT", str(native.REVIEW_ROOT)), key=f"native-label-root:{target}", on_change=retire_active_view)).expanduser().resolve()
-            revision_of_markers = dino_markers.marker_revision(native.FieldSource.annotation_directories())
+            native, native_app = get_native_modules(review_target.adapter)
+            label_root = Path(st.sidebar.text_input("Review state directory", os.environ.get("DINO_REVIEW_LABEL_ROOT", str(review_target.review_root)), key=f"native-label-root:{target}", on_change=retire_active_view)).expanduser().resolve()
+            revision_of_markers = dino_markers.marker_revision(native.FieldSource.annotation_directories(review_target))
             source = NativeSource(
-                native_app.get_source(native.FieldSource, revision_of_markers), label_root=label_root
+                native_app.get_source(native.FieldSource, review_target, revision_of_markers), label_root=label_root
             )
         except (FileNotFoundError, ImportError, ValueError) as error:
             retire_active_view()
@@ -868,7 +902,7 @@ def main() -> None:
             st.caption(source.field_source.classifier_caption)
     if view == "Spatial field":
         if isinstance(source, NativeSource):
-            native_field_mode(source, native, native_app, marker_revision=revision_of_markers)
+            native_field_mode(source, native, native_app, target=review_target, marker_revision=revision_of_markers)
         else:
             from dinoapp.rhu2_app import spatial_mode
             spatial_mode(root, target_id=source.target_id)

@@ -181,6 +181,31 @@ barrage display (`display.json`) read microscopy stores, segmentations, and
 model outputs prepared by the separate `thesis-dino` pipeline. They are
 described in the [README](../README.md) and are not part of the barrage format.
 
+## Review targets
+
+A marker configuration file may carry a top-level `review_targets` list, the
+native datasets that **Review target** offers. The reviewer reads it only from
+the file named by `DINO_REVIEW_CONFIG`; a barrage's own `markers.json` supplies
+only its markers, and `thesis-dino` never writes `review_targets` into a data
+directory. Without `DINO_REVIEW_CONFIG` the reviewer offers only **Crop
+directory**.
+
+Each entry is an object with exactly these keys:
+
+| Key | Rule |
+| --- | --- |
+| `name` | Non-empty string, unique in the file. |
+| `adapter` | Non-empty string naming a reviewer adapter: `prod2`, `prod3`, `prod2_2`, or `prod3_2`. The app rejects any other name when the target is opened. |
+| `root`, `review_root` | Non-empty path strings. |
+| `cell_prefix` | String; cell identifiers are `<cell_prefix>\|<label>`. |
+| `raw_channels` | Object mapping raw image array names to channel keys, one array for each of the file's reference and marker keys. |
+| `embedding_run` | Optional non-empty path string; required by the `prod3_2` and `prod2_2` adapters. |
+
+A relative path resolves against the directory that contains the file; an
+absolute path is used as written. A file without `review_targets` has no review
+targets. An invalid entry is reported with the file path and the entry's
+position, for example `review_targets[0]: unexpected keys ['dataset']`.
+
 
 ## Connected review
 

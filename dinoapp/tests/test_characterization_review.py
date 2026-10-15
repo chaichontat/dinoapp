@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from dino_markers import DEFAULT_CONTRACT, default_config, toggle_marker
+from dino_markers import DEFAULT_CONTRACT, ReviewTarget, default_config, toggle_marker
 from PIL import Image
 from skimage.segmentation import find_boundaries
 
@@ -93,12 +93,14 @@ def _render_marker_crop(crop: CellCrop, marker: str, display_max: float) -> byte
 
 
 def _load_native_calls(root: Path) -> np.ndarray:
-    return native.FieldSource(root).calls
+    target = ReviewTarget("Prod2", "prod2", root, root, "full-run2", {"561": "pi", "BrdU": "brdu", "EdU": "edu"})
+    return native.FieldSource(target).calls
 
 
 def _overlay_calls(field_ids: np.ndarray, predicted: np.ndarray, manual: dict[str, tuple[int, int]]) -> np.ndarray:
     source = object.__new__(native.FieldSource)
     source.config = default_config()
+    source.cell_prefix = "full-run2"
     source.calls = predicted
     return source.field_calls(SimpleNamespace(ids=field_ids), SimpleNamespace(values=manual))
 

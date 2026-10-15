@@ -10,51 +10,44 @@ import joblib
 import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-from dino_markers import INFERENCE, cutoff_key, prediction_column, probability_column
+from dino_markers import INFERENCE, ReviewTarget, cutoff_key, prediction_column, probability_column
 
 from dino.artifacts import file_sha256, read_parquet_artifact
 from dino.classifier_features import validate_feature_contract
 from dino.zarr_source import CellCropReader
 from dinoapp.display_pixels import DisplayPixels
-from dinoapp.native import adapter_config, classifier_caption
+from dinoapp.native import classifier_caption
 from dinoapp.native import load_prediction_pointer, prediction_contract
 from dinoapp.native import render_field as render_field
 from dinoapp.review_predictions import load_review_predictions
 from dinoapp.prod3 import FieldSource as Prod3FieldSource
 from squisher.jpegxr_zarr import register_jpegxr_codec
 
-ROOT = Path('/working/eduseg/prod3-2')
-REVIEW_ROOT = ROOT / 'dino-prod3-2'
-
 
 class FieldSource(Prod3FieldSource):
     """Use the reviewed ventricular surface and validated saved model calls."""
 
-    display_name = 'Prod3-2 native'
-    cell_prefix = '235-4-edu-workflow-recovered'
-    raw_channels = {'DAPI': 'pi', 'BrdU': 'brdu', 'EdU': 'edu'}
-
-    dataset_name = 'Prod3-2'
-    dataset_root = ROOT
-    review_directory = 'dino-prod3-2'
-    reembedding_run = Path('/warm/prod3-2-514-local3d-ls-z128-core80/dino')
-    surface_coordinates = reembedding_run / 'vz-coordinates/cells.parquet'
-    prediction_pointer: Path | None = REVIEW_ROOT / 'cell-review/current.json'
-
     @classmethod
-    def annotation_directories(cls, root: Path | None = None) -> tuple[Path, ...]:
-        root = cls.dataset_root if root is None else root
-        return (root / cls.review_directory / 'barrage-cortex-v1',)
+    def annotation_directories(cls, target: ReviewTarget) -> tuple[Path, ...]:
+        return (target.review_root / 'barrage-cortex-v1',)
 
-    def __init__(self, root: Path | None = None):
-        root = self.dataset_root if root is None else root
-        self.root = root
-        review_root = root / self.review_directory
-        self.annotation_paths = tuple(directory / 'labels.csv' for directory in self.annotation_directories(root))
-        self.default_annotation_path = self.annotation_paths[0]
-        self.config = adapter_config(
-            self.default_annotation_path.parent, self.raw_channels, adapter=self.dataset_name
-        )
+    @property
+    def reembedding_run(self) -> Path:
+        if self.target.embedding_run is None:
+            raise ValueError(f'Review target {self.target.name!r} needs the embedding_run its adapter reads')
+        return self.target.embedding_run
+
+    @property
+    def surface_coordinates(self) -> Path:
+        return self.reembedding_run / 'vz-coordinates/cells.parquet'
+
+    @property
+    def prediction_pointer(self) -> Path | None:
+        return self.target.review_root / 'cell-review/current.json'
+
+    def __init__(self, target: ReviewTarget):
+        self._bind(target)
+        root, review_root = target.root, target.review_root
         markers = self.config.contract.markers
         run = self.reembedding_run
         complete = json.loads((run / 'complete.json').read_text())
@@ -107,7 +100,7 @@ class FieldSource(Prod3FieldSource):
         self.crop_reader = CellCropReader(
             labels=self.labels,
             channels={**{key: self.arrays[name] for name, key in self.raw_channels.items()},
-                      'dapi': self.arrays['DAPI']},
+                      'dapi': self.arrays[self.reference_channel]},
             offset_zyx=(0, 0, 0),
             cache_bytes=4 * int(np.prod(self.labels.chunks)) * self.labels.dtype.itemsize
             + 64 * 1024**2,

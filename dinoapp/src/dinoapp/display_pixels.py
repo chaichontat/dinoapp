@@ -14,9 +14,6 @@ from dino.spatial_pixels import SpatialPixels, require_spatial_subtraction_contr
 from dino.zarr_source import CellCrop, open_review_source
 from dino.pixel_corrections import correct_channels
 
-OUTPUT_ROOT = Path('/home/chaichontat/fishtools2/thesis-internal/thesis/output')
-
-
 class DisplayPixels:
     """Use the exact bound spatial subtraction and periodic transform, in order."""
 
@@ -50,11 +47,6 @@ class DisplayPixels:
         require_periodic_targets(self.periodic, self.contract, artifact=str(self.model_path))
         self.identity = file_sha256(self.model_path)
         self.description = 'BrdU/DAPI subtracted; periodic intensity corrected'
-
-    @classmethod
-    def for_dataset(cls, dataset: str) -> DisplayPixels:
-        root = OUTPUT_ROOT / f'{dataset}_brdu_dapi_subtraction' / 'reembedding'
-        return cls(root / 'model/model.joblib', root / 'source')
 
     def validate_native_grid(self, *, labels, shape, scale, origin):
         if (Path(self.source.manifest['labels']['root']).resolve() != Path(labels).resolve()

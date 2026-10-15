@@ -32,12 +32,15 @@ forwarded to Streamlit.
 2. Choose **Review scope → Dataset cells** and **Review view → Cell review**.
    Correction galleries require saved labels and can be empty on a new target.
 3. Choose a **Dataset** and **Cells → Unsaved**.
-4. Inspect the combined crop and set each marker with its `−` or `+` control (BrdU
-   and EdU by default). `+` means positive and `−` means negative. The controls
-   change a draft only. **Save and next** is available once every marker has a
-   value; it writes the complete call in one save and advances to the next cell.
-   A cell with no saved call is never shown or filtered as all-negative; that state
-   exists only after you save every marker as `−`.
+4. Inspect the combined crop. With two markers (BrdU and EdU by default), choose
+   the cell's call from four buttons, one per combination (for example
+   **BrdU− / EdU+**); the saved call is highlighted. A click saves the call and
+   advances to the next cell, and clicking the call that is already saved writes
+   nothing and advances. With three or more markers, set each marker with its `−`
+   or `+` control. The cell is saved as soon as every marker has a value that differs
+   from the saved call, without advancing; **Set every marker to save this cell.**
+   appears while any marker is unset. A cell with no saved call is never shown or
+   filtered as all-negative; that state exists only after you save every marker as `−`.
 5. Use **Undo last edit** to reverse the most recent edit for the current review
    target. Its history is shared across crop, gallery, and spatial views in this
    browser session. Switching targets keeps their histories separate; restarting
@@ -70,7 +73,8 @@ colors, rebuilds that target's sources and fields on the next render.
 
 ## Choose a target, scope, and view
 
-**Review target** opens a crop directory or one of the configured native datasets.
+**Review target** opens a crop directory or one of the native review targets
+configured in the file named by `DINO_REVIEW_CONFIG` ([Review targets](#review-targets)).
 **Review scope** chooses the dataset roster, model training disagreements, or a
 queue you captured from a field or gallery. **Review view** offers the views
 supported by that target and scope.
@@ -220,9 +224,10 @@ the selected predictions. dinoapp has no inference or model activation button.
 
 ## Native spatial review
 
-Native dataset targets use prepared local microscopy datasets at the
-paths below. To use them, those datasets must be accessible on the machine
-running the app. Installing the app does not download or prepare them.
+Native review targets use prepared local microscopy datasets at the paths named
+in a review target configuration. To use them, those datasets must be accessible
+on the machine running the app. Installing the app does not download or prepare
+them.
 
 Native review requires Python 3.12 or newer and, in the same environment,
 `thesis-dino` from this repository's `dino/` directory, `dino-markers` from
@@ -238,14 +243,68 @@ conda run -n multi python -m pip install --no-deps \
   -e ../markers \
   -e ../dino
 conda run -n multi python -m pip install -e '.[native]'
+DINO_REVIEW_CONFIG=/path/to/markers.json \
 DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
   conda run -n multi dinoapp --server.port 8502
 ```
 
-In the sidebar, choose **Review target → Prod2, Prod3, Prod2-2, or Prod3-2**, then
+### Review targets
+
+The native targets are the `review_targets` list of a marker configuration file.
+`DINO_REVIEW_CONFIG` names that file; the app reads it on every render. Without
+`DINO_REVIEW_CONFIG`, **Review target** offers only **Crop directory**. With
+`DINO_REVIEW_SOURCE="Native fields"`, `DINO_NATIVE_DATASET` selects the initial
+target by name and must name a configured target. Each entry names its adapter,
+which owns the dataset's file layout below `root` and `review_root`:
+
+```json
+{
+  "version": 1,
+  "reference": {"key": "pi", "label": "PI"},
+  "markers": [
+    {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+    {"key": "edu", "label": "EdU", "color": "#00ff00"}
+  ],
+  "presentation": {
+    "crop_panels": ["pi", "edu", "brdu"],
+    "negative_color": [0.25, 0.25, 0.25],
+    "uncalled_color": "#999999"
+  },
+  "review_targets": [
+    {
+      "name": "Prod3",
+      "adapter": "prod3",
+      "root": "/data/prod3",
+      "review_root": "/data/prod3/dino-review",
+      "cell_prefix": "prod3-realigned-v1",
+      "raw_channels": {"561": "pi", "BrdU": "brdu", "EdU": "edu"}
+    }
+  ]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `name` | Name shown in **Review target**; unique in the file. |
+| `adapter` | `prod2`, `prod3`, `prod2_2`, or `prod3_2`. |
+| `root` | Dataset directory holding the microscopy, segmentation, and surface files the adapter reads. |
+| `review_root` | Directory holding the annotation directories, the model selection `cell-review/current.json`, and the default review state. |
+| `cell_prefix` | Namespace of the dataset's cell identifiers, `<cell_prefix>\|<label>`. |
+| `raw_channels` | Raw image array names mapped to the file's reference and marker keys, one array per key. |
+| `embedding_run` | Re-embedding run directory; required by `prod3_2` and `prod2_2`. |
+
+Relative paths resolve against the directory containing the file; absolute paths
+are used as written. Each target's `raw_channels` must cover the channel keys of
+this file and of the target's annotation directories. `review_targets` is read only
+by the reviewer: `thesis-dino` ignores it and never stores it in a data
+directory, and the `markers.json` of a crop or annotation directory supplies only
+its markers. The [data format](docs/data-format.md#review-targets) lists the
+validation rules.
+
+In the sidebar, choose a configured **Review target**, then
 choose **Review view → Spatial field**. The sidebar shows the selected classifier
 and its cutoff for each marker. The adapters read the reference and markers from the
-`markers.json` of the dataset's default labels directory, and they reject a
+`markers.json` of the target's default labels directory, and they reject a
 classifier, prediction manifest, or inference record whose marker contract differs.
 
 Use **Position**, **Previous**, and **Next** to sample fields; adjust **Field
@@ -254,24 +313,26 @@ identities** or **Model uncertainty** in **Right panel view**.
 
 Clicking an unannotated cell with a model call immediately confirms and saves
 that call. Clicking an already annotated cell selects it for inspection.
-Use the `−` or `+` control of each marker, then **Save**, to change the selected
-cell's call; the badge names its state (for example **EdU only**, **Dual positive**,
-or **Neither** with two markers). **Undo last edit** reverses the most recent saved
-edit.
+With two markers, four buttons (**EdU only**, **BrdU only**, **Dual positive**,
+**Neither** by default) set the selected cell's call; a click saves it immediately
+unless it equals the saved call, which writes nothing. With three or more markers,
+use the `−` or `+` control of each marker; the call is saved as soon as every marker
+is set and differs from the saved call, and **Set every marker to save this cell.**
+appears while any marker is unset. The badge names the selected cell's state.
+**Undo last edit** reverses the most recent saved edit.
 
 ### Native save locations
 
 Existing annotations are updated in the file that contains them. New annotations
-go to the default file below; relative paths are under the listed review directory.
+go to the adapter's default file below, under the target's `review_root`.
 
-| Dataset | Review directory | Default labels file |
+| Adapter | Annotation directories | Default labels file |
 | --- | --- | --- |
-| Prod2 | `/working/eduseg/20260808-prod2/full-run2` | `barrage-pixel/labels.csv` |
-| Prod3 | `/working/eduseg/prod3/dino-prod3-latest` | `barrage-vz-svz-v1/labels.csv` |
-| Prod2-2 | `/working/eduseg/prod2-2/dino-prod2-2` | `barrage-cortex-v1/labels.csv` |
-| Prod3-2 | `/working/eduseg/prod3-2/dino-prod3-2` | `barrage-cortex-v1/labels.csv` |
+| `prod2` | `barrage-cortex`, `barrage-vz-svz`, `barrage-pixel` | `barrage-pixel/labels.csv` |
+| `prod3` | `barrage-cortex-v1`, `barrage-vz-svz-v1` | `barrage-vz-svz-v1/labels.csv` |
+| `prod2_2`, `prod3_2` | `barrage-cortex-v1` | `barrage-cortex-v1/labels.csv` |
 
-**Review state directory** defaults to that dataset's review directory.
+**Review state directory** defaults to the target's `review_root`.
 `DINO_REVIEW_LABEL_ROOT` sets its initial value. This setting controls where
 `cell-review/` backups and change journals are written; annotation files remain
 at the locations selected by the dataset adapter.
@@ -290,7 +351,7 @@ review directory.
 
 Prod3-2 uses the recovered 405 nm DAPI fusion and postprocessed segmentation under
 `/warm/prod3-2-405-local3d-ls-z128-core80`, with the short-window 514 nm EdU fusion
-and baseline predictions under `/warm/prod3-2-514-local3d-ls-z128-core80/dino/infer`.
+and baseline predictions under the target's `embedding_run`.
 Its spatial view uses the reviewed ventricular surface. The transferred baseline
 was trained on Prod2 cells: **Training miscalls** scope, **Training**, and **Validation**
 are empty for that baseline's Prod3-2 review. Use **All labeled** in a correction

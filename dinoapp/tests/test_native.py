@@ -16,6 +16,7 @@ from dino_markers import (
     INFERENCE,
     ContractMismatchError,
     MarkerContract,
+    ReviewTarget,
     UnsupportedArtifactError,
     config_to_json,
     default_config,
@@ -90,9 +91,9 @@ REORDERED = parse_config(
         ("prod2_2", "234-2-514561638"),
     ],
 )
-def test_field_overlays_preserve_adapter_annotation_namespace(adapter, prefix):
+def test_field_overlays_preserve_adapter_annotation_namespace(adapter, prefix, tmp_path):
     source = object.__new__(import_module(f"dinoapp.{adapter}").FieldSource)
-    source.config = default_config()
+    source._bind(ReviewTarget("Test", adapter, tmp_path, tmp_path, prefix, {"raw": "pi", "BrdU": "brdu", "EdU": "edu"}))
     source.calls = np.array([4, 2, 1], dtype=np.uint8)
     source.uncertainty = np.array([np.nan, 2.5, np.nan], dtype=np.float32)
     field = SimpleNamespace(ids=np.array([0, 1, 2, 5, 8], dtype=np.uint32))
@@ -771,6 +772,7 @@ def test_model_uncertainty_view_colors_scored_cells_and_requires_a_scale():
 def test_field_calls_encode_saved_labels_for_every_marker_and_fill_the_uncalled_code():
     source = object.__new__(FieldSource)
     source.config = CONFIG3
+    source.cell_prefix = "full-run2"
     source.calls = np.array([8, 6, 1], dtype=np.uint8)
     field = SimpleNamespace(ids=np.array([0, 1, 2, 9], dtype=np.uint32))
     annotations = SimpleNamespace(values={"full-run2|2": (1, 0, 1), "full-run2|9": (0, 1, 1)})
@@ -784,17 +786,20 @@ def test_field_calls_encode_saved_labels_for_every_marker_and_fill_the_uncalled_
 def test_annotation_directories_name_the_directories_each_adapter_annotates(tmp_path):
     from dinoapp import prod2_2, prod3, prod3_2
 
-    assert FieldSource.annotation_directories(tmp_path) == tuple(
-        tmp_path / name for name in ("barrage-cortex", "barrage-vz-svz", "barrage-pixel")
+    review = tmp_path / "review"
+    target = ReviewTarget("Test", "test", tmp_path / "root", review, "run", {"561": "pi", "BrdU": "brdu", "EdU": "edu"})
+    assert FieldSource.annotation_directories(target) == tuple(
+        review / name for name in ("barrage-cortex", "barrage-vz-svz", "barrage-pixel")
     )
-    assert FieldSource.annotation_directories()[-1].name == "barrage-pixel"
-    assert prod3.FieldSource.annotation_directories() == (
-        prod3.REVIEW_ROOT / "barrage-cortex-v1", prod3.REVIEW_ROOT / "barrage-vz-svz-v1",
+    assert prod3.FieldSource.annotation_directories(target) == (
+        review / "barrage-cortex-v1", review / "barrage-vz-svz-v1",
     )
-    assert prod3_2.FieldSource.annotation_directories(tmp_path) == (tmp_path / "dino-prod3-2" / "barrage-cortex-v1",)
-    assert prod3_2.FieldSource.annotation_directories() == (prod3_2.REVIEW_ROOT / "barrage-cortex-v1",)
-    assert prod2_2.FieldSource.annotation_directories(tmp_path) == (tmp_path / "dino-prod2-2" / "barrage-cortex-v1",)
-    assert prod2_2.FieldSource.annotation_directories() == (prod2_2.REVIEW_ROOT / "barrage-cortex-v1",)
+    assert prod3_2.FieldSource.annotation_directories(target) == (review / "barrage-cortex-v1",)
+    assert prod2_2.FieldSource.annotation_directories(target) == (review / "barrage-cortex-v1",)
+
+
+def _prod2_target(root: Path) -> ReviewTarget:
+    return ReviewTarget("Prod2", "prod2", root, root, "full-run2", {"561": "pi", "BrdU": "brdu", "EdU": "edu"})
 
 
 def _prod2_predictions():
@@ -809,7 +814,7 @@ def _prod2_predictions():
 def test_prod2_adapter_reads_its_calls_config_contrast_and_caption(tmp_path):
     root = build_native_root(tmp_path, _prod2_predictions())
 
-    source = FieldSource(root)
+    source = FieldSource(_prod2_target(root))
 
     assert source.config == default_config()
     np.testing.assert_array_equal(source.calls, [4, 0, 1, 4, 2, 3])
@@ -834,7 +839,7 @@ def test_prod2_adapter_rejects_an_annotation_directory_with_other_channels(tmp_p
     _write_markers(root, CONFIG3)
 
     with pytest.raises(ValueError, match="do not match the marker configuration"):
-        FieldSource(root)
+        FieldSource(_prod2_target(root))
 
 
 def test_prod2_adapter_rejects_reordered_annotations_against_its_unversioned_manifest(tmp_path):
@@ -842,7 +847,7 @@ def test_prod2_adapter_rejects_reordered_annotations_against_its_unversioned_man
     _write_markers(root, REORDERED)
 
     with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
-        FieldSource(root)
+        FieldSource(_prod2_target(root))
 
 
 def test_prod2_adapter_rejects_a_prediction_manifest_with_another_contract(tmp_path):
@@ -852,7 +857,7 @@ def test_prod2_adapter_rejects_a_prediction_manifest_with_another_contract(tmp_p
     manifest.write_text(json.dumps(record))
 
     with pytest.raises(ContractMismatchError):
-        FieldSource(root)
+        FieldSource(_prod2_target(root))
 
 
 def test_prod2_adapter_accepts_a_versioned_manifest_of_its_contract(tmp_path):
@@ -860,7 +865,7 @@ def test_prod2_adapter_accepts_a_versioned_manifest_of_its_contract(tmp_path):
     manifest = tmp_path / "model-v1" / "cortex-pred" / "complete.json"
     manifest.write_text(json.dumps(CORTEX_RESCORE.stamp(json.loads(manifest.read_text()), DEFAULT_CONTRACT)))
 
-    assert FieldSource(root).config.contract == DEFAULT_CONTRACT
+    assert FieldSource(_prod2_target(root)).config.contract == DEFAULT_CONTRACT
 
 
 def test_prod3_marker_crop_renders_one_marker_with_its_display_maximum_and_label():

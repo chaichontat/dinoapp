@@ -331,9 +331,9 @@ def send_delayed_field_button(app, button_id, monkeypatch):
 
 
 @pytest.mark.parametrize("return_to_first", [False, True])
-def test_delayed_assignment_for_previous_field_selection_cannot_edit_new_cell(selection_review, monkeypatch, return_to_first):
+def test_delayed_field_button_for_previous_selection_cannot_edit_new_cell(selection_review, monkeypatch, return_to_first):
     app, path = selection_review
-    old_id = next(button for button in app.button if button.label == "Save").proto.id
+    old_id = next(button for button in app.button if button.label == "EdU only").proto.id
     before = path.read_bytes()
     send_click(app, x=5 / 6, token=app.session_state.test_field_token)
     assert app.session_state.review_contexts["selection-test"]["native"]["selection"]["label"] == 2
@@ -346,10 +346,10 @@ def test_delayed_assignment_for_previous_field_selection_cannot_edit_new_cell(se
     assert not app.session_state.review_contexts["selection-test"]["history"]
 
 
-def test_same_field_cell_reselection_rejects_action_rendered_before_external_edit(selection_review, monkeypatch):
+def test_same_field_cell_reselection_rejects_button_rendered_before_external_edit(selection_review, monkeypatch):
     from dinoapp.label_store import update_label
     app, path = selection_review
-    old_id = next(button for button in app.button if button.label == "Save").proto.id
+    old_id = next(button for button in app.button if button.label == "EdU only").proto.id
     update_label(path, "test|1", (1, 1), contract=DEFAULT_CONTRACT, expected=(0, 0))
     before = path.read_bytes()
     send_click(app, x=.5, token=app.session_state.test_field_token)
@@ -473,17 +473,24 @@ def test_field_panel_offers_per_marker_controls_and_badges_follow_the_config(thr
     assert app.session_state.review_contexts['three-markers']['history'][-1].value == (0, 1, 1)
 
 
-def test_field_save_writes_every_marker_at_once_and_an_unchanged_draft_writes_nothing(three_marker_field, monkeypatch):
+def set_field_marker(app, label, value, monkeypatch):
+    from dinoapp import native_app
+
+    # AppTest widget events run the entire script; adapt only the framework rerun.
+    rerun = native_app.st.rerun
+    with monkeypatch.context() as framework:
+        framework.setattr(native_app.st, 'rerun', lambda **kwargs: rerun())
+        next(widget for widget in app.segmented_control if widget.label == label).set_value(value).run()
+    assert not app.exception
+
+
+def test_three_marker_field_saves_every_marker_as_soon_as_the_last_one_is_set(three_marker_field, monkeypatch):
     app, path = three_marker_field
     context = app.session_state.review_contexts['three-markers']
     before = path.read_bytes()
-    click_field_button(app, 'Save', monkeypatch)
+    assert not [button for button in app.button if button.label == 'Save']
     assert path.read_bytes() == before and not context['history']
-    next(widget for widget in app.segmented_control if widget.label == 'BrdU').set_value(1).run()
-    assert not app.exception
-    assert path.read_bytes() == before
-    assert context['drafts']['test|1'] == {'expected': (1, 0, 1), 'values': {'edu': 1, 'brdu': 1, 'pcna': 1}}
-    click_field_button(app, 'Save', monkeypatch)
+    set_field_marker(app, 'BrdU', 1, monkeypatch)
     assert path.read_text() == 'cell,edu,brdu,pcna\ntest|1,1,1,1\n'
     assert context['history'][-1].previous == (1, 0, 1)
     assert context['native']['selection']['expected'] == (1, 1, 1)
@@ -492,23 +499,41 @@ def test_field_save_writes_every_marker_at_once_and_an_unchanged_draft_writes_no
     assert json.loads(journal_path.read_text().splitlines()[0])['value'] == [1, 1, 1]
 
 
-def test_unsaved_field_cell_with_a_model_call_starts_unset_and_saves_once_every_marker_is_chosen(tmp_path, monkeypatch):
+def test_unsaved_three_marker_field_cell_with_a_model_call_starts_unset_and_saves_once_every_marker_is_chosen(tmp_path, monkeypatch):
     app, path = open_three_marker_field(tmp_path, {'label': 2, 'expected': None})
     context = app.session_state.review_contexts['three-markers']
     assert [widget.value for widget in app.segmented_control] == [None, None, None]
-    assert next(button for button in app.button if button.label == 'Save').disabled
+    assert 'Set every marker to save this cell.' in [caption.value for caption in app.caption]
     badge = next(item.value for item in app.markdown if 'selected-label-state' in item.value)
     assert 'data-state="BrdU + PCNA only"' in badge and 'background: #' in badge
     for label, value in (('EdU', 0), ('BrdU', 1)):
-        next(widget for widget in app.segmented_control if widget.label == label).set_value(value).run()
-        assert next(button for button in app.button if button.label == 'Save').disabled
-    next(widget for widget in app.segmented_control if widget.label == 'PCNA').set_value(1).run()
-    assert not next(button for button in app.button if button.label == 'Save').disabled
-    assert 'test|2' not in path.read_text()
-    click_field_button(app, 'Save', monkeypatch)
+        set_field_marker(app, label, value, monkeypatch)
+        assert 'Set every marker to save this cell.' in [caption.value for caption in app.caption]
+        assert 'test|2' not in path.read_text() and not context['history']
+    set_field_marker(app, 'PCNA', 1, monkeypatch)
     assert path.read_text() == 'cell,edu,brdu,pcna\ntest|1,1,0,1\ntest|2,0,1,1\n'
     assert context['history'][-1].previous is None
+    assert 'Set every marker to save this cell.' not in [caption.value for caption in app.caption]
     assert context['drafts'] == {'test|2': {'expected': (0, 1, 1), 'values': {'edu': 0, 'brdu': 1, 'pcna': 1}}}
+
+
+def test_two_marker_field_button_saves_in_one_click_and_an_unchanged_click_writes_nothing(selection_review, monkeypatch):
+    app, path = selection_review
+    context = app.session_state.review_contexts['selection-test']
+    assert [button.label for button in app.button][:4] == ['EdU only', 'BrdU only', 'Dual positive', 'Neither']
+    assert not [button for button in app.button if button.label == 'Save']
+    before = path.read_bytes()
+    click_field_button(app, 'Neither', monkeypatch)
+    assert path.read_bytes() == before and not context['history']
+    click_field_button(app, 'BrdU only', monkeypatch)
+    assert path.read_text() == 'cell,brdu,edu\ntest|1,1,0\ntest|2,1,1\n'
+    assert len(context['history']) == 1 and context['history'][-1].previous == (0, 0)
+    assert context['native']['selection']['expected'] == (1, 0)
+    journal_path, = path.parent.glob('changes-*.jsonl')
+    assert json.loads(journal_path.read_text().splitlines()[0])['value'] == [1, 0]
+    saved = path.read_bytes()
+    click_field_button(app, 'BrdU only', monkeypatch)
+    assert path.read_bytes() == saved and len(context['history']) == 1
 
 
 THREE_MARKER_CONFIG = {

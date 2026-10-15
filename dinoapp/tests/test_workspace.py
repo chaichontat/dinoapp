@@ -1,17 +1,40 @@
 """Connected views resolve bounded identities without changing review rosters."""
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
-from dino_markers import DEFAULT_CONTRACT, default_config
+from dino_markers import DEFAULT_CONTRACT, ReviewTarget, config_to_json, default_config
 
 from dinoapp.prod3 import FieldSource
 from dinoapp.sources import NativeSource
+
+PROD3_CHANNELS = {"561": "pi", "BrdU": "brdu", "EdU": "edu"}
+
+
+def prod3_target(root):
+    return ReviewTarget("Prod3", "prod3", root, root, "prod3-realigned-v1", PROD3_CHANNELS)
+
+
+def write_review_config(directory, targets):
+    """Write a marker configuration file that carries review targets."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "markers.json"
+    path.write_text(json.dumps({**config_to_json(default_config()), "review_targets": targets}))
+    return path
+
+
+PROD3_ENTRY = {
+    "name": "Prod3", "adapter": "prod3", "root": "..", "review_root": "..",
+    "cell_prefix": "prod3-realigned-v1", "raw_channels": PROD3_CHANNELS,
+}
 
 
 @pytest.fixture
 def native_source(tmp_path):
     reader = object.__new__(FieldSource)
+    reader._bind(prod3_target(tmp_path))
     reader.props_path = tmp_path / "cells.parquet"
     pd.DataFrame(
         dict(label=[10, 20], plane_z=[0, 1], centroid_y=[4.0, 8.0], centroid_x=[5.0, 9.0])
@@ -82,6 +105,7 @@ def build_reader(reader, tmp_path):
     from types import SimpleNamespace
     from PIL import Image
 
+    reader._bind(prod3_target(tmp_path))
     reader.config = default_config()
     reader.shape = (3, 64, 64)
     reader.origin = np.array([100.0, 0.0, 0.0])
@@ -139,13 +163,14 @@ def workspace_review(tmp_path, monkeypatch):
     from dinoapp import app, native_app
 
     reader = build_reader(object.__new__(FieldSource), tmp_path)
-    monkeypatch.setattr(FieldSource, "annotation_directories", classmethod(lambda cls, root=None: (tmp_path,)), raising=False)
-    monkeypatch.setattr(native_app, "get_source", lambda cls, marker_revision: reader)
+    monkeypatch.setattr(FieldSource, "annotation_directories", classmethod(lambda cls, target: (tmp_path,)))
+    monkeypatch.setattr(native_app, "get_source", lambda cls, target, marker_revision: reader)
     monkeypatch.setattr(
         native_app,
         "get_field",
-        lambda cls, marker_revision, seed, position, z, width: reader.field(seed, position, z, width),
+        lambda cls, target, marker_revision, seed, position, z, width: reader.field(seed, position, z, width),
     )
+    monkeypatch.setenv("DINO_REVIEW_CONFIG", str(write_review_config(tmp_path / "config", [PROD3_ENTRY])))
     monkeypatch.setenv("DINO_REVIEW_SOURCE", "Native fields")
     monkeypatch.setenv("DINO_NATIVE_DATASET", "Prod3")
     monkeypatch.setenv("DINO_REVIEW_LABEL_ROOT", str(tmp_path))
@@ -275,6 +300,8 @@ def test_native_viewport_loader_preserves_geometry_and_adapter_pixels(tmp_path, 
         "prod2_2": prod2_2.FieldSource,
     }[adapter]
     reader = object.__new__(cls)
+    raw = PROD3_CHANNELS if adapter in ("prod2", "prod3") else {"DAPI": "pi", "BrdU": "brdu", "EdU": "edu"}
+    reader._bind(ReviewTarget("Test", adapter, tmp_path, tmp_path, "run", raw))
     reader.shape = (2, 24, 24)
     reader.origin, reader.scale = np.array([100.0, 200.0, 300.0]), np.array([2.0, 3.0, 4.0])
     reader.arrays = {
@@ -312,17 +339,47 @@ def test_captured_assignment_rejects_label_changed_since_render(workspace_review
     path = root / "labels.csv"
     update_label(path, "prod3-realigned-v1|1", (0, 0), contract=DEFAULT_CONTRACT)
     press(review, "Review cells in this field")
-    next(widget for widget in review.segmented_control if widget.label == "EdU").set_value(1).run()
-    assert not review.exception
-    save = next(widget for widget in review.button if widget.label == "Save and next")
-    assert not save.disabled
+    stale = next(widget for widget in review.button if widget.label == "BrdU− / EdU+")
     update_label(path, "prod3-realigned-v1|1", (1, 1), contract=DEFAULT_CONTRACT, expected=(0, 0))
     before = path.read_bytes()
-    save.click().run()
+    stale.click().run()
     assert not review.exception
     assert path.read_bytes() == before
     assert not context_of(review)["history"]
     assert not list(root.rglob("changes-*.jsonl"))
+
+
+def test_two_marker_cell_review_button_saves_and_advances_and_an_unchanged_click_still_advances(workspace_review):
+    from dinoapp.label_store import update_label
+    review, reader, root = workspace_review
+    path = root / "labels.csv"
+    update_label(path, "prod3-realigned-v1|1", (0, 0), contract=DEFAULT_CONTRACT)
+    update_label(path, "prod3-realigned-v1|2", (1, 1), contract=DEFAULT_CONTRACT)
+    press(review, "Review cells in this field")
+    assert not review.segmented_control
+    assert [widget.label for widget in review.button if " / " in widget.label] == [
+        "BrdU− / EdU−", "BrdU− / EdU+", "BrdU+ / EdU−", "BrdU+ / EdU+"
+    ]
+    context = context_of(review)
+    queue = context["workspace"]["queue"]
+    before = path.read_bytes()
+    press(review, "BrdU− / EdU−")
+    assert path.read_bytes() == before and not context["history"]
+    assert "prod3-realigned-v1|1 is unchanged; nothing was written." in [element.value for element in review.info]
+    assert queue["position"] == 1
+    assert "**Cell 2 of 2**" in [element.value for element in review.main.markdown]
+    press(review, "Previous")
+    assert queue["position"] == 0
+    press(review, "BrdU− / EdU+")
+    assert path.read_text().splitlines()[1] == "prod3-realigned-v1|1,0,1"
+    assert len(context["history"]) == 1 and context["history"][-1].previous == (0, 0)
+    assert queue["position"] == 1
+    assert "**Cell 2 of 2**" in [element.value for element in review.main.markdown]
+    journal_path, = root.rglob("changes-*.jsonl")
+    record = json.loads(journal_path.read_text().splitlines()[-1])
+    assert (record["cell"], record["previous"], record["value"], record["action"]) == (
+        "prod3-realigned-v1|1", [0, 0], [0, 1], "assign"
+    )
 
 
 THREE_MARKERS = {
@@ -389,33 +446,30 @@ def test_cell_review_offers_one_control_per_marker_and_starts_unset(three_marker
     choose(review, "Review view", "Cell review")
     assert [widget.label for widget in review.segmented_control] == ["EdU", "BrdU", "PCNA"]
     assert [widget.value for widget in review.segmented_control] == [None, None, None]
-    save = next(widget for widget in review.button if widget.label == "Save and next")
-    assert save.disabled
+    assert "Set every marker to save this cell." in [element.value for element in review.caption]
+    assert not [widget for widget in review.button if widget.label in ("Save", "Save and next")]
     assert "No saved call" in [element.value for element in review.main.markdown]
     assert not (root / "labels.csv").exists()
 
 
-def test_save_and_next_waits_for_every_marker_then_writes_one_row_and_advances(three_marker_barrage):
+def test_three_marker_cell_review_saves_when_the_last_marker_is_set_and_does_not_advance(three_marker_barrage):
     root, open_review = three_marker_barrage
     review = open_review()
     choose(review, "Review view", "Cell review")
     set_marker(review, "EdU", 1)
     set_marker(review, "BrdU", 0)
-    assert next(widget for widget in review.button if widget.label == "Save and next").disabled
-    set_marker(review, "PCNA", 1)
-    save = next(widget for widget in review.button if widget.label == "Save and next")
-    assert not save.disabled
+    assert "Set every marker to save this cell." in [element.value for element in review.caption]
     assert not (root / "labels.csv").exists()
-    save.click().run()
-    assert not review.exception
+    set_marker(review, "PCNA", 1)
     assert (root / "labels.csv").read_text() == "cell,edu,brdu,pcna\ntri|1,1,0,1\n"
     context = context_of(review)
     assert context["history"][-1].value == (1, 0, 1)
-    assert context["drafts"] == {"tri|2": {"expected": None, "values": {"edu": None, "brdu": None, "pcna": None}}}
+    assert context["drafts"] == {"tri|1": {"expected": (1, 0, 1), "values": {"edu": 1, "brdu": 0, "pcna": 1}}}
     (queue,) = context["cell_queues"].values()
-    assert queue["position"] == 1
-    assert "**Cell 2 of 3**" in [element.value for element in review.main.markdown]
-    assert [widget.value for widget in review.segmented_control] == [None, None, None]
+    assert queue["position"] == 0
+    assert "**Cell 1 of 3**" in [element.value for element in review.main.markdown]
+    assert [widget.value for widget in review.segmented_control] == [1, 0, 1]
+    assert "Set every marker to save this cell." not in [element.value for element in review.caption]
     journal_path, = (root / "cell-review").glob("changes-*.jsonl")
     import json
     record = json.loads(journal_path.read_text().splitlines()[0])
@@ -532,8 +586,6 @@ def test_stale_session_write_shows_the_mismatch_and_leaves_labels_unchanged(thre
     review = open_review(labels=["tri|1,0,0,0"])
     choose(review, "Review view", "Cell review")
     choose(review, "Cells", "All cells")
-    for label, value in (("EdU", 1), ("BrdU", 1), ("PCNA", 1)):
-        set_marker(review, label, value)
     reordered = json.loads(json.dumps(THREE_MARKERS))
     reordered["markers"].reverse()
     persist = review_session.save_assignment
@@ -544,8 +596,7 @@ def test_stale_session_write_shows_the_mismatch_and_leaves_labels_unchanged(thre
 
     monkeypatch.setattr(review_session, "save_assignment", stale_save)
     before = (root / "labels.csv").read_bytes()
-    next(widget for widget in review.button if widget.label == "Save and next").click().run()
-    assert not review.exception
+    set_marker(review, "EdU", 1)
     assert (root / "labels.csv").read_bytes() == before
     assert not context_of(review)["history"]
     assert any("Marker contract mismatch" in element.value for element in review.info)
@@ -563,13 +614,13 @@ def test_annotation_marker_change_rebuilds_the_source_and_the_sampled_field(tmp_
     built = {"sources": 0, "fields": 0}
 
     class Reader(FieldSource):
-        def __init__(self):
+        def __init__(self, target):
             built["sources"] += 1
             build_reader(self, tmp_path)
             self.config = resolve_directory(tmp_path)
 
         @classmethod
-        def annotation_directories(cls, root=None):
+        def annotation_directories(cls, target):
             return (tmp_path,)
 
         def field(self, *args):
@@ -577,6 +628,7 @@ def test_annotation_marker_change_rebuilds_the_source_and_the_sampled_field(tmp_
             return super().field(*args)
 
     monkeypatch.setattr(prod3, "FieldSource", Reader)
+    monkeypatch.setenv("DINO_REVIEW_CONFIG", str(write_review_config(tmp_path / "config", [PROD3_ENTRY])))
     monkeypatch.setenv("DINO_REVIEW_SOURCE", "Native fields")
     monkeypatch.setenv("DINO_NATIVE_DATASET", "Prod3")
     monkeypatch.setenv("DINO_REVIEW_LABEL_ROOT", str(tmp_path))
@@ -599,6 +651,52 @@ def test_annotation_marker_change_rebuilds_the_source_and_the_sampled_field(tmp_
     review.run()
     assert not review.exception
     assert built == {"sources": 2, "fields": 2}
-    assert [widget.label for widget in review.segmented_control] == ["EdU label", "BrdU"]
+    assert not review.segmented_control
+    assert [widget.label for widget in review.button][:4] == ["EdU label only", "BrdU only", "Dual positive", "Neither"]
     review.run()
     assert built == {"sources": 2, "fields": 2}
+
+
+def review_target_options(review):
+    return next(widget for widget in review.selectbox if widget.label == "Review target").options
+
+
+def test_review_targets_come_from_the_configured_marker_file(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from dinoapp import app
+
+    beta = {**PROD3_ENTRY, "name": "Beta", "adapter": "prod2_2", "root": str(tmp_path / "beta")}
+    config = write_review_config(tmp_path / "config", [{**PROD3_ENTRY, "name": "Alpha"}, beta])
+    monkeypatch.setenv("DINO_REVIEW_BARRAGE_DIR", str(tmp_path / "missing"))
+    monkeypatch.delenv("DINO_REVIEW_SOURCE", raising=False)
+    monkeypatch.setenv("DINO_REVIEW_CONFIG", str(config))
+    review = AppTest.from_file(app.__file__).run(timeout=20)
+    assert review_target_options(review) == ["Crop directory", "Alpha", "Beta"]
+
+    monkeypatch.delenv("DINO_REVIEW_CONFIG")
+    review = AppTest.from_file(app.__file__).run(timeout=20)
+    assert review_target_options(review) == ["Crop directory"]
+
+
+@pytest.mark.parametrize(
+    ("dataset", "adapter", "message"),
+    [
+        (None, "prod3", "Unknown review target: None"),
+        ("Prod2", "prod3", "Unknown review target: Prod2"),
+        ("Prod3", "prod9", "Review target 'Prod3' names unknown adapter 'prod9'; known adapters: prod2, prod3, prod2_2, prod3_2"),
+    ],
+)
+def test_native_review_requires_a_configured_target_and_adapter(tmp_path, monkeypatch, dataset, adapter, message):
+    from streamlit.testing.v1 import AppTest
+    from dinoapp import app
+
+    config = write_review_config(tmp_path / "config", [{**PROD3_ENTRY, "adapter": adapter}])
+    monkeypatch.setenv("DINO_REVIEW_CONFIG", str(config))
+    monkeypatch.setenv("DINO_REVIEW_SOURCE", "Native fields")
+    if dataset is None:
+        monkeypatch.delenv("DINO_NATIVE_DATASET", raising=False)
+    else:
+        monkeypatch.setenv("DINO_NATIVE_DATASET", dataset)
+    review = AppTest.from_file(app.__file__).run(timeout=20)
+    assert not review.exception
+    assert [error.value for error in review.error] == [message]

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from functools import cache
 from importlib import resources
 from pathlib import Path
@@ -184,7 +185,7 @@ def parse_config(value: object, *, source: str) -> MarkerConfig:
             raise fail(f"invalid color {node!r} for {location}")
         return rgb
 
-    top = obj(value, "", {"version", "reference", "markers", "presentation"})
+    top = obj(value, "", {"version", "reference", "markers", "presentation"}, frozenset({"review_targets"}))
     problem = check_version(top["version"])
     if problem is not None:
         raise fail(problem)
@@ -252,6 +253,70 @@ def load_config(path: Path) -> MarkerConfig:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise MarkerConfigError(f"{path}: invalid JSON: {error}") from error
     return parse_config(value, source=str(path))
+
+
+@dataclass(frozen=True)
+class ReviewTarget:
+    """A dataset the reviewer opens with a named adapter, its paths resolved against its config file."""
+
+    name: str
+    adapter: str
+    root: Path
+    review_root: Path
+    cell_prefix: str
+    raw_channels: Mapping[str, str] = field(hash=False)
+    embedding_run: Path | None = None
+
+
+def load_review_targets(path: Path) -> tuple[ReviewTarget, ...]:
+    """The review targets of a marker configuration file, validated against its contract."""
+    path = Path(path)
+    channels = load_config(path).contract.channel_keys
+    nodes = json.loads(path.read_text(encoding="utf-8")).get("review_targets", [])
+    base = path.absolute().parent
+
+    def fail(problem: str) -> MarkerConfigError:
+        return MarkerConfigError(f"{path}: {problem}")
+
+    if not isinstance(nodes, list):
+        raise fail(f"review_targets must be a list, got {nodes!r}")
+    targets: list[ReviewTarget] = []
+    for index, node in enumerate(nodes):
+        location = f"review_targets[{index}]"
+        if not isinstance(node, dict):
+            raise fail(f"{location}: expected a JSON object, got {node!r}")
+        problem = keys_problem(
+            node, {"name", "adapter", "root", "review_root", "cell_prefix", "raw_channels"},
+            frozenset({"embedding_run"}),
+        )
+        if problem is not None:
+            raise fail(f"{location}: {problem}")
+        for key in ("name", "adapter", "root", "review_root", "embedding_run"):
+            if key in node and not (isinstance(node[key], str) and node[key]):
+                raise fail(f"{location}.{key} must be a non-empty string, got {node[key]!r}")
+        if not isinstance(node["cell_prefix"], str):
+            raise fail(f"{location}.cell_prefix must be a string, got {node['cell_prefix']!r}")
+        if any(target.name == node["name"] for target in targets):
+            raise fail(f"duplicate review target name {node['name']!r}")
+        raw = node["raw_channels"]
+        if not (
+            isinstance(raw, dict)
+            and all(isinstance(value, str) for value in raw.values())
+            and sorted(raw.values()) == sorted(channels)
+        ):
+            raise fail(f"{location}.raw_channels must map one raw array to each of {list(channels)!r}, got {raw!r}")
+        targets.append(
+            ReviewTarget(
+                node["name"],
+                node["adapter"],
+                base / node["root"],
+                base / node["review_root"],
+                node["cell_prefix"],
+                dict(raw),
+                base / node["embedding_run"] if "embedding_run" in node else None,
+            )
+        )
+    return tuple(targets)
 
 
 @cache

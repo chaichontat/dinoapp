@@ -14,6 +14,7 @@ from dino_markers import (
     ContractMismatchError,
     Label,
     MarkerConfig,
+    ReviewTarget,
     badge_colors,
     decode_call,
     hex_color,
@@ -51,21 +52,22 @@ from dinoapp.sources import AnnotationFiles
 
 
 @st.cache_resource(hash_funcs={type: id})
-def get_source(source_type: type[FieldSource], marker_revision: str) -> FieldSource:
-    """Invalidate native readers when a code reload or a marker configuration change replaces them."""
-    return source_type()
+def get_source(source_type: type[FieldSource], target: ReviewTarget, marker_revision: str) -> FieldSource:
+    """Invalidate native readers when a code reload, another target, or a marker configuration change replaces them."""
+    return source_type(target)
 
 
 @st.cache_data(max_entries=6, show_spinner=False, hash_funcs={type: id})
 def get_field(
     source_type: type[FieldSource],
+    target: ReviewTarget,
     marker_revision: str,
     seed: int,
     position: int,
     z_um: float,
     width_um: float,
 ):
-    return get_source(source_type, marker_revision).field(seed, position, z_um, width_um)
+    return get_source(source_type, target, marker_revision).field(seed, position, z_um, width_um)
 
 
 @st.cache_resource
@@ -759,7 +761,6 @@ def review_field(
         cell in annotations.values
         or (selected < len(source.calls) and source.calls[selected] < uncalled)
     )
-    draft = cell_draft(context, cell, annotations.values.get(cell), contract.markers) if editable else None
     z_caption = f"Z {field.z_um:.1f} µm" if field.z_um is not None else f"Z plane {field.z_index}"
     st.caption(
         (f"Seed {seed} · Position {field.position} · " if show_seed and seed is not None else "")
@@ -789,47 +790,58 @@ def review_field(
             st.caption(selected_caption(selected) if selected_caption else membership)
         if context["notice"]:
             st.write(context["notice"])
-    markers = config.display_markers
-    actions = st.columns([1] * (len(markers) + 2))
-    for column, key in zip(actions, markers):
-        choice = column.segmented_control(
-            config.label(key),
-            (0, 1),
-            format_func=lambda value: "+" if value else "−",
-            default=draft["values"][key] if draft is not None else None,
-            disabled=not editable,
-            key=f"field-mark:{context['session_id']}:{cell}:{key}:{view_token}:{draft['expected'] if draft is not None else None}",
-        )
-        if draft is not None:
-            draft["values"][key] = choice
-    value = draft_label(contract.markers, draft) if draft is not None else None
-    if actions[len(markers)].button("Save", disabled=value is None, width="stretch", key=f"field-save:{view_token}"):
-        if value != annotations.values.get(cell):
-            try:
-                edit = save_assignment(
-                    annotations,
-                    state_dir,
-                    cell,
-                    value,
-                    expected=draft["expected"],
-                    record={
-                        "action": "assign",
-                        "seed": seed,
-                        "position": field.position,
-                        "z_um": field.z_um,
-                        "z_index": field.z_index,
-                        "center_xy_um": field.center_xy_um.tolist(),
-                    },
-                )
-            except EDIT_REJECTED as exc:
-                context["native"]["selection"] = None
-                context["notice"] = str(exc)
-                st.rerun(scope="fragment")
-            context["notice"] = (
-                f"Saved cell {selected} as {identity_name(config, value)} in {edit.path.parent.name}."
+    saved = annotations.values.get(cell)
+    chosen = None
+    if len(contract.markers) == 2:
+        actions = st.columns([1] * 5)
+        for column, value in zip(actions, ((0, 1), (1, 0), (1, 1), (0, 0))):
+            if column.button(
+                identity_name(config, value), disabled=not editable, width="stretch", key=f"field-assign:{view_token}:{value}"
+            ):
+                chosen = value
+    else:
+        markers = config.display_markers
+        actions = st.columns([1] * (len(markers) + 1))
+        draft = cell_draft(context, cell, saved, contract.markers) if editable else None
+        for column, key in zip(actions, markers):
+            choice = column.segmented_control(
+                config.label(key),
+                (0, 1),
+                format_func=lambda value: "+" if value else "−",
+                default=draft["values"][key] if draft is not None else None,
+                disabled=not editable,
+                key=f"field-mark:{context['session_id']}:{cell}:{key}:{view_token}:{draft['expected'] if draft is not None else None}",
             )
-        context["native"]["selection"]["expected"] = value
-        del context["drafts"][cell]
+            if draft is not None:
+                draft["values"][key] = choice
+        value = draft_label(contract.markers, draft) if draft is not None else None
+        if draft is not None and value is None:
+            st.caption("Set every marker to save this cell.")
+        chosen = value
+    if chosen is not None and chosen != saved:
+        try:
+            edit = save_assignment(
+                annotations,
+                state_dir,
+                cell,
+                chosen,
+                expected=selection["expected"],
+                record={
+                    "action": "assign",
+                    "seed": seed,
+                    "position": field.position,
+                    "z_um": field.z_um,
+                    "z_index": field.z_index,
+                    "center_xy_um": field.center_xy_um.tolist(),
+                },
+            )
+        except EDIT_REJECTED as exc:
+            context["native"]["selection"] = None
+            context["notice"] = str(exc)
+            st.rerun(scope="fragment")
+        context["native"]["selection"]["expected"] = chosen
+        context["drafts"].pop(cell, None)
+        context["notice"] = f"Saved cell {selected} as {identity_name(config, chosen)} in {edit.path.parent.name}."
         st.rerun(scope="fragment")
     if actions[-1].button(
         "Undo last edit", disabled=not context["history"], width="stretch", key=f"field-undo:{view_token}"
@@ -915,7 +927,7 @@ def review_field(
             )
     with right:
         st.subheader(
-            f"{' / '.join(config.label(key) for key in markers)} · cell identities"
+            f"{' / '.join(config.label(key) for key in config.display_markers)} · cell identities"
             if right_view == "Cell identities"
             else "Combined model uncertainty"
         )

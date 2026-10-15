@@ -26,6 +26,7 @@ from dino_markers import (
     Label,
     MarkerConfig,
     MarkerContract,
+    ReviewTarget,
     SavedFilter,
     UnsupportedArtifactError,
     call_weights,
@@ -58,9 +59,6 @@ from dino.review_contracts import (
 )
 from dinoapp.review_predictions import load_review_predictions
 from squisher.jpegxr_zarr import register_jpegxr_codec
-
-ROOT = Path("/working/eduseg/20260808-prod2/full-run2")
-REVIEW_ROOT = ROOT
 
 
 @dataclass(frozen=True)
@@ -319,22 +317,32 @@ class Field:
 class FieldSource:
     """Read fixed-Z native pixels and sample the full supported 90% wall contour."""
 
-    display_name = "Prod2 native"
-    dataset_name = "Prod2"
-    raw_channels = {"561": "pi", "BrdU": "brdu", "EdU": "edu"}
-
     @classmethod
-    def annotation_directories(cls, root: Path | None = None) -> tuple[Path, ...]:
-        root = ROOT if root is None else root
-        return tuple(root / name for name in ("barrage-cortex", "barrage-vz-svz", "barrage-pixel"))
+    def annotation_directories(cls, target: ReviewTarget) -> tuple[Path, ...]:
+        return tuple(target.review_root / name for name in ("barrage-cortex", "barrage-vz-svz", "barrage-pixel"))
 
-    def __init__(self, root: Path = ROOT):
-        self.root = root
-        self.annotation_paths = tuple(directory / "labels.csv" for directory in self.annotation_directories(root))
+    def _bind(self, target: ReviewTarget) -> None:
+        """Take the target's identity, raw channels and annotations, and the marker configuration they serve."""
+        self.target = target
+        self.root = target.root
+        self.dataset_name = target.name
+        self.display_name = f"{target.name} native"
+        self.cell_prefix = target.cell_prefix
+        self.raw_channels = target.raw_channels
+        self.annotation_paths = tuple(directory / "labels.csv" for directory in self.annotation_directories(target))
         self.default_annotation_path = self.annotation_paths[-1]
         self.config = adapter_config(
             self.default_annotation_path.parent, self.raw_channels, adapter=self.dataset_name
         )
+
+    @property
+    def reference_channel(self) -> str:
+        """The raw array name of the marker contract's reference channel."""
+        return next(name for name, key in self.raw_channels.items() if key == self.config.reference.key)
+
+    def __init__(self, target: ReviewTarget):
+        self._bind(target)
+        root = target.root
         source_path = root / "dino-v3/source.json"
         source = json.loads(source_path.read_text())
         self.source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -350,7 +358,7 @@ class FieldSource:
         self.default_z = native["planes"][0]["z_um"]
         self.sources = {name: Path(native["sources"][name]["path"]) for name in self.raw_channels}
         register_jpegxr_codec()
-        self.shape, self.scale, self.origin = image_geometry(self.sources["561"], "0")
+        self.shape, self.scale, self.origin = image_geometry(self.sources[self.reference_channel], "0")
         self.arrays = {}
         for name, path in self.sources.items():
             shape, scale, origin = image_geometry(path, "0")
@@ -400,7 +408,7 @@ class FieldSource:
             if hashlib.sha256(path.read_bytes()).hexdigest() != meta["output_sha256"]:
                 raise ValueError(f"Boundary assignment changed: {path}")
         self.model_version, prediction_dir, prediction_manifest, prediction_record = (
-            load_prediction_pointer(root / "cell-review/current.json")
+            load_prediction_pointer(target.review_root / "cell-review/current.json")
         )
         self._require_contract(
             prediction_contract(prediction_record, where=str(prediction_manifest)),
@@ -410,14 +418,14 @@ class FieldSource:
         columns = ["label", "cell", *markers, *(probability_column(marker) for marker in markers)]
         frame = ds.dataset(prediction_dir, format="parquet").to_table(columns=columns).to_pandas()
         cutoffs = {marker: float(prediction_record[cutoff_key(marker)]) for marker in markers}
-        self._adopt_model_calls(frame, cutoffs=cutoffs, cell_prefix="full-run2")
+        self._adopt_model_calls(frame, cutoffs=cutoffs, cell_prefix=self.cell_prefix)
         self.prediction_manifest = str(prediction_manifest)
         self.classifier_caption = classifier_caption(
             str(prediction_record["model_sha256"])[:12], self.config, cutoffs
         )
         self.training_review_manifest = str(prediction_record["review_manifest"])
         self.training_predictions = load_review_predictions(
-            Path(self.training_review_manifest), cell_prefix="full-run2",
+            Path(self.training_review_manifest), cell_prefix=self.cell_prefix,
             model_sha256=str(prediction_record["model_sha256"]), contract=self.config.contract,
         )
         self.contrast = {
@@ -443,9 +451,8 @@ class FieldSource:
         self.calls, self.uncertainty = model.calls, model.uncertainty
         self.uncertainty_log_vmax = model.uncertainty_log_vmax
 
-    @staticmethod
-    def cell_id(label: int) -> str:
-        return f"full-run2|{label}"
+    def cell_id(self, label: int) -> str:
+        return f"{self.cell_prefix}|{label}"
 
     def cell_geometry(self, label: int):
         return read_cell_geometry(self.root / "props-cortex.parquet", label, self.shape)

@@ -357,8 +357,8 @@ def test_gallery_rejects_disagreement_between_item_and_cell(
     )
 
 
-@pytest.mark.parametrize("dataset", ["Prod2", "Prod3"])
-def test_native_loader_uses_packaged_modules(dataset, monkeypatch):
+@pytest.mark.parametrize("adapter", ["prod2", "prod3", "prod2_2", "prod3_2"])
+def test_native_loader_uses_packaged_modules(adapter, monkeypatch):
     imports = []
 
     def load(name):
@@ -368,17 +368,17 @@ def test_native_loader_uses_packaged_modules(dataset, monkeypatch):
     monkeypatch.setattr(app.importlib, "import_module", load)
     get_native_modules.clear()
     try:
-        native, native_app = get_native_modules(dataset)
-        assert native.__name__ == app.NATIVE_SOURCES[dataset]
+        native, native_app = get_native_modules(adapter)
+        assert native.__name__ == app.ADAPTERS[adapter]
         assert native_app.__name__ == "dinoapp.native_app"
-        assert imports == [app.NATIVE_SOURCES[dataset], "dinoapp.native_app"]
+        assert imports == [app.ADAPTERS[adapter], "dinoapp.native_app"]
     finally:
         get_native_modules.clear()
 
 
-def test_native_loader_rejects_unknown_datasets():
-    with pytest.raises(ValueError, match="Unknown native dataset"):
-        get_native_modules("Other")
+def test_native_loader_rejects_unknown_adapters():
+    with pytest.raises(ValueError, match="Unknown review adapter"):
+        get_native_modules("Prod2")
 
 
 def test_launch_starts_universal_streamlit_app(monkeypatch: pytest.MonkeyPatch):

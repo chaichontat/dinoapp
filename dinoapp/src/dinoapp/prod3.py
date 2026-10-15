@@ -13,12 +13,11 @@ import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import zarr
-from dino_markers import cutoff_key, probability_column
+from dino_markers import ReviewTarget, cutoff_key, probability_column
 from skimage.segmentation import find_boundaries
 
 from dinoapp.native import (
     Field,
-    adapter_config,
     classifier_caption,
     load_prediction_pointer,
     prediction_contract,
@@ -35,30 +34,17 @@ from squisher.jpegxr_zarr import register_jpegxr_codec
 from dinoapp.native_geometry import mesh_vertex_normals as vertex_normals
 
 
-ROOT = Path("/working/eduseg/prod3")
-REVIEW_ROOT = ROOT / "dino-prod3-realigned-v1"
-
-
 class FieldSource(NativeFieldSource):
     """Read prod3 native pixels, calls, uncertainty, and reviewed VZ/SVZ boundaries."""
 
-    display_name = "Prod3 native"
-    dataset_name = "Prod3"
-    cell_prefix = "prod3-realigned-v1"
-    raw_channels = {"561": "pi", "BrdU": "brdu", "EdU": "edu"}
-
     @classmethod
-    def annotation_directories(cls, root: Path | None = None) -> tuple[Path, ...]:
-        return (REVIEW_ROOT / "barrage-cortex-v1", REVIEW_ROOT / "barrage-vz-svz-v1")
+    def annotation_directories(cls, target: ReviewTarget) -> tuple[Path, ...]:
+        return (target.review_root / "barrage-cortex-v1", target.review_root / "barrage-vz-svz-v1")
 
-    def __init__(self, root: Path = ROOT):
-        self.root = root
-        self.annotation_paths = tuple(directory / "labels.csv" for directory in self.annotation_directories(root))
-        self.default_annotation_path = self.annotation_paths[-1]
-        self.config = adapter_config(
-            self.default_annotation_path.parent, self.raw_channels, adapter=self.dataset_name
-        )
-        source_path = REVIEW_ROOT / "source/source.json"
+    def __init__(self, target: ReviewTarget):
+        self._bind(target)
+        root, review_root = target.root, target.review_root
+        source_path = review_root / "source/source.json"
         source = json.loads(source_path.read_text())
         labels_meta = source["labels"]
         if (
@@ -68,7 +54,7 @@ class FieldSource(NativeFieldSource):
             raise ValueError("Postprocessed labels differ from the saved prod3 DINO source")
 
         self.sources = {
-            "561": root
+            self.reference_channel: root
             / "235-2-561638514-3/fusion-561-preibisch-v1/fused.ch0.ome.zarr",
             **{
                 name: Path(source["channels"][key]["root"])
@@ -98,7 +84,7 @@ class FieldSource(NativeFieldSource):
         if tuple(self.labels.shape) != self.shape:
             raise ValueError("Prod3 postprocessed labels and native microscopy grids differ")
 
-        self.display_pixels = DisplayPixels(REVIEW_ROOT / "model/model.joblib", REVIEW_ROOT / "source")
+        self.display_pixels = DisplayPixels(review_root / "model/model.joblib", review_root / "source")
         self._require_contract(self.display_pixels.contract, actual_from=str(self.display_pixels.model_path))
         self.display_pixels.validate_native_grid(
             labels=labels_meta["root"], shape=self.shape, scale=self.scale, origin=self.origin,
@@ -121,9 +107,9 @@ class FieldSource(NativeFieldSource):
         self.pixel_version = self.display_pixels.identity
         self.crop_lock = Lock()
         self.display_name = f"{self.display_name} · {self.display_pixels.description}"
-        self.props_path = REVIEW_ROOT / "source/cells.parquet"
+        self.props_path = review_root / "source/cells.parquet"
         self.crop_contract = json.loads(
-            (REVIEW_ROOT / "barrage-cortex-v1/run.json").read_text()
+            (review_root / "barrage-cortex-v1/run.json").read_text()
         )
         self.crop_contract["display_max"]["pi"] = 28686.583613151608
 
@@ -153,10 +139,10 @@ class FieldSource(NativeFieldSource):
                     inverse.reshape(-1, 3),
                 )
             )
-        self.layer_path = REVIEW_ROOT / "vz-layers/cells.parquet"
+        self.layer_path = review_root / "vz-layers/cells.parquet"
 
         _, prediction_dir, prediction_manifest, prediction_record = (
-            load_prediction_pointer(REVIEW_ROOT / "cell-review/current.json")
+            load_prediction_pointer(review_root / "cell-review/current.json")
         )
         self._require_contract(
             prediction_contract(prediction_record, where=str(prediction_manifest)),
@@ -184,9 +170,6 @@ class FieldSource(NativeFieldSource):
             f"Ready: {len(frame):,} prod3 model calls; default Z={self.default_z:.3f} µm",
             flush=True,
         )
-
-    def cell_id(self, label: int) -> str:
-        return f"{self.cell_prefix}|{label}"
 
     def cell_geometry(self, label: int):
         return read_cell_geometry(self.props_path, label, self.shape)

@@ -157,6 +157,11 @@ differs from the run's configuration in any way, including presentation; supply 
 use a new output directory. Every
 `labels.csv` write also checks the directory's contract under the label-file lock.
 
+A marker configuration file may also carry `review_targets`, the native datasets
+the reviewer offers ([dinoapp README](../dinoapp/README.md#review-targets)). Only
+the reviewer reads it; commands here ignore it, and the `markers.json` they store
+in data directories never carries it.
+
 ### Artifact records
 
 Every new artifact carries the current version of its family and a
@@ -219,7 +224,7 @@ repository's `dinoapp/` directory. The
 Python interpreter. Install the reviewer separately in that environment. It
 discovers datasets from the barrage index and uses explicit
 `{key}_image_path` columns for each marker (`brdu_image_path` and `edu_image_path`
-by default) and `combined_image_path` when present. Choose **Review target → Prod2** or **Prod3** for spatial
+by default) and `combined_image_path` when present. Choose a configured native **Review target** (`DINO_REVIEW_CONFIG`) for spatial
 field and model-miscall modes; native dependencies load only after selection.
 The adapters, renderer, label store, legacy labeler, and reviewer tests are
 maintained in `dinoapp`; no reviewer source files are retained in this package.
@@ -229,6 +234,7 @@ From the repository root, install `dinoapp` in the same environment:
 
 ```bash
 conda run -n multi python -m pip install --no-deps -e './dinoapp[native]'
+DINO_REVIEW_CONFIG=/path/to/markers.json \
 DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
   conda run -n multi dinoapp --server.port 8502
 ```

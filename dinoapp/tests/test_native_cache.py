@@ -1,13 +1,17 @@
 """Cache ownership across Streamlit module reloads."""
 
 import sys
+from dataclasses import replace
+from pathlib import Path
 from types import ModuleType
 
-from dino_markers import DEFAULT_CONTRACT
+from dino_markers import DEFAULT_CONTRACT, ReviewTarget
 
 from dinoapp.native_app import get_field, get_source
 from dinoapp import native_app
 from dinoapp.review_session import activate_target
+
+TARGET = ReviewTarget("Prod2", "prod2", Path("/data"), Path("/data"), "run", {"561": "pi", "BrdU": "brdu", "EdU": "edu"})
 
 
 def test_switching_native_dataset_isolates_edit_state(monkeypatch):
@@ -35,6 +39,8 @@ def test_sidebar_cache_miss_uses_reloaded_source_class(monkeypatch):
         exec(
             "class Field: pass\n"
             "class Source:\n"
+            "    def __init__(self, target):\n"
+            "        self.target = target\n"
             "    def field(self, *args):\n"
             "        result = Field()\n"
             "        result.settings = args\n"
@@ -47,14 +53,14 @@ def test_sidebar_cache_miss_uses_reloaded_source_class(monkeypatch):
     get_source.clear()
     get_field.clear()
     first = module_version()
-    initial = get_field(first.Source, "markers-1", 0, 0, 694.7, 200.0)
+    initial = get_field(first.Source, TARGET, "markers-1", 0, 0, 694.7, 200.0)
     assert isinstance(initial, first.Field)
     second = module_version()
-    changed = get_field(second.Source, "markers-1", 1, 0, 695.3, 150.0)
+    changed = get_field(second.Source, TARGET, "markers-1", 1, 0, 695.3, 150.0)
     assert isinstance(changed, second.Field)
     assert changed.settings == (1, 0, 695.3, 150.0)
-    assert get_source(first.Source, "markers-1") is not get_source(second.Source, "markers-1")
-    cached = get_field(second.Source, "markers-1", 1, 0, 695.3, 150.0)
+    assert get_source(first.Source, TARGET, "markers-1") is not get_source(second.Source, TARGET, "markers-1")
+    cached = get_field(second.Source, TARGET, "markers-1", 1, 0, 695.3, 150.0)
     assert cached.settings == changed.settings
     assert cached is not changed
     get_source.clear()
@@ -83,7 +89,8 @@ def test_marker_revision_rebuilds_the_reader_and_the_sampled_field():
     class Source:
         constructed = 0
 
-        def __init__(self):
+        def __init__(self, target):
+            self.target = target
             type(self).constructed += 1
 
         def field(self, *args):
@@ -91,12 +98,15 @@ def test_marker_revision_rebuilds_the_reader_and_the_sampled_field():
 
     get_source.clear()
     get_field.clear()
-    reader = get_source(Source, "markers-1")
-    assert get_source(Source, "markers-1") is reader
-    assert get_field(Source, "markers-1", 0, 0, 694.7, 200.0) == 1
-    assert get_field(Source, "markers-1", 0, 0, 694.7, 200.0) == 1
-    assert get_source(Source, "markers-2") is not reader
-    assert get_field(Source, "markers-2", 0, 0, 694.7, 200.0) == 2
-    assert get_field(Source, "markers-1", 0, 0, 694.7, 200.0) == 1
+    reader = get_source(Source, TARGET, "markers-1")
+    assert get_source(Source, TARGET, "markers-1") is reader
+    assert get_field(Source, TARGET, "markers-1", 0, 0, 694.7, 200.0) == 1
+    assert get_field(Source, TARGET, "markers-1", 0, 0, 694.7, 200.0) == 1
+    assert get_source(Source, TARGET, "markers-2") is not reader
+    assert get_field(Source, TARGET, "markers-2", 0, 0, 694.7, 200.0) == 2
+    assert get_field(Source, TARGET, "markers-1", 0, 0, 694.7, 200.0) == 1
+    other = replace(TARGET, name="Prod2 copy", root=Path("/other"))
+    assert get_source(Source, other, "markers-1").target == other
+    assert get_field(Source, other, "markers-1", 0, 0, 694.7, 200.0) == 3
     get_source.clear()
     get_field.clear()
