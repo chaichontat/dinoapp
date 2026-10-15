@@ -32,8 +32,6 @@ def spatial_mode(root: Path, *, target_id: str) -> None:
         native_app.reset_position(context)
     located_view = context["workspace"]["located_field"] is not None
     with st.sidebar:
-        if located_view:
-            st.caption("Viewing a located cell. Return to sampled fields to change the branch cursor.")
         st.header('CCF branch fields')
         branch_index = st.selectbox(
             'ccf_adjusted ROI', options=branch_order, disabled=located_view, key=widget_key(context, 'rhu2_branch_index', branch_order[0]),
@@ -60,9 +58,6 @@ def spatial_mode(root: Path, *, target_id: str) -> None:
             )
             for marker in config.contract.markers
         }
-        st.caption(f'{len(branch_order)} cortical CCF branches, fewest manual annotations first. '
-                   'Counts include your saved barrage and spatial annotations. '
-                   'Next and Previous browse reproducible fields within the selected branch.')
     if context["workspace"]["located_field"] is None:
         with st.spinner("Loading native ROI field…"):
             roi, cell_index = source.sample_branch(branch_index, position)
@@ -90,13 +85,9 @@ def spatial_mode(root: Path, *, target_id: str) -> None:
         with rois:
             st.dataframe(counts.groupby(['Sample', 'ROI'], as_index=False)['Manual annotations'].sum()
                          .sort_values(['Manual annotations', 'Sample', 'ROI']), hide_index=True)
-        st.caption('Saved cortical annotations, including the migrated barrage. '
-                   'Acquisition ROI counts combine its ccf_adjusted branches.')
     st.subheader(roi.display_name if context["workspace"]["located_field"] is not None else f"{roi.display_name} · {branch['ccf_adjusted']}")
     prefix = "" if located_view else f"{branch['cells']:,} cortical cohort cells in this branch · "
     st.caption(prefix + f"{int((field.ids > 0).sum()):,} in this field · 20 µm scale bar")
-    st.caption('Only cortical cohort cells are colored and selectable. '
-               'Cells outside the cohort remain visible in the raw image.')
     contrast = dict(roi.contrast)
     for marker, percentile in percentiles.items():
         # One raw intensity unit keeps empty fields well defined with vmin=0.

@@ -38,8 +38,7 @@ forwarded to Streamlit.
    advances to the next cell, and clicking the call that is already saved writes
    nothing and advances. With three or more markers, set each marker with its `−`
    or `+` control. The cell is saved as soon as every marker has a value that differs
-   from the saved call, without advancing; **Set every marker to save this cell.**
-   appears while any marker is unset. A cell with no saved call is never shown or
+   from the saved call, without advancing. A cell with no saved call is never shown or
    filtered as all-negative; that state exists only after you save every marker as `−`.
 5. Use **Undo last edit** to reverse the most recent edit for the current review
    target. Its history is shared across crop, gallery, and spatial views in this
@@ -317,8 +316,7 @@ With two markers, four buttons (**EdU only**, **BrdU only**, **Dual positive**,
 **Neither** by default) set the selected cell's call; a click saves it immediately
 unless it equals the saved call, which writes nothing. With three or more markers,
 use the `−` or `+` control of each marker; the call is saved as soon as every marker
-is set and differs from the saved call, and **Set every marker to save this cell.**
-appears while any marker is unset. The badge names the selected cell's state.
+is set and differs from the saved call. The badge names the selected cell's state.
 **Undo last edit** reverses the most recent saved edit.
 
 ### Native save locations

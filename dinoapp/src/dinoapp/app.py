@@ -310,7 +310,6 @@ def render_gallery(
     config = source.config
     gallery["config"] = config
     marker_name = config.label(marker)
-    others = ", ".join(config.label(key) for key in config.display_markers if key != marker)
     cells = gallery["cells"]
     total = len(cells)
     page_count = max(1, (total + GALLERY_PAGE_SIZE - 1) // GALLERY_PAGE_SIZE)
@@ -319,11 +318,6 @@ def render_gallery(
 
     view_token = activate_view(context, ("gallery", source.source_id, gallery["queue_id"], page))
     st.title(f"{marker_name} correction gallery")
-    st.caption(
-        f"Click a crop to flip {marker_name}"
-        + (f" while keeping {others} unchanged. " if others else ". ")
-        + "The loaded queue stays fixed until you refresh its matches."
-    )
     undo_column, status_column = st.columns([1, 3], vertical_alignment="center")
     history: list[Edit] = context["history"]
     last_edit = history[-1] if history else None
@@ -481,7 +475,6 @@ def review_marker_gallery(
         subset = st.selectbox("Examples", source.subsets, key=widget_key(context, "gallery_subset", source.subsets[0]), on_change=remember_widget, args=(context, "gallery_subset"))
         dataset = st.selectbox("Dataset", source.datasets, key=widget_key(context, "gallery_dataset", source.datasets[0]), on_change=remember_widget, args=(context, "gallery_dataset"))
         identity = saved_filter_controls(context, config, "gallery_saved")
-        st.caption("Matches use current saved labels. The queue stays fixed while you edit.")
     signature = (source.source_id, config.contract, marker, subset, dataset, identity)
     if st.sidebar.button("Refresh matches", width="stretch"):
         discarded = context["galleries"].pop(signature, None)
@@ -531,10 +524,6 @@ def review_barrage_cell(
             saved_filter: SavedFilter = (None,) * len(contract.markers)
             if cells_option == "Saved":
                 saved_filter = saved_filter_controls(context, config, "cell_saved")
-            st.caption(
-                f"Set {', '.join(config.label(key) for key in config.display_markers)} "
-                "for each displayed cell; each choice is saved immediately."
-            )
         signature = (source.source_id, contract, dataset, cells_option, saved_filter)
         queues = context["cell_queues"]
         if st.sidebar.button("Refresh cells", width="stretch"):
@@ -561,7 +550,6 @@ def review_barrage_cell(
     position = min(int(queue["position"]), max(len(cells) - 1, 0))
     view_token = activate_view(context, ("cell", source.source_id, queue["queue_id"], position))
     st.title("Cell review")
-    st.caption("Assign the displayed cell directly from its real combined crop.")
     if not cells:
         st.info("No cells match this filter.")
         return
@@ -644,9 +632,7 @@ def review_barrage_cell(
                     key=f"cell-mark:{context['session_id']}:{cell}:{key}:{view_token}:{draft['expected']}",
                 )
             value = draft_label(contract.markers, draft)
-            if value is None:
-                st.caption("Set every marker to save this cell.")
-            elif value != current:
+            if value is not None and value != current:
                 chosen = value
         if chosen is not None:
             saved = chosen == current
@@ -692,8 +678,6 @@ def native_field_mode(
     context = get_context(source.target_id)
     located_view = context["workspace"]["located_field"] is not None
     with st.sidebar:
-        if located_view:
-            st.caption("Viewing a located cell. Return to sampled fields to change the sampling cursor.")
         st.header("Field")
         seed = int(
             st.number_input(

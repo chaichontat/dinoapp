@@ -446,7 +446,6 @@ def test_cell_review_offers_one_control_per_marker_and_starts_unset(three_marker
     choose(review, "Review view", "Cell review")
     assert [widget.label for widget in review.segmented_control] == ["EdU", "BrdU", "PCNA"]
     assert [widget.value for widget in review.segmented_control] == [None, None, None]
-    assert "Set every marker to save this cell." in [element.value for element in review.caption]
     assert not [widget for widget in review.button if widget.label in ("Save", "Save and next")]
     assert "No saved call" in [element.value for element in review.main.markdown]
     assert not (root / "labels.csv").exists()
@@ -458,7 +457,6 @@ def test_three_marker_cell_review_saves_when_the_last_marker_is_set_and_does_not
     choose(review, "Review view", "Cell review")
     set_marker(review, "EdU", 1)
     set_marker(review, "BrdU", 0)
-    assert "Set every marker to save this cell." in [element.value for element in review.caption]
     assert not (root / "labels.csv").exists()
     set_marker(review, "PCNA", 1)
     assert (root / "labels.csv").read_text() == "cell,edu,brdu,pcna\ntri|1,1,0,1\n"
@@ -469,7 +467,6 @@ def test_three_marker_cell_review_saves_when_the_last_marker_is_set_and_does_not
     assert queue["position"] == 0
     assert "**Cell 1 of 3**" in [element.value for element in review.main.markdown]
     assert [widget.value for widget in review.segmented_control] == [1, 0, 1]
-    assert "Set every marker to save this cell." not in [element.value for element in review.caption]
     journal_path, = (root / "cell-review").glob("changes-*.jsonl")
     import json
     record = json.loads(journal_path.read_text().splitlines()[0])

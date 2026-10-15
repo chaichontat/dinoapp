@@ -134,7 +134,7 @@ def pending_gallery_app(annotation_path):
     source = SimpleNamespace(marker_crop=lambda label, marker: (output.getvalue(), 0),
                              config=default_config(), origin=np.zeros(3), scale=np.ones(3))
     native_app.review_gallery(source, annotations, path.parent, st.session_state.queued_gallery,
-                              title='Gallery', caption='', group_label='Cells', empty_message='Empty')
+                              title='Gallery', group_label='Cells', empty_message='Empty')
 
 
 def send_gallery_flip(review, payload):

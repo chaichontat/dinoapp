@@ -211,7 +211,7 @@ def switching_selection_app(root):
             galleries['switch-test'] = native_app.new_gallery_state(rows, annotations, kind='toggle', crop_kind='edu')
             galleries['switch-test'].update(marker='edu', split='training', identity=(0, 0))
         native_app.review_gallery(source, annotations, path.parent, galleries['switch-test'],
-                                  title='Gallery', caption='', group_label='Cells', empty_message='Empty')
+                                  title='Gallery', group_label='Cells', empty_message='Empty')
         st.session_state.test_gallery_token = context['event_token']
         return
     position = int(st.number_input('Position', min_value=0, step=1,
@@ -503,17 +503,14 @@ def test_unsaved_three_marker_field_cell_with_a_model_call_starts_unset_and_save
     app, path = open_three_marker_field(tmp_path, {'label': 2, 'expected': None})
     context = app.session_state.review_contexts['three-markers']
     assert [widget.value for widget in app.segmented_control] == [None, None, None]
-    assert 'Set every marker to save this cell.' in [caption.value for caption in app.caption]
     badge = next(item.value for item in app.markdown if 'selected-label-state' in item.value)
     assert 'data-state="BrdU + PCNA only"' in badge and 'background: #' in badge
     for label, value in (('EdU', 0), ('BrdU', 1)):
         set_field_marker(app, label, value, monkeypatch)
-        assert 'Set every marker to save this cell.' in [caption.value for caption in app.caption]
         assert 'test|2' not in path.read_text() and not context['history']
     set_field_marker(app, 'PCNA', 1, monkeypatch)
     assert path.read_text() == 'cell,edu,brdu,pcna\ntest|1,1,0,1\ntest|2,0,1,1\n'
     assert context['history'][-1].previous is None
-    assert 'Set every marker to save this cell.' not in [caption.value for caption in app.caption]
     assert context['drafts'] == {'test|2': {'expected': (0, 1, 1), 'values': {'edu': 0, 'brdu': 1, 'pcna': 1}}}
 
 

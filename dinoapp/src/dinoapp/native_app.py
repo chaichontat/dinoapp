@@ -346,7 +346,6 @@ def review_gallery(
     gallery: dict,
     *,
     title: str,
-    caption: str,
     group_label: str,
     empty_message: str,
 ) -> None:
@@ -368,7 +367,6 @@ def review_gallery(
 
     view_token = activate_view(context, ("native-gallery", gallery["queue_id"], page))
     st.title(title)
-    st.caption(caption)
     undo_column, status_column = st.columns([1, 3], vertical_alignment="center")
     last_edit = context["history"][-1] if context["history"] else None
     undo_label = (
@@ -614,9 +612,6 @@ def review_training_miscalls(
             "Disagreement", target_options, key=target_widget, on_change=remember_widget, args=(context, "miscall_target")
         )
         identity = saved_filter_controls(context, config, "miscall_saved")
-        st.caption(
-            "Ranked by the probability assigned against the current saved label."
-        )
     split = {"Training": "training", "Validation": "validation", "All labeled": "all"}[
         split_name
     ]
@@ -648,10 +643,6 @@ def review_training_miscalls(
         state_dir,
         gallery_states[signature],
         title="Training miscall gallery",
-        caption=(
-            "Each marker disagreement is a separate card, so a cell can appear more than once. "
-            "Click a card to flip only its displayed marker; the queue stays fixed until refreshed."
-        ),
         group_label="Training miscall cells",
         empty_message="No model/annotation disagreements match these filters.",
     )
@@ -815,8 +806,6 @@ def review_field(
             if draft is not None:
                 draft["values"][key] = choice
         value = draft_label(contract.markers, draft) if draft is not None else None
-        if draft is not None and value is None:
-            st.caption("Set every marker to save this cell.")
         chosen = value
     if chosen is not None and chosen != saved:
         try:
@@ -896,11 +885,9 @@ def review_field(
     picker = image_picker()
     with left:
         st.subheader("Selected cell")
-        if selected is None:
-            st.caption("Click a cell in the field to inspect its widest Z slice.")
-        elif not editable:
+        if selected is not None and not editable:
             st.caption("This segmented cell has no saved call or review crop geometry.")
-        else:
+        elif selected is not None:
             crop, plane_z = (render_cell_crop or source.cell_crop)(selected)
             badge_background, badge_foreground = badge_colors(
                 config, decode_call(contract, int(calls[selected_index]))
@@ -931,11 +918,6 @@ def review_field(
             if right_view == "Cell identities"
             else "Combined model uncertainty"
         )
-        if right_view == "Model uncertainty":
-            st.caption(
-                "Yellower cells are closer to either fitted decision threshold. "
-                "Colors show log1p(max inverse margin), capped at the global 99.9th percentile."
-            )
         picker(
             data={
                 "image": image,
