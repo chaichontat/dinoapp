@@ -62,7 +62,6 @@ class InferConfig:
     out_dir: Path
     markers: MarkerContract | None
     cells: Path | None
-    dinov2_repo: Path | None
     weights: Path | None
     batch_size: int
     cache_gb: float
@@ -88,8 +87,6 @@ def _load_bundle(path: Path) -> dict[str, Any]:
         "input_channels",
         "weights",
         "weights_sha256",
-        "dinov2_repo",
-        "model_source_sha256",
         "crop_size",
         "resize_size",
         "crop_eval_size",
@@ -355,7 +352,6 @@ def _parse_args() -> InferConfig:
         help="Marker configuration asserted against the model bundle; its contract must equal the bundle's.",
     )
     parser.add_argument("--cells", type=Path, default=None)
-    parser.add_argument("--dinov2-repo", type=Path, default=None)
     parser.add_argument("--weights", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--cache-gb", type=float, default=4.0)
@@ -390,7 +386,6 @@ def _parse_args() -> InferConfig:
         out_dir=args.out_dir.expanduser(),
         markers=load_config(args.markers.expanduser()).contract if args.markers is not None else None,
         cells=args.cells.expanduser() if args.cells is not None else None,
-        dinov2_repo=args.dinov2_repo.expanduser() if args.dinov2_repo is not None else None,
         weights=args.weights.expanduser() if args.weights is not None else None,
         batch_size=args.batch_size,
         cache_gb=args.cache_gb,
@@ -494,6 +489,8 @@ def main() -> None:
     embedding_path = cfg.out_dir / "embeddings"
     complete_path = cfg.out_dir / "complete.json"
     contract_path = cfg.out_dir / "contract.json"
+    weights = cfg.weights or Path(bundle["weights"]).expanduser()
+    validate_model_artifacts(bundle=bundle, weights=weights)
     fields = {
         "prepared_cells_sha256": file_sha256(source_cells_path),
         "requested_input_sha256": file_sha256(cfg.cells) if cfg.cells is not None else None,
@@ -501,7 +498,8 @@ def main() -> None:
             str(cell) for partition in cell_partitions() for cell in partition["cell"]
         ).tolist()).hex(),
         "source_sha256": source_sha256,
-        "model_source_sha256": str(bundle["model_source_sha256"]),
+        # Legacy bundles identify the backbone by model_source_sha256; resumed runs must keep it.
+        **{key: str(bundle[key]) for key in ("dinov2_source", "model_source_sha256") if key in bundle},
         "model_sha256": file_sha256(model_path),
         "cells": cell_count,
         "source_cells": source_cell_count,
@@ -527,9 +525,6 @@ def main() -> None:
             }
         )
     expected = INFERENCE.stamp(fields, contract)
-    repo = cfg.dinov2_repo or Path(bundle["dinov2_repo"]).expanduser()
-    weights = cfg.weights or Path(bundle["weights"]).expanduser()
-    validate_model_artifacts(bundle=bundle, weights=weights, model_source=repo)
     if cfg.out_dir.exists() and any(cfg.out_dir.iterdir()):
         if not cfg.resume:
             raise FileExistsError(f"Refusing --no-resume with occupied destination: {cfg.out_dir}")
@@ -574,14 +569,12 @@ def main() -> None:
         write_json_atomic(run_record, contract_path, overwrite=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_cell_dino_model(
-        repo=repo,
         hub_model=feature_extractor,
         weights=weights,
         device=device,
         precision=str(bundle["feature_precision"]),
     )
     transform = build_cell_transform(
-        repo=repo,
         resize_size=int(bundle["resize_size"]),
         crop_size=int(bundle["crop_eval_size"]),
     )

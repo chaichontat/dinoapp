@@ -20,7 +20,7 @@ def test_training_serialization_failure_preserves_existing_artifact(
         seed=0, limit=0, test_fraction=0.25, cv_folds=2,
         barrage_dir=tmp_path, feature_cache=tmp_path / "cache.joblib",
         model_out=tmp_path / "model.joblib", weights=tmp_path / "weights",
-        dinov2_repo=tmp_path / "repo", hub_model="test", batch_size=8, num_workers=0,
+        hub_model="test", batch_size=8, num_workers=0,
         input_channels=4, codebook="test", seg_codebook="test", segmentation_name="test",
         crop_size=8, resize_size=8, crop_eval_size=8,
     )
@@ -32,10 +32,10 @@ def test_training_serialization_failure_preserves_existing_artifact(
     monkeypatch.setattr(train, "_parse_args", lambda: cfg)
     monkeypatch.setattr(train, "load_barrage_training_table", lambda **kwargs: rows)
     monkeypatch.setattr(train, "file_sha256", lambda path: "weights")
-    monkeypatch.setattr(train, "path_sha256", lambda path: "source")
+    monkeypatch.setattr(train, "installed_dinov2_source", lambda: "source")
     monkeypatch.setattr(train, "_feature_cache_metadata", lambda *args, **kwargs: {})
     monkeypatch.setattr(train, "_load_feature_cache", lambda *args, **kwargs: {"entries": {}})
-    monkeypatch.setattr(train, "_load_cell_dino_model", lambda **kwargs: object())
+    monkeypatch.setattr(train, "load_cell_dino_model", lambda **kwargs: object())
 
     def extract(*, rows, **kwargs):
         targets = rows[["brdu", "edu"]].to_numpy()

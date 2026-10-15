@@ -16,6 +16,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dino_markers import MarkerContract
 
+from dino.cell_dino import require_dinov2_source
+
 if TYPE_CHECKING:
     import torch
 
@@ -111,16 +113,21 @@ def validate_model_artifacts(
     *,
     bundle: Mapping[str, Any],
     weights: Path,
-    model_source: Path,
 ) -> None:
+    """Check the checkpoint, and the installed dinov2 when the bundle records it.
+
+    Legacy bundles record a hash of a local checkout (model_source_sha256) instead of
+    dinov2_source; their source is not checked.
+    """
     expected_weights = bundle.get("weights_sha256")
-    expected_source = bundle.get("model_source_sha256")
-    if not isinstance(expected_weights, str) or not isinstance(expected_source, str):
-        raise ValueError("Model bundle is missing required content hashes; retrain the classifier bundle.")
+    if not isinstance(expected_weights, str):
+        raise ValueError("Model bundle is missing weights_sha256; retrain the classifier bundle.")
+    if "dinov2_source" not in bundle and not isinstance(bundle.get("model_source_sha256"), str):
+        raise ValueError("Model bundle records no dinov2_source; retrain the classifier bundle.")
     if file_sha256(weights) != expected_weights:
         raise ValueError(f"Cell-DINO checkpoint content does not match the trained bundle: {weights}")
-    if path_sha256(model_source) != expected_source:
-        raise ValueError(f"Cell-DINO source content does not match the trained bundle: {model_source}")
+    if "dinov2_source" in bundle:
+        require_dinov2_source(str(bundle["dinov2_source"]))
 
 
 def write_parquet_atomic(frame: pd.DataFrame, path: Path, *, provenance: Mapping[str, Any]) -> None:

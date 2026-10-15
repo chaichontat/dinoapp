@@ -32,7 +32,8 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
-from dino.artifacts import _dump_joblib_atomic, file_sha256, path_sha256
+from dino.artifacts import _dump_joblib_atomic, file_sha256
+from dino.cell_dino import installed_dinov2_source
 from dino.training_split import split_training_rows
 from dino.zarr_model import (
     DEFAULT_INPUT_CHANNEL_NAMES,
@@ -59,7 +60,6 @@ class TrainConfig:
     target_source_dir: Path | None
     out_dir: Path
     feature_cache: Path | None
-    dinov2_repo: Path
     hub_model: str
     weights: Path
     crop_size: int
@@ -397,7 +397,6 @@ def _parse_args() -> TrainConfig:
         default=None,
         help="Reusable embedding cache path. Defaults to <out-dir>/features.joblib.",
     )
-    parser.add_argument("--dinov2-repo", type=Path, default=Path("~/dinov2").expanduser())
     parser.add_argument("--hub-model", choices=sorted(MODEL_INPUT_CHANNELS), default="cell_dino_hpa_vitl16")
     parser.add_argument(
         "--weights",
@@ -470,7 +469,6 @@ def _parse_args() -> TrainConfig:
         target_source_dir=target_source_dir,
         out_dir=args.out_dir.expanduser(),
         feature_cache=args.feature_cache.expanduser() if args.feature_cache is not None else None,
-        dinov2_repo=args.dinov2_repo.expanduser(),
         hub_model=args.hub_model,
         weights=args.weights.expanduser(),
         crop_size=args.crop_size,
@@ -526,11 +524,11 @@ def main() -> None:
     source_sha256 = str(target_source.manifest["source_sha256"])
 
     weights_sha256 = file_sha256(cfg.weights)
-    model_source_sha256 = path_sha256(cfg.dinov2_repo)
+    dinov2_source = installed_dinov2_source()
     cache_fields = {
         "source_sha256s": training_source_sha256s,
         "weights_sha256": weights_sha256,
-        "model_source_sha256": model_source_sha256,
+        "dinov2_source": dinov2_source,
         "hub_model": cfg.hub_model,
         "crop_size": cfg.crop_size,
         "resize_size": cfg.resize_size,
@@ -552,10 +550,17 @@ def main() -> None:
     if (
         not isinstance(metadata, dict)
         or not FEATURE_CACHE.recognizes(metadata)
-        or FEATURE_CACHE.normalize(metadata, where=str(cache_path)) != cache_metadata
         or not isinstance(cache.get("entries"), dict)
     ):
         cache = {"metadata": cache_metadata, "entries": {}}
+    else:
+        recorded, expected = FEATURE_CACHE.normalize(metadata, where=str(cache_path)), cache_metadata
+        if "model_source_sha256" in recorded:
+            # A legacy cache predates recorded dinov2 sources and, like a legacy bundle, is reused without a source check.
+            recorded = {key: value for key, value in recorded.items() if key != "model_source_sha256"}
+            expected = {key: value for key, value in cache_metadata.items() if key != "dinov2_source"}
+        if recorded != expected:
+            cache = {"metadata": cache_metadata, "entries": {}}
 
     features, missing = _cached_features(selected_rows, cache, markers)
     miss_count = sum(map(len, missing.values()))
@@ -566,14 +571,12 @@ def main() -> None:
     if missing:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = load_cell_dino_model(
-            repo=cfg.dinov2_repo,
             hub_model=cfg.hub_model,
             weights=cfg.weights,
             device=device,
             precision=cfg.feature_precision,
         )
         transform = build_cell_transform(
-            repo=cfg.dinov2_repo,
             resize_size=cfg.resize_size,
             crop_size=cfg.crop_eval_size,
         )
@@ -635,8 +638,7 @@ def main() -> None:
         },
         "weights": str(cfg.weights),
         "weights_sha256": weights_sha256,
-        "dinov2_repo": str(cfg.dinov2_repo),
-        "model_source_sha256": model_source_sha256,
+        "dinov2_source": dinov2_source,
         "crop_size": cfg.crop_size,
         "resize_size": cfg.resize_size,
         "crop_eval_size": cfg.crop_eval_size,

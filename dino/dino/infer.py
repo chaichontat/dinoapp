@@ -17,7 +17,8 @@ from loguru import logger
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from dino.workspace_inputs import cell_id_roi_and_label, resolve_workspace_root
-from dino.cell_dino import build_cell_transform, require_dinov2_checkout
+from dino.cell_dino import build_cell_transform
+from dino.zarr_model import load_cell_dino_model
 from fishtools.brdu.barrage import load_obs_from_h5ad
 from dino.artifacts import (
     file_sha256,
@@ -39,8 +40,6 @@ REQUIRED_BUNDLE_KEYS = {
     "feature_extractor",
     "weights",
     "weights_sha256",
-    "dinov2_repo",
-    "model_source_sha256",
     "feature_scaler",
     "brdu_model",
     "edu_model",
@@ -61,7 +60,6 @@ class InferConfig:
     output_path: Path | None
     fused_zarr: Path | None
     segmentation_zarr: Path | None
-    dinov2_repo: Path | None
     weights: Path | None
     datasets: tuple[str, ...]
     rois: tuple[str, ...]
@@ -114,9 +112,6 @@ def _parse_args() -> InferConfig:
         help="Exact segmentation Zarr paired with --fused-zarr.",
     )
     parser.add_argument(
-        "--dinov2-repo", type=Path, default=None, help="Override dinov2 repo path from the bundle."
-    )
-    parser.add_argument(
         "--weights", type=Path, default=None, help="Override Cell-DINO checkpoint path from the bundle."
     )
     parser.add_argument(
@@ -165,7 +160,6 @@ def _parse_args() -> InferConfig:
             if args.segmentation_zarr is not None
             else None
         ),
-        dinov2_repo=Path(args.dinov2_repo).expanduser() if args.dinov2_repo is not None else None,
         weights=Path(args.weights).expanduser() if args.weights is not None else None,
         datasets=tuple(str(x) for x in args.datasets),
         rois=tuple(str(x) for x in args.rois),
@@ -279,7 +273,8 @@ def _output_provenance(
         "version": INFERENCE_ARTIFACT_VERSION,
         "model_sha256": file_sha256(cfg.model_path),
         "weights_sha256": str(bundle["weights_sha256"]),
-        "model_source_sha256": str(bundle["model_source_sha256"]),
+        # Legacy bundles identify the backbone by model_source_sha256; resumed outputs must keep it.
+        **{key: str(bundle[key]) for key in ("dinov2_source", "model_source_sha256") if key in bundle},
         "input_signature": _input_signature(cfg.h5ad_path),
         "fused_zarr": str(cfg.fused_zarr.resolve()) if cfg.fused_zarr is not None else None,
         "segmentation_zarr": (
@@ -355,12 +350,6 @@ def _load_obs_table(cfg: InferConfig) -> pd.DataFrame:
     return table
 
 
-def _load_cell_dino_model(*, repo: Path, hub_model: str, weights: Path, device: torch.device) -> Any:
-    require_dinov2_checkout(repo)
-    model = torch.hub.load(str(repo), hub_model, source="local", pretrained_path=str(weights))
-    return model.eval().to(device)
-
-
 def _load_seg_slab(
     seg: zarr.Array,
     *,
@@ -406,7 +395,6 @@ class _SlabBatchIterableDataset(IterableDataset[tuple[torch.Tensor, dict[str, An
         resize_size: int,
         crop_eval_size: int,
         batch_size: int,
-        repo: Path,
         y_dim: int,
         x_dim: int,
     ) -> None:
@@ -424,7 +412,6 @@ class _SlabBatchIterableDataset(IterableDataset[tuple[torch.Tensor, dict[str, An
         self.input_channels = input_channels
         self.resize_size = resize_size
         self.crop_eval_size = crop_eval_size
-        self.repo = repo
         self.batch_specs = _make_slab_batch_specs(
             group,
             crop_size=crop_size,
@@ -446,9 +433,7 @@ class _SlabBatchIterableDataset(IterableDataset[tuple[torch.Tensor, dict[str, An
         if start >= stop:
             return
 
-        transform = build_cell_transform(
-            repo=self.repo, resize_size=self.resize_size, crop_size=self.crop_eval_size
-        )
+        transform = build_cell_transform(resize_size=self.resize_size, crop_size=self.crop_eval_size)
         fused = zarr.open_array(self.fused_path, mode="r")
         seg = zarr.open_array(self.seg_path, mode="r")
         current_slab_key: tuple[int, int, int, int, int] | None = None
@@ -611,7 +596,6 @@ def _predict_group(
     group: pd.DataFrame,
     model: Any,
     bundle: dict[str, Any],
-    repo: Path,
     device: torch.device,
     batch_size: int,
     num_workers: int,
@@ -657,7 +641,6 @@ def _predict_group(
         resize_size=int(bundle["resize_size"]),
         crop_eval_size=int(bundle["crop_eval_size"]),
         batch_size=batch_size,
-        repo=repo,
         y_dim=int(fused.shape[1]),
         x_dim=int(fused.shape[2]),
     )
@@ -710,9 +693,8 @@ def main() -> None:
         raise ValueError(
             "Explicit --fused-zarr/--segmentation-zarr inputs require exactly one dataset/ROI group."
         )
-    repo = cfg.dinov2_repo if cfg.dinov2_repo is not None else Path(bundle["dinov2_repo"]).expanduser()
     weights = cfg.weights if cfg.weights is not None else Path(bundle["weights"]).expanduser()
-    validate_model_artifacts(bundle=bundle, weights=weights, model_source=repo)
+    validate_model_artifacts(bundle=bundle, weights=weights)
     provenance = _output_provenance(cfg=cfg, bundle=bundle, table=table)
     if output_path.exists():
         if not cfg.skip_existing:
@@ -734,11 +716,11 @@ def main() -> None:
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _load_cell_dino_model(
-        repo=repo,
+    model = load_cell_dino_model(
         hub_model=str(bundle["feature_extractor"]),
         weights=weights,
         device=device,
+        precision="float32",
     )
 
     group_outputs: list[pd.DataFrame] = []
@@ -750,7 +732,6 @@ def main() -> None:
                 group=group,
                 model=model,
                 bundle=bundle,
-                repo=repo,
                 device=device,
                 batch_size=cfg.batch_size,
                 num_workers=cfg.num_workers,

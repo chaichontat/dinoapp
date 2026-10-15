@@ -18,7 +18,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
-from dino.artifacts import _dump_joblib_atomic, array_sha256, file_sha256, path_sha256
+from dino.artifacts import _dump_joblib_atomic, array_sha256, file_sha256
 from dino.artifacts import row_feature_cache_key as _row_feature_cache_key
 from dino.training_split import split_training_rows
 from dino_markers import DEFAULT_CONTRACT
@@ -27,7 +27,8 @@ from dino.workspace_inputs import (
     cell_id_roi_and_label,
     resolve_workspace_root,
 )
-from dino.cell_dino import build_cell_transform, require_dinov2_checkout
+from dino.cell_dino import build_cell_transform, installed_dinov2_source
+from dino.zarr_model import load_cell_dino_model
 from fishtools.brdu.model import load_barrage_training_table
 from fishtools.io.workspace import Workspace
 from fishtools.segment.cell_thumbnail import cell_thumbnail_from_fused
@@ -49,7 +50,6 @@ class TrainConfig:
     barrage_dir: Path
     model_out: Path
     feature_cache: Path
-    dinov2_repo: Path
     hub_model: str
     input_channels: int
     weights: Path
@@ -84,12 +84,11 @@ def _parse_args() -> TrainConfig:
         default=None,
         help="Output joblib path for cached Cell-DINO features. Default: <barrage-dir>/cell_dino_hpa_vitl16_feature_cache.joblib",
     )
-    parser.add_argument("--dinov2-repo", type=Path, default=Path("~/dinov2").expanduser())
     parser.add_argument(
         "--hub-model",
         choices=sorted(MODEL_INPUT_CHANNELS),
         default="cell_dino_hpa_vitl16",
-        help="Local torch.hub Cell-DINO model entrypoint.",
+        help="Cell-DINO backbone in dinov2.hub.cell_dino.backbones.",
     )
     parser.add_argument(
         "--weights",
@@ -130,7 +129,6 @@ def _parse_args() -> TrainConfig:
         barrage_dir=barrage_dir,
         model_out=model_out,
         feature_cache=feature_cache,
-        dinov2_repo=Path(args.dinov2_repo).expanduser(),
         hub_model=hub_model,
         input_channels=MODEL_INPUT_CHANNELS[hub_model],
         weights=Path(args.weights).expanduser(),
@@ -171,14 +169,14 @@ def _feature_cache_metadata(
     cfg: TrainConfig,
     *,
     weights_sha256: str,
-    model_source_sha256: str,
+    dinov2_source: str,
 ) -> dict[str, Any]:
     return {
         "feature_cache_version": FEATURE_CACHE_VERSION,
         "feature_extractor": cfg.hub_model,
         "input_channels": cfg.input_channels,
         "weights_sha256": weights_sha256,
-        "model_source_sha256": model_source_sha256,
+        "dinov2_source": dinov2_source,
         "codebook": cfg.codebook,
         "seg_codebook": cfg.seg_codebook,
         "segmentation_name": cfg.segmentation_name,
@@ -307,7 +305,6 @@ def _extract_features_with_cache(
     cache_bundle: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     transform = build_cell_transform(
-        repo=cfg.dinov2_repo,
         resize_size=cfg.resize_size,
         crop_size=cfg.crop_eval_size,
     )
@@ -397,12 +394,6 @@ def _make_split_tables(train: pd.DataFrame, *, cfg: TrainConfig) -> tuple[pd.Dat
     return split_training_rows(train, markers=DEFAULT_CONTRACT.markers, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed)
 
 
-def _load_cell_dino_model(*, repo: Path, hub_model: str, weights: Path, device: torch.device) -> Any:
-    require_dinov2_checkout(repo)
-    model = torch.hub.load(str(repo), hub_model, source="local", pretrained_path=str(weights))
-    return model.eval().to(device)
-
-
 def main() -> None:
     cfg = _parse_args()
     torch.manual_seed(cfg.seed)
@@ -420,18 +411,18 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weights_sha256 = file_sha256(cfg.weights)
-    model_source_sha256 = path_sha256(cfg.dinov2_repo)
+    dinov2_source = installed_dinov2_source()
     cache_metadata = _feature_cache_metadata(
         cfg,
         weights_sha256=weights_sha256,
-        model_source_sha256=model_source_sha256,
+        dinov2_source=dinov2_source,
     )
     cache_bundle = _load_feature_cache(cfg, expected_metadata=cache_metadata)
-    model = _load_cell_dino_model(
-        repo=cfg.dinov2_repo,
+    model = load_cell_dino_model(
         hub_model=cfg.hub_model,
         weights=cfg.weights,
         device=device,
+        precision="float32",
     )
 
     train_features, train_targets, train_cache_updated = _extract_features_with_cache(
@@ -485,8 +476,7 @@ def main() -> None:
         "feature_extractor": cfg.hub_model,
         "weights": str(cfg.weights),
         "weights_sha256": weights_sha256,
-        "dinov2_repo": str(cfg.dinov2_repo),
-        "model_source_sha256": model_source_sha256,
+        "dinov2_source": dinov2_source,
         "input_channels": int(cfg.input_channels),
         "feature_cache": str(cfg.feature_cache),
         "codebook": cfg.codebook,

@@ -5,7 +5,6 @@ import sys
 from types import ModuleType
 from typing import Any
 
-import dinov2
 import numpy as np
 import pandas as pd
 import pytest
@@ -22,9 +21,7 @@ class _MeanModel(torch.nn.Module):
         return x[:, :2].mean(dim=(2, 3)) + 1.0
 
 
-def _fake_dinov2_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    repo = tmp_path / "dinov2"
-    monkeypatch.setattr(dinov2, "__file__", str(repo / "dinov2" / "__init__.py"))
+def _fake_cell_dino_transforms(monkeypatch: pytest.MonkeyPatch) -> None:
     transforms = ModuleType("dinov2.data.cell_dino.transforms")
     monkeypatch.setattr(
         transforms,
@@ -33,7 +30,6 @@ def _fake_dinov2_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
         raising=False,
     )
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
-    return repo
 
 
 def _make_group_rows() -> pd.DataFrame:
@@ -152,7 +148,7 @@ def test_copy_cell_into_batch_image_pads_scales_and_masks_exact_label() -> None:
 
 def test_slab_batch_loader_emits_expected_pixels_and_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = infer
-    repo = _fake_dinov2_checkout(tmp_path, monkeypatch)
+    _fake_cell_dino_transforms(monkeypatch)
     group = _make_group_rows()
 
     fused_path = tmp_path / "fused.zarr"
@@ -178,7 +174,6 @@ def test_slab_batch_loader_emits_expected_pixels_and_order(tmp_path: Path, monke
         resize_size=6,
         crop_eval_size=6,
         batch_size=1,
-        repo=repo,
         y_dim=fused_data.shape[1],
         x_dim=fused_data.shape[2],
     )
@@ -232,7 +227,7 @@ def test_slab_batch_loader_emits_expected_pixels_and_order(tmp_path: Path, monke
 
 def test_slab_batch_loader_retains_cell_with_empty_target_mask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = infer
-    repo = _fake_dinov2_checkout(tmp_path, monkeypatch)
+    _fake_cell_dino_transforms(monkeypatch)
     group = pd.DataFrame(
         [
             {
@@ -268,7 +263,6 @@ def test_slab_batch_loader_retains_cell_with_empty_target_mask(tmp_path: Path, m
         resize_size=4,
         crop_eval_size=4,
         batch_size=1,
-        repo=repo,
         y_dim=8,
         x_dim=8,
     )
@@ -310,7 +304,6 @@ def test_resolve_output_path_defaults_to_nvme_dataset_path() -> None:
         output_path=None,
         fused_zarr=None,
         segmentation_zarr=None,
-        dinov2_repo=None,
         weights=None,
         datasets=(),
         rois=(),
@@ -328,7 +321,7 @@ def test_resolve_output_path_defaults_to_nvme_dataset_path() -> None:
 @pytest.mark.integration
 def test_predict_group_preserves_row_order_with_multiple_workers(tmp_path: Path, monkeypatch: Any) -> None:
     module = infer
-    repo = _fake_dinov2_checkout(tmp_path, monkeypatch)
+    _fake_cell_dino_transforms(monkeypatch)
     workspace_root = tmp_path / "DS1"
     workspace_root.mkdir(parents=True, exist_ok=True)
     (workspace_root / "ready.DONE").write_text("", encoding="utf-8")
@@ -387,7 +380,6 @@ def test_predict_group_preserves_row_order_with_multiple_workers(tmp_path: Path,
             "brdu_model": brdu_model,
             "edu_model": edu_model,
         },
-        repo=repo,
         device=torch.device("cpu"),
         batch_size=2,
         num_workers=2,

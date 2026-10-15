@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import inspect
 import os
 import sys
 from collections.abc import Iterator
@@ -15,7 +17,6 @@ from loguru import logger
 from sklearn.metrics import balanced_accuracy_score
 
 from dino.cell_dino import build_cell_transform as build_cell_transform
-from dino.cell_dino import require_dinov2_checkout
 from dino.pixel_corrections import correct_channels
 from dino.zarr_source import (
     CellCropReader,
@@ -67,9 +68,21 @@ def feature_dtype(precision: str) -> torch.dtype:
     raise ValueError(f"Unsupported feature precision: {precision}")
 
 
+def cell_dino_backbone(hub_model: str) -> Any:
+    """Resolve a Cell-DINO backbone constructor in the installed dinov2 package."""
+    backbones = importlib.import_module("dinov2.hub.cell_dino.backbones")
+    available = {
+        name: value for name, value in vars(backbones).items() if not name.startswith("_") and inspect.isfunction(value)
+    }
+    if hub_model not in available:
+        raise ValueError(
+            f"{hub_model!r} is not a Cell-DINO backbone in {backbones.__name__}; available: {sorted(available)}"
+        )
+    return available[hub_model]
+
+
 def load_cell_dino_model(
     *,
-    repo: Path,
     hub_model: str,
     weights: Path,
     device: torch.device,
@@ -85,8 +98,7 @@ def load_cell_dino_model(
             "PyTorch SDPA can be selected"
         )
     os.environ["XFORMERS_DISABLED"] = "1"
-    require_dinov2_checkout(repo)
-    model = torch.hub.load(str(repo), hub_model, source="local", pretrained_path=str(weights))
+    model = cell_dino_backbone(hub_model)(pretrained_path=str(weights))
     attention_module = sys.modules.get("dinov2.layers.attention")
     if attention_module is None or bool(getattr(attention_module, "XFORMERS_AVAILABLE", True)):
         raise RuntimeError("Cell-DINO did not initialize with native PyTorch SDPA")

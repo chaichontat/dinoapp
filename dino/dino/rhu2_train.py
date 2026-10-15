@@ -23,6 +23,7 @@ from threadpoolctl import threadpool_limits
 import torch
 import zarr
 
+from dino.cell_dino import installed_dinov2_source, require_dinov2_source
 from dino.intensity_context import IntensityContext
 from dino.zarr_model import (
     balanced_accuracy_cutoff, build_cell_transform, extract_normalized_features, feature_dtype,
@@ -35,7 +36,7 @@ TARGETS = ('brdu', 'edu')
 CONTEXT_FEATURES = ('log1p_cell_mean', 'log_cell_over_local_mean', 'log1p_pi_mean')
 ENCODER_KEYS = (
     'feature_extractor', 'input_channels', 'input_channel_names_by_target',
-    'weights', 'weights_sha256', 'dinov2_repo', 'crop_size', 'resize_size',
+    'weights', 'weights_sha256', 'crop_size', 'resize_size',
     'crop_eval_size', 'highpass_sigma_px', 'mask_erosion_px', 'feature_precision',
     'feature_execution',
 )
@@ -99,7 +100,7 @@ def prepare(review: Path, output: Path, reference: Path, z_step_um: float | None
         'reference_model': str(reference), 'label_snapshot_count': len(labels),
         'training_label_count': len(rows), 'excluded_noncohort_labels': len(labels) - len(rows),
         'cohort_missing_intensity_cells': int((~np.isfinite(numeric[:, 3:]).all(axis=1)).sum()),
-        'encoder': {key: reference_bundle[key] for key in ENCODER_KEYS},
+        'encoder': {**{key: reference_bundle[key] for key in ENCODER_KEYS}, 'dinov2_source': installed_dinov2_source()},
         'pixel_correction': None,
         'pixel_correction_note': 'Prod2 correction is acquisition-specific; RHU2 uses native fused pixels.',
         'rois': spatial['rois'], 'spacing_by_roi': spacing,
@@ -130,10 +131,11 @@ def extract(output: Path) -> None:
     rows = pd.read_parquet(output / 'training_rows.parquet')
     device = torch.device('cuda:0')
     torch.set_num_threads(4)
-    model = load_cell_dino_model(repo=Path(config['dinov2_repo']), hub_model=config['feature_extractor'],
-                                 weights=Path(config['weights']), device=device, precision=config['feature_precision'])
-    transform = build_cell_transform(repo=Path(config['dinov2_repo']), resize_size=config['resize_size'],
-                                     crop_size=config['crop_eval_size'])
+    if 'dinov2_source' in config:
+        require_dinov2_source(config['dinov2_source'])
+    model = load_cell_dino_model(hub_model=config['feature_extractor'], weights=Path(config['weights']),
+                                 device=device, precision=config['feature_precision'])
+    transform = build_cell_transform(resize_size=config['resize_size'], crop_size=config['crop_eval_size'])
     features = {target: np.empty((len(rows), 1024), np.float32) for target in TARGETS}
     planes = np.full(len(rows), -1, dtype=np.int64)
     rois = {item['key']: item for item in metadata['rois']}

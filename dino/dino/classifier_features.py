@@ -211,6 +211,7 @@ def assemble_classifier_features(
 FEATURE_KEYS = (
     "feature_extractor",
     "weights_sha256",
+    "dinov2_source",
     "model_source_sha256",
     "crop_size",
     "resize_size",

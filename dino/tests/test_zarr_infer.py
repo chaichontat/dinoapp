@@ -14,7 +14,7 @@ from click.testing import CliRunner
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from dino import call_provenance, zarr_cli, zarr_infer, zarr_model
+from dino import call_provenance, cell_dino, zarr_cli, zarr_infer, zarr_model
 from dino_markers import (
     DEFAULT_CONTRACT,
     INFERENCE,
@@ -34,6 +34,7 @@ from dino.artifacts import (
     read_parquet_artifact,
     write_parquet_atomic,
 )
+from dino.cell_dino import installed_dinov2_source
 from dino.intensity_context import IntensityContext
 from dino.zarr_source import build_source_manifest, write_json_atomic
 
@@ -112,8 +113,6 @@ def make_inference_run(tmp_path, monkeypatch):
             "input_channels": 4,
             "weights": str(weights),
             "weights_sha256": file_sha256(weights),
-            "dinov2_repo": str(encoder_dir),
-            "model_source_sha256": path_sha256(encoder_dir),
             "crop_size": 4,
             "resize_size": 4,
             "crop_eval_size": 4,
@@ -125,6 +124,10 @@ def make_inference_run(tmp_path, monkeypatch):
         }
         if current:
             bundle["marker_contract"] = contract.to_json()
+            bundle["dinov2_source"] = installed_dinov2_source()
+        else:
+            bundle["dinov2_repo"] = str(encoder_dir)
+            bundle["model_source_sha256"] = path_sha256(encoder_dir)
         expected_embeddings = {}
         expected_probabilities = {}
         for target in contract.markers:
@@ -171,6 +174,35 @@ def make_inference_run(tmp_path, monkeypatch):
 @pytest.fixture
 def inference_run(make_inference_run):
     return make_inference_run()
+
+
+def test_inference_rejects_a_bundle_built_with_another_dinov2(make_inference_run, monkeypatch) -> None:
+    run = make_inference_run(current=True)
+    bundle = joblib.load(run.model_path)
+    bundle["dinov2_source"] = "git+https://github.com/chaichontat/dinov2@0000000"
+    joblib.dump(bundle, run.model_path)
+    monkeypatch.setattr(
+        zarr_infer, "load_cell_dino_model", lambda **kwargs: pytest.fail("a source mismatch reached the encoder")
+    )
+
+    result = CliRunner().invoke(zarr_cli.main, run.args)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ValueError)
+    assert installed_dinov2_source() in str(result.exception)
+    assert "git+https://github.com/chaichontat/dinov2@0000000" in str(result.exception)
+    assert not run.out_dir.exists()
+
+
+def test_legacy_bundle_inference_skips_the_dinov2_source_check(inference_run, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cell_dino, "installed_dinov2_source", lambda: pytest.fail("a legacy bundle must not check dinov2")
+    )
+
+    result = CliRunner().invoke(zarr_cli.main, inference_run.args)
+
+    assert result.exit_code == 0, result.exception
+    assert "status=complete" in result.output
 
 
 def _output_bytes(out_dir):

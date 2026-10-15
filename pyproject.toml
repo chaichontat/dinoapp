@@ -21,7 +21,7 @@ dino-markers = { workspace = true }
 thesis-dino = { workspace = true }
 squisher = { git = "https://github.com/chaichontat/squisher", subdirectory = "squisher" }
 squisher-segment = { git = "https://github.com/chaichontat/squisher", subdirectory = "segment" }
-dinov2 = { git = "https://github.com/facebookresearch/dinov2", rev = "7b187bd4df8efce2cbcbbb67bd01532c19bf4c9c" }
+dinov2 = { git = "https://github.com/chaichontat/dinov2", rev = "76d1757bbb72097b7f0126c4d0081f4fea483e67" }
 
 [tool.pytest.ini_options]
 testpaths = ["dinoapp/tests", "dino/tests", "markers/tests"]

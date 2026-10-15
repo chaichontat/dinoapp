@@ -47,6 +47,7 @@ from dino.artifacts import (
     read_parquet_artifact,
     write_embedding_atomic,
 )
+from dino.cell_dino import installed_dinov2_source
 from dino.intensity_context import IntensityContext
 from dino.zarr_source import load_source, manifest_digest
 
@@ -72,7 +73,6 @@ def _train_cli(*, barrage_dir: Path, out_dir: Path, feature_cache: Path | None =
         "train",
         "--barrage-dir", str(barrage_dir),
         "--out-dir", str(out_dir),
-        "--dinov2-repo", "encoder",
         "--weights", "encoder/weights.pth",
         "--crop-size", "4",
         "--resize-size", "4",
@@ -245,6 +245,9 @@ EXPECTED_BUNDLE_KEYS = {
     "edu_validation_balanced_accuracy",
 }
 
+# Freshly trained bundles record dinov2_source where the legacy fixture records dinov2_repo and model_source_sha256.
+FRESH_BUNDLE_KEYS = EXPECTED_BUNDLE_KEYS - {"dinov2_repo", "model_source_sha256"} | {"dinov2_source"}
+
 EXPECTED_BUNDLE_VALUES = {
     "schema": "dino-zarr-model-v6",
     "source_sha256": SOURCE_SHA256,
@@ -392,12 +395,13 @@ def _assert_same_estimator(left, right) -> None:
 
 def _assert_reproduces_legacy_bundle(bundle: dict, legacy_bundle: dict, *, barrage_dir: Path) -> None:
     assert set(legacy_bundle) == EXPECTED_BUNDLE_KEYS
-    assert set(bundle) == EXPECTED_BUNDLE_KEYS | {"marker_contract"}
+    assert set(bundle) == FRESH_BUNDLE_KEYS | {"marker_contract"}
     assert bundle["schema"] == "dino-zarr-model-v7"
     assert bundle["marker_contract"] == DEFAULT_JSON
     assert bundle["training_barrage_dirs"] == [str(barrage_dir.resolve())]
+    assert bundle["dinov2_source"] == installed_dinov2_source()
     pd.Timestamp(bundle["created_at_utc"])
-    for key in EXPECTED_BUNDLE_KEYS - {"schema", "created_at_utc", "training_barrage_dirs"}:
+    for key in FRESH_BUNDLE_KEYS - {"schema", "created_at_utc", "training_barrage_dirs", "dinov2_source"}:
         if key.endswith(("_model", "_feature_scaler")):
             _assert_same_estimator(bundle[key], legacy_bundle[key])
         else:
@@ -488,7 +492,10 @@ def test_fresh_training_reproduces_legacy_cache_and_bundle(legacy, monkeypatch) 
     legacy_cache = joblib.load(legacy / "model" / "features.joblib")
     assert legacy_cache["metadata"] == EXPECTED_CACHE_METADATA
     assert cache["metadata"] == {
-        **EXPECTED_CACHE_METADATA, "schema": "dino-zarr-features-v3", "marker_contract": DEFAULT_JSON
+        **{key: value for key, value in EXPECTED_CACHE_METADATA.items() if key != "model_source_sha256"},
+        "dinov2_source": installed_dinov2_source(),
+        "schema": "dino-zarr-features-v3",
+        "marker_contract": DEFAULT_JSON,
     }
     assert set(cache["entries"]) == set(legacy_cache["entries"])
     for key, entry in legacy_cache["entries"].items():

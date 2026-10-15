@@ -39,30 +39,24 @@ uv sync --package dinoapp --extra native         # native field review
 uv sync --package thesis-dino --extra compute    # preparation, fitting, inference
 ```
 
-The `compute` sync installs `dinov2` from `facebookresearch/dinov2` at the commit
-that provides Cell-DINO (`7b187bd`), and the root `pyproject.toml` overrides its
-2023 training pins. Model loading also reads the checkout's `hubconf.py` and
-requires the installed package to be that checkout, so install a clone of the same
-commit over it after each sync;
-[dino/README.md](dino/README.md#installation) describes the checkpoint:
-
-```bash
-git clone https://github.com/facebookresearch/dinov2 /path/to/dinov2
-git -C /path/to/dinov2 checkout 7b187bd4df8efce2cbcbbb67bd01532c19bf4c9c
-uv pip install --no-deps -e /path/to/dinov2
-```
+The `compute` sync installs `dinov2` from the fork
+[chaichontat/dinov2](https://github.com/chaichontat/dinov2) at commit `76d1757`,
+which is `facebookresearch/dinov2` commit `7b187bd` with the Cell-DINO folders
+packaged. The root `pyproject.toml` overrides its 2023 training pins.
+[dino/README.md](dino/README.md#installation) describes the checkpoint.
 
 With pip, `dino-markers` is not on PyPI and must be installed from `markers/` in
 the same command. The PyPI `squisher` and `dinov2` are unrelated packages, so
-install squisher from GitHub and the DINOv2 clone first when the native or compute
-extras need them:
+install both from GitHub first when the native or compute extras need them.
+Install `dinov2` with `--no-deps`, because its `setup.py` pins a 2023 Torch stack:
 
 ```bash
 python -m pip install -e ./markers -e ./dinoapp
 python -m pip install \
   "squisher @ git+https://github.com/chaichontat/squisher#subdirectory=squisher" \
   "squisher-segment @ git+https://github.com/chaichontat/squisher#subdirectory=segment"
-python -m pip install --no-deps -e /path/to/dinov2
+python -m pip install --no-deps \
+  "dinov2 @ git+https://github.com/chaichontat/dinov2@76d1757bbb72097b7f0126c4d0081f4fea483e67"
 python -m pip install -e ./markers -e './dino[compute]' -e './dinoapp[native]'
 ```
 

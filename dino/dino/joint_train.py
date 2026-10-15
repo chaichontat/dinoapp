@@ -63,10 +63,12 @@ CV_FOLDS = 5
 INTENSITY_NEIGHBORS = 16
 EMBEDDING_WIDTH = 1024
 ENCODER_KEYS = (
-    'feature_extractor', 'weights_sha256', 'model_source_sha256', 'crop_size', 'resize_size', 'crop_eval_size',
+    'feature_extractor', 'weights_sha256', 'crop_size', 'resize_size', 'crop_eval_size',
     'highpass_sigma_px', 'mask_erosion_px', 'input_channels', 'input_channel_names_by_target',
     'feature_precision', 'feature_execution',
 )
+# Legacy embedding bundles identify the backbone by model_source_sha256 instead of dinov2_source.
+BACKBONE_SOURCE_KEYS = ('dinov2_source', 'model_source_sha256')
 # Classifier state inherited from the embedding bundle that a deployed bundle must not carry.
 STALE_KEYS = (
     'embedding_pca', 'deployment', 'feature_cache', 'training_barrage_dirs', 'classifier_feature_schema',
@@ -74,6 +76,12 @@ STALE_KEYS = (
     'test_fraction', 'split_source_model', 'split_source_model_sha256', 'label_snapshot',
     'label_snapshot_sha256', 'training_labels_snapshot', 'training_labels_snapshot_sha256',
 )
+
+
+def encoder_identity(bundle: dict) -> dict:
+    return {key: bundle[key] for key in ENCODER_KEYS} | {
+        key: bundle[key] for key in BACKBONE_SOURCE_KEYS if key in bundle
+    }
 
 
 @dataclass(frozen=True)
@@ -258,9 +266,9 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
             'intensity_props_sha256': record['props_sha256'], 'intensity_measurement': record,
             'dapi_props': str(dataset.dapi_props.resolve()), 'dapi_props_sha256': file_sha256(dataset.dapi_props),
             'intensity_scale_zyx_um': list(dataset.scale_zyx_um), 'tranches': tranches[dataset.name]}
-    reference = {key: bundles[names[0]][key] for key in ENCODER_KEYS}
+    reference = encoder_identity(bundles[names[0]])
     for name in names[1:]:
-        if {key: bundles[name][key] for key in ENCODER_KEYS} != reference:
+        if encoder_identity(bundles[name]) != reference:
             raise ValueError(f'{name} embeddings use a different encoder than {names[0]}')
 
     markers = contract.markers

@@ -441,7 +441,7 @@ def test_unsupported_limit_fails_before_feature_extraction(monkeypatch, tmp_path
                             lambda **kwargs: pytest.fail("unsupported split reached the encoder"))
     else:
         monkeypatch.setattr(module, "load_barrage_training_table", lambda **kwargs: rows)
-        monkeypatch.setattr(module, "_load_cell_dino_model",
+        monkeypatch.setattr(module, "load_cell_dino_model",
                             lambda **kwargs: pytest.fail("unsupported split reached the encoder"))
     with pytest.raises(ValueError, match="No supported.*stratification"):
         module.main()
@@ -767,7 +767,6 @@ def _train_three_markers(monkeypatch, tmp_path, *, out: str, cache: Path | None 
         "dino-zarr train",
         "--barrage-dir", str(tmp_path / "barrage"),
         "--out-dir", str(tmp_path / out),
-        "--dinov2-repo", str(tmp_path / "encoder"),
         "--weights", str(tmp_path / "weights.pth"),
         "--crop-size", "4", "--resize-size", "4", "--crop-eval-size", "4",
         "--batch-size", "4", "--test-fraction", "0.25", "--cache-gb", "0.001",
@@ -863,7 +862,7 @@ def test_an_extended_legacy_cache_keeps_its_v2_metadata(monkeypatch, tmp_path) -
         "argv",
         [
             "dino-zarr train", "--barrage-dir", ".", "--out-dir", "retrain", "--feature-cache", str(cache_path),
-            "--dinov2-repo", "encoder", "--weights", "encoder/weights.pth", "--crop-size", "4",
+            "--weights", "encoder/weights.pth", "--crop-size", "4",
             "--resize-size", "4", "--crop-eval-size", "4", "--batch-size", "4", "--test-fraction", "0.25",
             "--cache-gb", "0.001", "--prefetch-workers", "1", "--crop-workers", "1",
         ],

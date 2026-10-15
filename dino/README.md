@@ -28,13 +28,13 @@ that is installed from there alongside this package.
 
 Use `[compute]` for encoder execution, spatial fitting, direct-Zarr preparation,
 and pixelwise regionprops measurements. The uv workspace resolves `squisher` and
-`squisher-segment` from GitHub and `dinov2` from `facebookresearch/dinov2` at
-commit `7b187bd`. Run these commands from the `dinoinfer` repository root, with
-`/home/chaichontat/dinov2` a clone at that commit:
+`squisher-segment` from GitHub and `dinov2` from the fork
+[chaichontat/dinov2](https://github.com/chaichontat/dinov2) at commit `76d1757`
+(`facebookresearch/dinov2` commit `7b187bd` with the Cell-DINO folders packaged).
+Run this command from the `dinoinfer` repository root:
 
 ```bash
 uv sync --package thesis-dino --extra compute
-uv pip install --no-deps -e /home/chaichontat/dinov2
 ```
 
 Use `[legacy]` for the H5AD pipeline (`dino train`, `infer`, `barrage`, `run`,
@@ -43,7 +43,7 @@ supplies the microscopy workspace, crop, and barrage readers. fishtools requires
 NumPy 1 and squisher NumPy 2.4 or newer, so install it with `./dino[legacy]` in a
 separate environment.
 
-Cell-DINO requires the Cell-DINO DINOv2 checkout installed editable in the same environment and the selected Cell-DINO checkpoint. `--dinov2-repo` (or the path recorded in the model bundle) must identify that installed checkout: transforms are imported from the installed package, and model loading uses its local `hubconf.py`. `uv sync` reinstalls the locked copy, so repeat the editable install after each sync. The root `pyproject.toml` overrides the checkout's legacy dependency pins, and the `--no-deps` install preserves the environment's Torch stack. The optional MNIST validation command requires DINOv3 to be importable in the environment.
+Cell-DINO requires the selected Cell-DINO checkpoint and `dinov2` installed from a git commit; models and transforms load from the installed package. Model bundles record that installation as `dinov2_source` (git URL and commit), and inference refuses a bundle whose `dinov2_source` differs from the installed `dinov2`. Bundles and feature caches that record only `model_source_sha256` load without a source check. Outside the uv workspace, install it with `pip install --no-deps "dinov2 @ git+https://github.com/chaichontat/dinov2@76d1757bbb72097b7f0126c4d0081f4fea483e67"`; `--no-deps` preserves the environment's Torch stack. The optional MNIST validation command requires DINOv3 to be importable in the environment.
 
 ## Marker configuration
 
@@ -274,7 +274,7 @@ and refuse to overwrite an existing destination. Legacy `dino infer --skip-exist
 assumes the image and segmentation stores are immutable. Use a fresh output
 destination after changing either store; this path does not detect in-place
 pixel or label changes. Feature caches are bound to
-the checkpoint, backbone source, preprocessing, and masked-cell inputs;
+the checkpoint, the installed `dinov2` commit, preprocessing, and masked-cell inputs;
 bundles created before that metadata was added must be retrained.
 
 Held-out ROC evaluation requires the bundle's saved `train_cells` and

@@ -7,10 +7,10 @@ import pandas as pd
 import pytest
 import torch
 
+from dino import cell_dino
 from dino.artifacts import (
     array_sha256,
     file_sha256,
-    path_sha256,
     read_embedding_artifact,
     read_parquet_artifact,
     require_embedding_markers,
@@ -129,39 +129,50 @@ def test_require_embedding_markers_rejects_missing_and_extra_markers(tmp_path: P
         require_embedding_markers(_embeddings(*keys), ("edu", "brdu", "pcna"), path=path)
 
 
-def test_model_artifacts_reject_changed_weights(tmp_path: Path) -> None:
+def test_model_artifacts_reject_changed_weights(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cell_dino, "installed_dinov2_source", lambda: "git+https://example/dinov2@a")
     weights = tmp_path / "weights.pth"
     weights.write_bytes(b"trained weights")
-    repo = tmp_path / "dinov2"
-    repo.mkdir()
-    (repo / "hubconf.py").write_text("MODEL = 1\n", encoding="utf-8")
-    bundle = {
-        "weights_sha256": file_sha256(weights),
-        "model_source_sha256": path_sha256(repo),
-    }
+    bundle = {"weights_sha256": file_sha256(weights), "dinov2_source": "git+https://example/dinov2@a"}
 
-    validate_model_artifacts(bundle=bundle, weights=weights, model_source=repo)
+    validate_model_artifacts(bundle=bundle, weights=weights)
     weights.write_bytes(b"different weights")
 
     with pytest.raises(ValueError, match="checkpoint content does not match"):
-        validate_model_artifacts(bundle=bundle, weights=weights, model_source=repo)
+        validate_model_artifacts(bundle=bundle, weights=weights)
 
 
-def test_model_artifacts_reject_changed_source(tmp_path: Path) -> None:
+def test_model_artifacts_reject_another_installed_dinov2(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cell_dino, "installed_dinov2_source", lambda: "git+https://example/dinov2@b")
     weights = tmp_path / "weights.pth"
     weights.write_bytes(b"trained weights")
-    repo = tmp_path / "dinov2"
-    repo.mkdir()
-    source = repo / "hubconf.py"
-    source.write_text("MODEL = 1\n", encoding="utf-8")
-    bundle = {
-        "weights_sha256": file_sha256(weights),
-        "model_source_sha256": path_sha256(repo),
-    }
-    source.write_text("MODEL = 2\n", encoding="utf-8")
+    bundle = {"weights_sha256": file_sha256(weights), "dinov2_source": "git+https://example/dinov2@a"}
 
-    with pytest.raises(ValueError, match="source content does not match"):
-        validate_model_artifacts(bundle=bundle, weights=weights, model_source=repo)
+    with pytest.raises(ValueError, match=r"dinov2@b.*dinov2@a"):
+        validate_model_artifacts(bundle=bundle, weights=weights)
+
+
+def test_legacy_model_artifacts_skip_the_source_check(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cell_dino, "installed_dinov2_source", lambda: pytest.fail("a legacy bundle must not check dinov2")
+    )
+    weights = tmp_path / "weights.pth"
+    weights.write_bytes(b"trained weights")
+    bundle = {"weights_sha256": file_sha256(weights), "model_source_sha256": "legacy checkout digest"}
+
+    validate_model_artifacts(bundle=bundle, weights=weights)
+    weights.write_bytes(b"different weights")
+
+    with pytest.raises(ValueError, match="checkpoint content does not match"):
+        validate_model_artifacts(bundle=bundle, weights=weights)
+
+
+def test_model_artifacts_require_a_source_identity(tmp_path: Path) -> None:
+    weights = tmp_path / "weights.pth"
+    weights.write_bytes(b"trained weights")
+
+    with pytest.raises(ValueError, match="dinov2_source"):
+        validate_model_artifacts(bundle={"weights_sha256": file_sha256(weights)}, weights=weights)
 
 
 def test_array_sha256_changes_with_masked_input() -> None:

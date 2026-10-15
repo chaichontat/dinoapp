@@ -3,7 +3,6 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
-import dinov2
 import joblib
 import numpy as np
 import pandas as pd
@@ -79,9 +78,8 @@ class _LinearFeatureModel(torch.nn.Module):
 
 
 def test_load_cell_dino_model_casts_weights_to_native_bfloat16(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(dinov2, "__file__", str(tmp_path / "dinov2" / "dinov2" / "__init__.py"))
     source_model = _LinearFeatureModel()
-    monkeypatch.setattr(torch.hub, "load", lambda *args, **kwargs: source_model)
+    monkeypatch.setattr(zarr_model, "cell_dino_backbone", lambda hub_model: lambda **kwargs: source_model)
     monkeypatch.setitem(
         sys.modules,
         "dinov2.layers.attention",
@@ -89,7 +87,6 @@ def test_load_cell_dino_model_casts_weights_to_native_bfloat16(monkeypatch, tmp_
     )
 
     model = load_cell_dino_model(
-        repo=tmp_path / "dinov2",
         hub_model="cell_dino_hpa_vitl16",
         weights=tmp_path / "weights.pth",
         device=torch.device("cpu"),
@@ -110,7 +107,6 @@ def test_load_cell_dino_model_rejects_preimported_xformers(monkeypatch, tmp_path
 
     with pytest.raises(RuntimeError, match="imported with xFormers enabled"):
         load_cell_dino_model(
-            repo=tmp_path / "dinov2",
             hub_model="cell_dino_hpa_vitl16",
             weights=tmp_path / "weights.pth",
             device=torch.device("cpu"),

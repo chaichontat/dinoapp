@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 import zarr
 
+from dino.cell_dino import require_dinov2_source
 from dino.rhu2_train import TARGETS, native_crop
 from dino.zarr_model import (
     build_cell_transform, extract_normalized_features, feature_dtype, load_cell_dino_model,
@@ -76,10 +77,11 @@ def run(output: Path, batch_size: int, workers: int, max_partitions: int | None,
         write_json_atomic(manifest, manifest_path)
     torch.set_num_threads(4)
     device = torch.device('cuda:0')
-    model = load_cell_dino_model(repo=Path(config['dinov2_repo']), hub_model=config['feature_extractor'],
-                                 weights=Path(config['weights']), device=device, precision=config['feature_precision'])
-    transform = build_cell_transform(repo=Path(config['dinov2_repo']), resize_size=config['resize_size'],
-                                     crop_size=config['crop_eval_size'])
+    if 'dinov2_source' in config:
+        require_dinov2_source(config['dinov2_source'])
+    model = load_cell_dino_model(hub_model=config['feature_extractor'], weights=Path(config['weights']),
+                                 device=device, precision=config['feature_precision'])
+    transform = build_cell_transform(resize_size=config['resize_size'], crop_size=config['crop_eval_size'])
     print(f'CUDA worker PID={os.getpid()} device={torch.cuda.get_device_name(device)}', flush=True)
     rois = {item['key']: item for item in prepared['rois']}
     count, written, ordinal = 0, 0, 0
