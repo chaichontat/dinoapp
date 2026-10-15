@@ -27,22 +27,20 @@ Torch, DINOv2, or OSQP. Native review requires Python 3.12 or newer. The marker 
 that is installed from there alongside this package.
 
 Use `[compute]` for encoder execution, spatial fitting, direct-Zarr preparation,
-and pixelwise regionprops measurements. Use `[workspace]` for H5AD and microscopy
-workspace commands. To install the complete workflow, install the local
-`fishtools` checkout in the same uv environment; it supplies the shared
-microscopy workspace, crop, and barrage readers. Run these commands from the
-`dinoinfer` repository root:
+and pixelwise regionprops measurements. The uv workspace resolves `squisher` and
+`squisher-segment` from GitHub. Run these commands from the `dinoinfer`
+repository root:
 
 ```bash
-uv venv
+uv sync --package thesis-dino --extra compute
 uv pip install --no-deps -e /home/chaichontat/dinov2
-uv pip install \
-  -e ./markers \
-  -e /home/chaichontat/fishtools2 \
-  -e /home/chaichontat/squisher/squisher \
-  -e /home/chaichontat/squisher/segment \
-  -e './dino[compute,workspace]'
 ```
+
+Use `[legacy]` for the H5AD pipeline (`dino train`, `infer`, `barrage`, `run`,
+`roc`, `rf-*`, `model-sweep`). It also needs the `fishtools` checkout, which
+supplies the microscopy workspace, crop, and barrage readers. fishtools requires
+NumPy 1 and squisher NumPy 2.4 or newer, so install it with `./dino[legacy]` in a
+separate environment.
 
 Cell-DINO requires the Cell-DINO DINOv2 checkout installed editable in the same environment and the selected Cell-DINO checkpoint. `--dinov2-repo` (or the path recorded in the model bundle) must identify that installed checkout: transforms are imported from the installed package, and model loading uses its local `hubconf.py`. The `--no-deps` install above preserves the environment's existing Torch stack; the checkout's legacy dependency pins should not replace it. The optional MNIST validation command requires DINOv3 to be importable in the environment.
 
