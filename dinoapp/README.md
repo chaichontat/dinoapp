@@ -37,8 +37,8 @@ forwarded to Streamlit.
    **BrdU− / EdU+**); the saved call is highlighted. A click saves the call and
    advances to the next cell, and clicking the call that is already saved writes
    nothing and advances. With three or more markers, set each marker with its `−`
-   or `+` control. The cell is saved as soon as every marker has a value that differs
-   from the saved call, without advancing. A cell with no saved call is never shown or
+   or `+` control. Once every marker is set, the cell is saved if the call differs
+   from the saved one, and the view does not advance. A cell with no saved call is never shown or
    filtered as all-negative; that state exists only after you save every marker as `−`.
 5. Use **Undo last edit** to reverse the most recent edit for the current review
    target. Its history is shared across crop, gallery, and spatial views in this
@@ -176,7 +176,7 @@ Choose the inference workflow that matches your trained model:
 For an existing direct-Zarr source and model, run:
 
 ```bash
-conda run -n multi dino-zarr infer \
+dino-zarr infer \
   --source-dir /path/to/prepared-source \
   --model-dir /path/to/trained-model \
   --out-dir /path/to/inference-output
@@ -192,7 +192,7 @@ when changing the model or inputs.
 For one H5AD dataset/ROI with explicit image stores, run:
 
 ```bash
-conda run -n multi dino infer \
+dino infer \
   --h5ad /path/to/cells.h5ad \
   --model-path /path/to/trained-bundle.joblib \
   --dataset DATASET --roi ROI \
@@ -233,19 +233,20 @@ Native review requires Python 3.12 or newer and, in the same environment,
 `markers/`, and the local `squisher` package. The native extra declares these
 dependencies; it uses DINO's source readers, fitted corrections, review artifact
 validation, and renderer. Encoder execution and fitting dependencies are only
-needed when running DINO's compute commands. On the configured lab host, use the
-existing `multi` environment:
+needed when running DINO's compute commands. Install squisher from GitHub first,
+because the PyPI `squisher` is an unrelated package:
 
 ```bash
-conda run -n multi python -m pip install --no-deps \
-  -e /home/chaichontat/squisher/squisher \
-  -e ../markers \
-  -e ../dino
-conda run -n multi python -m pip install -e '.[native]'
-DINO_REVIEW_CONFIG=/path/to/markers.json \
+python -m pip install \
+  "squisher @ git+https://github.com/chaichontat/squisher@4cd1423aaacedda1fe3f4326411455e271eaf872#subdirectory=squisher"
+python -m pip install -e ../markers -e ../dino -e '.[native]'
+DINO_REVIEW_CONFIG=/path/to/review-config.json \
 DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
-  conda run -n multi dinoapp --server.port 8502
+  dinoapp --server.port 8502
 ```
+
+`DINO_NATIVE_DATASET` names a target in the configuration file, here the `Prod3`
+target of the example below.
 
 ### Review targets
 
@@ -293,8 +294,11 @@ which owns the dataset's file layout below `root` and `review_root`:
 | `embedding_run` | Re-embedding run directory; required by `prod3_2` and `prod2_2`. |
 
 Relative paths resolve against the directory containing the file; absolute paths
-are used as written. Each target's `raw_channels` must cover the channel keys of
-this file and of the target's annotation directories. `review_targets` is read only
+are used as written. The file must be a complete marker configuration, but the
+reviewer takes each target's markers from the target's own directories, as
+described below. The file's reference and markers serve to check the targets:
+each target's `raw_channels` must map one raw array to each channel key of this
+file and of the target's annotation directories. `review_targets` is read only
 by the reviewer: `thesis-dino` ignores it and never stores it in a data
 directory, and the `markers.json` of a crop or annotation directory supplies only
 its markers. The [data format](docs/data-format.md#review-targets) lists the
@@ -315,8 +319,8 @@ that call. Clicking an already annotated cell selects it for inspection.
 With two markers, four buttons (**EdU only**, **BrdU only**, **Dual positive**,
 **Neither** by default) set the selected cell's call; a click saves it immediately
 unless it equals the saved call, which writes nothing. With three or more markers,
-use the `−` or `+` control of each marker; the call is saved as soon as every marker
-is set and differs from the saved call. The badge names the selected cell's state.
+use the `−` or `+` control of each marker; once every marker is set, the call is
+saved if it differs from the saved one. The badge names the selected cell's state.
 **Undo last edit** reverses the most recent saved edit.
 
 ### Native save locations
@@ -337,30 +341,16 @@ at the locations selected by the dataset adapter.
 
 ### Corrected images and model review
 
-Prod3 displays BrdU after its saved smooth BrdU/DAPI subtraction and periodic
-intensity correction. DAPI uses the recorded 405 nm source; the 561 nm anatomical
-image is a separate display channel. Spatial fields and selected-cell crops use
-the same pixel correction.
-
-Prod2-2 uses the reviewed ventricular surface, native segmentation, true DAPI,
-corrected BrdU, and saved hierarchical probabilities. Its active classifier and
-training review artifact are selected by `cell-review/current.json` under its
-review directory.
-
-Prod3-2 uses the recovered 405 nm DAPI fusion and postprocessed segmentation under
-`/warm/prod3-2-405-local3d-ls-z128-core80`, with the short-window 514 nm EdU fusion
-and baseline predictions under the target's `embedding_run`.
-Its spatial view uses the reviewed ventricular surface. The transferred baseline
-was trained on Prod2 cells: **Training miscalls** scope, **Training**, and **Validation**
-are empty for that baseline's Prod3-2 review. Use **All labeled** in a correction
-gallery to review saved Prod3-2 annotations against its predictions.
-
-The Prod3-2 barrage at
-`/working/eduseg/prod3-2/dino-prod3-2/barrage-cortex-v1` also displays corrected
-crops through **Crop directory**. Its `display.json` selects native corrected pixels for
-both marker galleries and combined cell review. This requires the native
-dependencies and recorded source data; the index, labels, and original PNGs
-are preserved.
+A target's spatial fields and selected-cell crops apply the same pixel
+corrections, those its adapter records for the dataset. A crop
+directory whose `display.json` selects native corrected pixels shows them in both
+marker galleries and combined cell review; this requires the native dependencies
+and recorded source data, and the index, labels, and original PNGs are preserved.
+A model trained on another dataset has no training rows in the reviewed one. Its
+**Training miscalls** scope, **Training**, and **Validation** are empty; use **All
+labeled** in a correction gallery to review saved annotations against its
+predictions. The lab's datasets are described in
+[docs/lab-notes.md](../docs/lab-notes.md).
 
 ## RHU2 spatial review
 
@@ -391,17 +381,17 @@ are opened read-only, and saved annotations take precedence over model calls.
 ### Prepare RHU2 metadata
 
 Preparation requires an existing native barrage conversion with `complete.json`
-and a validated RHU2 release. Use the native dependencies in the `multi`
-environment on the configured host:
+and a validated RHU2 release. Run it in an environment with the native
+dependencies:
 
 ```bash
-conda run -n multi python -m dinoapp.rhu2_prepare \
-  --review-root /working/chaichontat/rhu2-barrage-review \
-  --release /working/chaichontat/ccf_release_rhu2_map2
+python -m dinoapp.rhu2_prepare \
+  --review-root /path/to/rhu2-barrage-review \
+  --release /path/to/ccf_release_rhu2
 
 DINO_REVIEW_SOURCE=Barrage \
-DINO_REVIEW_BARRAGE_DIR=/working/chaichontat/rhu2-barrage-review \
-  conda run -n multi dinoapp --server.port 8504 --server.headless true
+DINO_REVIEW_BARRAGE_DIR=/path/to/rhu2-barrage-review \
+  dinoapp --server.port 8504 --server.headless true
 ```
 
 Run preparation once: it refuses to overwrite an existing spatial snapshot.

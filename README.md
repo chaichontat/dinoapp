@@ -46,15 +46,16 @@ packaged. The root `pyproject.toml` overrides its 2023 training pins.
 [dino/README.md](dino/README.md#installation) describes the checkpoint.
 
 With pip, `dino-markers` is not on PyPI and must be installed from `markers/` in
-the same command. The PyPI `squisher` and `dinov2` are unrelated packages, so
-install both from GitHub first when the native or compute extras need them.
+the same command. When the native or compute extras need `squisher` and `dinov2`,
+install them from GitHub first, at the commits the uv workspace pins, because the
+PyPI packages of those names are unrelated.
 Install `dinov2` with `--no-deps`, because its `setup.py` pins a 2023 Torch stack:
 
 ```bash
 python -m pip install -e ./markers -e ./dinoapp
 python -m pip install \
-  "squisher @ git+https://github.com/chaichontat/squisher#subdirectory=squisher" \
-  "squisher-segment @ git+https://github.com/chaichontat/squisher#subdirectory=segment"
+  "squisher @ git+https://github.com/chaichontat/squisher@4cd1423aaacedda1fe3f4326411455e271eaf872#subdirectory=squisher" \
+  "squisher-segment @ git+https://github.com/chaichontat/squisher@4cd1423aaacedda1fe3f4326411455e271eaf872#subdirectory=segment"
 python -m pip install --no-deps \
   "dinov2 @ git+https://github.com/chaichontat/dinov2@76d1757bbb72097b7f0126c4d0081f4fea483e67"
 python -m pip install -e ./markers -e './dino[compute]' -e './dinoapp[native]'
@@ -64,21 +65,22 @@ The `[legacy]` extras serve the H5AD pipeline (`dino train`, `infer`, `barrage`,
 `run`, `roc`, `rf-*`, `model-sweep`) and `dinoapp-legacy`. That pipeline also
 needs the fishtools package, which requires NumPy 1 and cannot share an
 environment with squisher (NumPy 2.4 or newer). Run it in a separate environment
-with fishtools installed.
+with fishtools installed ([legacy install](dino/README.md#installation)).
 
 ## Preparing data
 
 The direct Zarr workflow takes a segmentation label Zarr and one fused OME-Zarr
-per channel, all on the same voxel grid (or offset into the label grid with
-`--offset-zyx`). It runs in the `compute` environment:
+per channel on one voxel grid; the label grid may be a crop of it, placed by
+`--offset-zyx`. It runs in the `compute` environment:
 
 1. Write a `markers.json` if the markers are not BrdU and EdU with a PI
    reference ([format](dino/README.md#marker-configuration)). Keys must avoid the
    reserved names in `dino_markers.RESERVED_KEYS`, and marker order is part of
    every artifact's contract.
-2. `dino-zarr prepare --labels LABELS --channel KEY=PATH ... --out-dir SRC
-   [--markers markers.json]` binds one channel to each key of the reference and
-   every marker.
+2. `dino-zarr prepare --labels LABELS --channel KEY=PATH ... --offset-zyx Z Y X
+   --out-dir SRC [--markers markers.json]` binds one channel to each key of the
+   reference and every marker. `--offset-zyx` is required, `0 0 0` when the label
+   and fused grids coincide.
 3. `dino-zarr barrage --source-dir SRC --out-dir BARRAGE` samples cells and
    renders their crops. The barrage takes its markers from the source.
 4. Review the barrage in `dinoapp` (**Review target → Crop directory**), which
@@ -92,8 +94,9 @@ per channel, all on the same voxel grid (or offset into the label grid with
 A consuming command takes its markers from the artifacts it reads; `--markers`
 there only asserts that they match. [dino/README.md](dino/README.md#direct-zarr-workflow)
 gives complete commands, sharding, and resume behavior. Native review of the
-production datasets (`DINO_REVIEW_SOURCE="Native fields"`) is described in
-[dinoapp/README.md](dinoapp/README.md).
+datasets listed in a review configuration (`DINO_REVIEW_CONFIG`) is described in
+[dinoapp/README.md](dinoapp/README.md#native-spatial-review), and the lab's
+datasets and runs in [docs/lab-notes.md](docs/lab-notes.md).
 
 ```bash
 export DINO_REVIEW_BARRAGE_DIR=/path/to/barrage
@@ -109,8 +112,8 @@ dependencies:
 
 ```bash
 python -m pip install --no-deps -e ./markers -e './dino[dev]' -e './dinoapp[dev]'
-conda run -n seq pytest dino/tests/test_cli.py dino/tests/test_zarr_cli.py dinoapp/tests/test_label_store.py
-conda run -n seq ruff check dino/dino/roc.py
+python -m pytest dino/tests/test_cli.py dino/tests/test_zarr_cli.py dinoapp/tests/test_label_store.py
+ruff check path/to/changed_file.py
 ```
 
 The test directories of all three packages are configured at the root. Run focused tests for

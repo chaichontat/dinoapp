@@ -16,13 +16,14 @@ The package owns the complete barrage and classification workflow under one `din
 - `dino rf-train`: fit the classical random-forest model bundle
 - `dino run`: run inference across several datasets
 - `dino roc`: render ROC curves from inference outputs
+- `dino periodic`: fit and apply [shared periodic intensity correction](#shared-periodic-intensity-correction)
 - `dino mnist`: run the standalone DINOv3 MNIST validation experiment
 
 ## Installation
 
 The base installation provides source and crop readers, fitted pixel corrections,
 review artifact validation, and crop rendering. It does not install the reviewer,
-Torch, DINOv2, or OSQP. Native review requires Python 3.12 or newer. The marker definitions come from the
+Torch, DINOv2, or OSQP. `thesis-dino` requires Python 3.12 or newer. The marker definitions come from the
 `dino-markers` package in the repository's `markers/` directory, a core dependency
 that is installed from there alongside this package.
 
@@ -38,12 +39,25 @@ uv sync --package thesis-dino --extra compute
 ```
 
 Use `[legacy]` for the H5AD pipeline (`dino train`, `infer`, `barrage`, `run`,
-`roc`, `rf-*`, `model-sweep`). It also needs the `fishtools` checkout, which
+`roc`, `rf-*`, `model-sweep`). It also needs the `fishtools` package, which
 supplies the microscopy workspace, crop, and barrage readers. fishtools requires
-NumPy 1 and squisher NumPy 2.4 or newer, so install it with `./dino[legacy]` in a
-separate environment.
+NumPy 1, but `squisher`, a core dependency of this package, requires NumPy 2.4 or
+newer. The legacy commands do not import squisher. Install them in a separate
+environment that already has fishtools and the other core dependencies, without
+dependency resolution:
 
-Cell-DINO requires the selected Cell-DINO checkpoint and `dinov2` installed from a git commit; models and transforms load from the installed package. Model bundles record that installation as `dinov2_source` (git URL and commit), and inference refuses a bundle whose `dinov2_source` differs from the installed `dinov2`. Bundles and feature caches that record only `model_source_sha256` load without a source check. Outside the uv workspace, install it with `pip install --no-deps "dinov2 @ git+https://github.com/chaichontat/dinov2@76d1757bbb72097b7f0126c4d0081f4fea483e67"`; `--no-deps` preserves the environment's Torch stack. The optional MNIST validation command requires DINOv3 to be importable in the environment.
+```bash
+python -m pip install --no-deps -e ./markers -e ./dino
+python -m pip install anndata tifffile
+```
+
+Cell-DINO requires the ViT-L/16 checkpoint trained on HPA single cells,
+`cell_dino_vitl16_pretrain_hpa_sc-d3ab8938.pth`, from Meta's
+[Cell-DINO downloads](https://ai.meta.com/resources/models-and-libraries/cell-dino-downloads/).
+`dino train` and `dino-zarr train` read it from `~/cell_dino_vitl16_pretrain_hpa_sc-d3ab8938.pth`
+unless `--weights` names another path.
+
+Cell-DINO also requires `dinov2` installed from a git commit; models and transforms load from the installed package. Model bundles record that installation as `dinov2_source` (git URL and commit), and inference refuses a bundle whose `dinov2_source` differs from the installed `dinov2`. Bundles and feature caches that record `model_source_sha256` instead load without a source check, and a bundle that records neither is rejected and must be retrained. Outside the uv workspace, install it with `pip install --no-deps "dinov2 @ git+https://github.com/chaichontat/dinov2@76d1757bbb72097b7f0126c4d0081f4fea483e67"`; `--no-deps` preserves the environment's Torch stack. The optional MNIST validation command requires DINOv3 to be importable in the environment.
 
 ## Marker configuration
 
@@ -145,7 +159,7 @@ artifact's contract, and it never reinterprets the artifact.
 | `dino-zarr periodic fit` | Defines the fitted targets, in order | The file, or the packaged default |
 | `dino-zarr periodic apply`, `measure` | none | The field bundle's `targets` and the classifier's contract, which must agree |
 | `dino clean-labels` | none | The barrage directory, under the label-file lock |
-| `python -m dino.cortex_score`, `dino.joint_train`, `dino.review_activation` | none | The bundles and records they read |
+| `python -m dino.cortex_score`, `python -m dino.joint_train`, the `dino.review_activation.activate()` API | none | The bundles and records they read |
 
 A source prepared with `--markers` carries that file as `markers.json` beside
 `source.json`, and a barrage carries the resolved configuration as `markers.json`
@@ -214,7 +228,7 @@ EdU only and run under the default contract.
 Training expects a barrage directory containing `index.csv` and `labels.csv`. Generate and label it with:
 
 ```bash
-dino barrage --out-dir output/brdu_edu_barrage
+dino barrage --h5ad /path/to/cells.h5ad --out-dir output/brdu_edu_barrage
 DINO_REVIEW_BARRAGE_DIR=output/brdu_edu_barrage dino label
 ```
 
@@ -230,13 +244,15 @@ The adapters, renderer, label store, legacy labeler, and reviewer tests are
 maintained in `dinoapp`; no reviewer source files are retained in this package.
 The native mode uses this package's existing crop readers and barrage renderer.
 
-From the repository root, install `dinoapp` in the same environment:
+From the repository root, install `dinoapp` in the same environment and launch
+native review. `DINO_NATIVE_DATASET` must name one of the `review_targets` in the
+file given by `DINO_REVIEW_CONFIG`:
 
 ```bash
-conda run -n multi python -m pip install --no-deps -e './dinoapp[native]'
-DINO_REVIEW_CONFIG=/path/to/markers.json \
-DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
-  conda run -n multi dinoapp --server.port 8502
+python -m pip install -e ./markers -e './dinoapp[native]'
+DINO_REVIEW_CONFIG=/path/to/review-config.json \
+DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=TARGET \
+  dinoapp --server.port 8502
 ```
 
 For every labeled cell, training reads its registered fused image and segmentation, masks the crop to the target cell, and places each marker's input channels in the model channels. The frozen backbone produces features; separate cross-validated logistic regressions classify each marker. The held-out test fraction defaults to 20%.
@@ -269,19 +285,20 @@ dino run --h5ad /path/to/cells.h5ad
 
 dino roc \
   --labels-csv output/brdu_edu_barrage/labels.csv \
-  --dinoinfer-dir /path/to/dinoinfer \
+  --dinoinfer-dir /path/to/inference-outputs \
   --bundle-path output/brdu_edu_barrage/brdu_edu_cell_dino_hpa_vitl16_logreg.joblib
 ```
 
-Inference writes `brdu_prob` and `edu_prob`. For a single dataset/ROI, pass the
+Inference writes `brdu_prob` and `edu_prob`. `dino run` writes one Parquet
+table per dataset to `~/nvme/dinoinfer`, and `dino roc --dinoinfer-dir` reads every
+Parquet table in the directory it names (by default the same one). For a single dataset/ROI, pass the
 exact fused and segmentation stores together so inference does not rediscover
 them from global workspace roots. Outputs include model and input provenance
 and refuse to overwrite an existing destination. Legacy `dino infer --skip-existing`
 assumes the image and segmentation stores are immutable. Use a fresh output
 destination after changing either store; this path does not detect in-place
 pixel or label changes. Feature caches are bound to
-the checkpoint, the installed `dinov2` commit, preprocessing, and masked-cell inputs;
-bundles created before that metadata was added must be retrained.
+the checkpoint, the installed `dinov2` commit, preprocessing, and masked-cell inputs.
 
 Held-out ROC evaluation requires the bundle's saved `train_cells` and
 `test_cells`; counts alone cannot reconstruct membership. Supplying a bundle
@@ -319,19 +336,21 @@ Prepare the globally reconciled masked labels once, then generate the barrage wi
 
 ```bash
 dino-zarr prepare \
-  --labels /working/eduseg/20260808-prod2/cp-large/masked/labels.zarr \
-  --channel pi=/working/eduseg/20260808-prod2/234-3-514561638/fusion-405-l0-g20-d40/fused.ch0.ome.zarr \
-  --channel edu=/working/eduseg/20260808-prod2/234-3-514561638/fusion-514-l0-t1k/fused.ch0.ome.zarr \
-  --channel brdu=/working/eduseg/20260808-prod2/234-3-514561638/fusion-638-l0/fused.ch1.ome.zarr \
-  --offset-zyx 0 4304 2911 \
-  --out-dir /working/eduseg/20260808-prod2/dino-src
+  --labels /path/to/labels.zarr \
+  --channel pi=/path/to/fusion-405/fused.ch0.ome.zarr \
+  --channel edu=/path/to/fusion-514/fused.ch0.ome.zarr \
+  --channel brdu=/path/to/fusion-638/fused.ch0.ome.zarr \
+  --offset-zyx 0 0 0 \
+  --out-dir /path/to/dino-src
 
 dino-zarr barrage \
-  --source-dir /working/eduseg/20260808-prod2/dino-src \
-  --out-dir /working/eduseg/20260808-prod2/dino-barrage
+  --source-dir /path/to/dino-src \
+  --out-dir /path/to/dino-barrage
 ```
 
-`--channel KEY=PATH` is repeated once for each key of the marker contract, the
+`--offset-zyx` is required. It gives the voxel position of the label grid's
+origin in the fused channel grid, `0 0 0` when the two grids coincide, and the
+label grid must lie inside the fused grid. `--channel KEY=PATH` is repeated once for each key of the marker contract, the
 reference and every marker, so the keys must equal that set exactly. With
 `--markers PATH`, the file defines the source (for example the three-marker
 configuration above with `--channel dapi=... --channel edu=... --channel brdu=...
@@ -352,18 +371,18 @@ together to specify the cell namespace when the storage path does not follow
 the dataset/ROI layout. A new segmentation requires a new ROI namespace.
 
 Launch `dinoapp` or the `dino label` compatibility command, choose **Review target → Crop directory**, and enter
-`/working/eduseg/20260808-prod2/dino-barrage` in the **Barrage directory** field. Once
+`/path/to/dino-barrage` in the **Barrage directory** field. Once
 annotations are complete:
 
 ```bash
 dino-zarr train \
-  --barrage-dir /working/eduseg/20260808-prod2/dino-barrage \
-  --out-dir /working/eduseg/20260808-prod2/dino-model
+  --barrage-dir /path/to/dino-barrage \
+  --out-dir /path/to/dino-model
 
 dino-zarr infer \
-  --source-dir /working/eduseg/20260808-prod2/dino-src \
-  --model-dir /working/eduseg/20260808-prod2/dino-model \
-  --out-dir /working/eduseg/20260808-prod2/dino-infer
+  --source-dir /path/to/dino-src \
+  --model-dir /path/to/dino-model \
+  --out-dir /path/to/dino-infer
 ```
 
 `--input-channel TARGET=CHANNEL` names the source channels that fill a marker's
@@ -549,16 +568,13 @@ The installed owner `dino.spatial_subtraction_workflow` runs the established
 paired raw-voxel workflow for an explicit directory and filename prefix:
 
 ```sh
-python -m dino.spatial_subtraction_workflow benchmark \
-  --output-dir thesis/output/prod2_brdu_dapi_subtraction --prefix prod2
-python -m dino.spatial_subtraction_workflow run \
-  --output-dir thesis/output/prod2_brdu_dapi_subtraction --prefix prod2
+python -m dino.spatial_subtraction_workflow benchmark --output-dir OUT --prefix PREFIX
+python -m dino.spatial_subtraction_workflow run --output-dir OUT --prefix PREFIX
 ```
 
-Use `multi` and persistent tmux for fitting. Package callers construct
-`WorkflowConfig(output_dir=Path(...), prefix="prod2")` and call `benchmark(config)`
-or `run(config)`. The original prod3 `smooth_subtraction.py benchmark|run`
-launcher calls these APIs with its existing directory/prefix.
+Run fitting in a persistent terminal session such as tmux. Package callers construct
+`WorkflowConfig(output_dir=Path(...), prefix="...")` and call `benchmark(config)`
+or `run(config)`.
 
 Inputs are `<prefix>_cortex_samples.parquet`,
 `<prefix>_cortex_global_training_samples.parquet`, and four supplied
@@ -588,38 +604,23 @@ Numerical precision can be set explicitly with
 `--solver-absolute-tolerance` and `--solver-relative-tolerance`, or the matching
 `WorkflowConfig` fields. These settings apply uniformly to the benchmark,
 inner candidates, outer fits and final fit; the statistical objective and
-independent acceptance gate remain unchanged. Prod2's 3,000-row benchmark
-required tighter precision:
-
-```sh
-python -m dino.spatial_subtraction_workflow run \
-  --output-dir thesis/output/prod2_brdu_dapi_subtraction --prefix prod2 \
-  --solver-absolute-tolerance 5e-5 --solver-relative-tolerance 1e-7 \
-  --solver-max-iterations 180000 --solver-time-limit 600
-```
-
-At those settings the exact failed benchmark passed with status `solved`,
-4,075 iterations, 0.7195 s solver time, raw primal infeasibility 1.28786e-11,
-relative objective gap 5.57510e-15 and mean-objective gap 2.27374e-13 raw
-intensity units. The preceding default-precision result had been rejected by
-the unchanged 1e-5 relative-gap gate. A cached fit made at looser precision
-than requested raises an explicit error rather than being silently reused or
-refitted. Accepted fits at equal or tighter precision remain reusable; prod3
-default settings are preserved.
+independent acceptance gate remain unchanged. A cached fit made at looser
+precision than requested raises an explicit error rather than being silently
+reused or refitted. Accepted fits at equal or tighter precision remain reusable.
 
 Iteration and time budgets are explicit `WorkflowConfig.solver_max_iter` /
 `solver_time_limit` fields and CLI `--solver-max-iterations` /
-`--solver-time-limit` options. Defaults remain 60,000 iterations and 240 s.
+`--solver-time-limit` options, with defaults of 60,000 iterations and 240 s.
 Increasing these budgets preserves already accepted checkpoints; it does not
-change the objective, precision or acceptance gate. Prod2 outer fold 1,
-inner fold 2 at lambda 0.1 exhausted the default iteration cap. Its exact
-33,161-row training subset passed with a 180,000 iteration/600 s budget at
-the same tighter tolerances: status `solved`, 68,125 iterations, 227.3825 s
-solver time, 227.4970 s fit wall time, raw primal infeasibility 0.0496028893,
-relative gap 6.531607e-8 and mean-objective gap 0.00000262611 raw intensity
-units. Benchmark process peak RSS was 416,428 KiB. Subsequent prod2 fits use
-the larger explicit budget; prior accepted models retain their own recorded
-solver budgets and are reused exactly.
+change the objective, precision or acceptance gate. Accepted models retain their
+own recorded solver budgets and are reused exactly. A run with tighter precision
+and a larger budget is:
+
+```sh
+python -m dino.spatial_subtraction_workflow run --output-dir OUT --prefix PREFIX \
+  --solver-absolute-tolerance 5e-5 --solver-relative-tolerance 1e-7 \
+  --solver-max-iterations 180000 --solver-time-limit 600
+```
 
 Outputs use `<prefix>_smooth_*`: inner-fold assignments, each candidate's
 model/solver/prediction/metric checkpoints, tuning tables and selection JSON;
@@ -627,20 +628,18 @@ four outer models/predictions/metrics; combined held-out predictions and
 XY/depth metrics; `<prefix>_smooth_final_model.joblib` and the run record.
 Existing accepted checkpoints and selections resume in their original names.
 The directory must belong to one fixed input roster; this workflow does not
-rebind existing checkpoints to changed input tables. The launcher owns logs,
+rebind existing checkpoints to changed input tables. The caller owns logs,
 completion signaling and upstream source provenance.
 
 Validate the saved fits without refitting:
 
 ```sh
-python -m dino.spatial_subtraction_validation \
-  --output-dir thesis/output/prod2_brdu_dapi_subtraction --prefix prod2
+python -m dino.spatial_subtraction_validation --output-dir OUT --prefix PREFIX
 ```
 
 The package API is `validate(output_dir: Path, prefix: str)`. An explicit
 `destination_dir=Path(...)` (CLI `--destination-dir`) redirects the validation
 outputs to an existing directory while leaving the input artifacts untouched.
-The original prod3 validation launcher uses this same owner.
 
 Validation checks all 45 inner candidates, four outer models and the final
 model against their exact training domains, sample counts, nonnegative finite
@@ -725,15 +724,29 @@ cutoff per marker is chosen on it. `metrics.json` also reports out-of-fold
 metrics per dataset. Within one dataset the intercept and other-dataset columns
 are constant, so `OUT/deploy/<dataset>/model.joblib` stores the exactly
 collapsed `dino-knn-intensity-v2` bundle for that dataset with the marker
-contract of the embedding bundle; the scorers read it directly. Example: `/working/eduseg/prod2-prod3-joint/config.json`.
-`--workers` sets the processes for reading labeled embeddings and for the
+contract of the embedding bundle; the scorers read it directly.
+The config is a JSON object with `seed`, `validation_cells`, `context_features`,
+and `datasets`, a list of at least two uniquely named entries. Each entry has
+`name`, `tranches` (labeled barrage directories), `embedding_run`,
+`embedding_model`, `intensity_props`, `intensity_provenance`, `dapi_props`, and
+`scale_zyx_um`. `--workers` sets the processes for reading labeled embeddings and for the
 single-threaded logistic fits (C search, final and out-of-fold fits); results
 are identical for any worker count.
 
-`python -m dino.cortex_score` takes the arguments of
-`full-run2/score-cortex.py` plus `--workers N` and writes the same prediction
-parquets with their provenance and `complete.json`, scoring partitions in
-parallel worker processes. Its prediction files hold `p_k` and `k` for each marker, in the
+`python -m dino.cortex_score` rescores the persisted embeddings of every cortical
+cell with a classifier bundle, scoring partitions in parallel worker processes:
+
+```sh
+python -m dino.cortex_score --model CLASSIFIER.joblib \
+  --embedding-model EMBEDDING_BUNDLE.joblib --embedding-run EMBEDDING_RUN \
+  --cortex-props CORTEX_PROPS --labeled-cells LABELS.csv \
+  --output-dir OUT --workers N
+```
+
+`--embedding-run` holds the `shard-*` directories of `dino-zarr infer
+--store-embeddings` runs made with `--embedding-model`. `--cortex-props` is a
+Parquet table whose `label` and `inside_cortex` columns select the cortical cells,
+and the cells of `--labeled-cells` are excluded from scoring. Its prediction files hold `p_k` and `k` for each marker, in the
 contract order of the classifier bundle, and `complete.json` records
 `dino-cortex-rescore-v2` with `marker_contract` and a `<key>_positive`
 count for each marker. It does not copy embeddings into the output
