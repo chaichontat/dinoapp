@@ -73,7 +73,10 @@ with tempfile.TemporaryDirectory(prefix='dinoapp-plain-review-') as scratch:
     assert not review.exception, review.exception
     next(widget for widget in review.selectbox if widget.label == 'Review view').select('Cell review').run()
     assert not review.exception, review.exception
-    next(widget for widget in review.button if widget.label == 'BrdU− / EdU−').click().run()
+    for label in ('EdU', 'BrdU'):
+        next(widget for widget in review.segmented_control if widget.label == label).set_value(0).run()
+        assert not review.exception, review.exception
+    next(widget for widget in review.button if widget.label == 'Save and next').click().run()
     assert not review.exception, review.exception
     assert 'plain|1,0,0' in (root / 'labels.csv').read_text()
     context, = review.session_state.review_contexts.values()

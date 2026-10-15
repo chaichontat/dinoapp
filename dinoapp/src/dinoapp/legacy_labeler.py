@@ -20,6 +20,7 @@ from fishtools.brdu.features import (
     features_array_from_row,
 )
 from fishtools.brdu.model import BrduEduModelBundle, save_model_bundle
+from dino_markers import DEFAULT_CONTRACT
 from dinoapp.label_store import LabelConflictError, load_labels as _load_labels, update_label
 
 
@@ -575,7 +576,7 @@ def main() -> None:
                             ):
                                 if not label_prev_cells or label_prev_cells[-1] != current_cell:
                                     label_prev_cells.append(current_cell)
-                                update_label(labels_path, current_cell, (brdu_val, edu_val))
+                                update_label(labels_path, current_cell, (brdu_val, edu_val), contract=DEFAULT_CONTRACT)
                                 del st.session_state["current_cell"]
                                 st.rerun()
 
@@ -646,7 +647,7 @@ def main() -> None:
                 if st.button("Undo", disabled=not history, key="gallery_undo"):
                     cell, previous, saved = history[-1]
                     try:
-                        update_label(labels_path, cell, previous, expected=saved)
+                        update_label(labels_path, cell, previous, contract=DEFAULT_CONTRACT, expected=saved)
                     except LabelConflictError as exc:
                         st.error(str(exc))
                     else:
@@ -674,7 +675,7 @@ def main() -> None:
                             width="stretch",
                         ):
                             try:
-                                update_label(labels_path, cell, target, expected=value)
+                                update_label(labels_path, cell, target, contract=DEFAULT_CONTRACT, expected=value)
                             except LabelConflictError as exc:
                                 st.error(str(exc))
                             else:
@@ -749,7 +750,7 @@ def main() -> None:
                     )
 
                     if st.button("Save edit", type="primary"):
-                        update_label(labels_path, cell, (brdu_val, edu_val))
+                        update_label(labels_path, cell, (brdu_val, edu_val), contract=DEFAULT_CONTRACT)
                         st.session_state["review_next_cell"] = cells[min(i + 1, len(cells) - 1)]
                         st.rerun()
 
@@ -900,7 +901,7 @@ def main() -> None:
                         )
 
                         if st.button("Save edit", type="primary", key="audit_save"):
-                            update_label(labels_path, cell, (brdu_val, edu_val))
+                            update_label(labels_path, cell, (brdu_val, edu_val), contract=DEFAULT_CONTRACT)
                             st.session_state["audit_next_cell"] = cells[min(i + 1, len(cells) - 1)]
                             st.rerun()
 

@@ -3,6 +3,7 @@ import json
 
 import pandas as pd
 import pytest
+from dino_markers import DEFAULT_CONTRACT
 
 from dino.artifacts import file_sha256
 from dinoapp.review_predictions import load_review_predictions
@@ -26,7 +27,9 @@ def review_artifacts(tmp_path):
 
 def test_final_fit_review_has_all_training_rows_and_no_invented_holdout(review_artifacts):
     manifest_path, _, _, _ = review_artifacts
-    rows = load_review_predictions(manifest_path, cell_prefix='prod3', model_sha256='selected')
+    rows = load_review_predictions(
+        manifest_path, cell_prefix='prod3', model_sha256='selected', contract=DEFAULT_CONTRACT
+    )
     assert rows.cell.tolist() == ['prod3|10', 'prod3|20']
     assert rows.split.tolist() == ['training', 'training']
     assert rows.p_edu.tolist() == [.9, .2]
@@ -51,7 +54,9 @@ def test_invalid_review_rows_fail_at_load_boundary(review_artifacts, invalid):
     manifest['predictions_sha256'] = file_sha256(path)
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError):
-        load_review_predictions(manifest_path, cell_prefix='prod3', model_sha256='selected')
+        load_review_predictions(
+            manifest_path, cell_prefix='prod3', model_sha256='selected', contract=DEFAULT_CONTRACT
+        )
 
 
 @pytest.mark.parametrize('artifact', ['model_binding', 'predictions'])
@@ -63,4 +68,6 @@ def test_mutated_binding_or_predictions_are_rejected(review_artifacts, artifact)
         manifest['model_sha256'] = 'different'
         manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='classifier|identity'):
-        load_review_predictions(manifest_path, cell_prefix='prod3', model_sha256='selected')
+        load_review_predictions(
+            manifest_path, cell_prefix='prod3', model_sha256='selected', contract=DEFAULT_CONTRACT
+        )

@@ -13,16 +13,18 @@ import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import zarr
+from dino_markers import cutoff_key, probability_column
 from skimage.segmentation import find_boundaries
 
 from dinoapp.native import (
     AnnotationFiles as AnnotationFiles,
     Field,
-    combined_uncertainty,
+    adapter_config,
+    classifier_caption,
     load_prediction_pointer,
-    render_brdu_crop,
-    render_edu_crop,
+    prediction_contract,
     render_field as render_field,
+    render_marker_crop,
     sample_center,
     read_cell_geometry,
     FieldSource as NativeFieldSource,
@@ -36,15 +38,27 @@ from dinoapp.native_geometry import mesh_vertex_normals as vertex_normals
 
 ROOT = Path("/working/eduseg/prod3")
 REVIEW_ROOT = ROOT / "dino-prod3-realigned-v1"
+
+
 class FieldSource(NativeFieldSource):
     """Read prod3 native pixels, calls, uncertainty, and reviewed VZ/SVZ boundaries."""
 
     display_name = "Prod3 native"
+    dataset_name = "Prod3"
     cell_prefix = "prod3-realigned-v1"
-    anatomy_channel = "561"
+    raw_channels = {"561": "pi", "BrdU": "brdu", "EdU": "edu"}
+
+    @classmethod
+    def annotation_directories(cls, root: Path | None = None) -> tuple[Path, ...]:
+        return (REVIEW_ROOT / "barrage-cortex-v1", REVIEW_ROOT / "barrage-vz-svz-v1")
 
     def __init__(self, root: Path = ROOT):
         self.root = root
+        self.annotation_paths = tuple(directory / "labels.csv" for directory in self.annotation_directories(root))
+        self.default_annotation_path = self.annotation_paths[-1]
+        self.config = adapter_config(
+            self.default_annotation_path.parent, self.raw_channels, adapter=self.dataset_name
+        )
         source_path = REVIEW_ROOT / "source/source.json"
         source = json.loads(source_path.read_text())
         labels_meta = source["labels"]
@@ -82,6 +96,7 @@ class FieldSource(NativeFieldSource):
             raise ValueError("Prod3 postprocessed labels and native microscopy grids differ")
 
         self.display_pixels = DisplayPixels(REVIEW_ROOT / "model/model.joblib", REVIEW_ROOT / "source")
+        self._require_contract(self.display_pixels.contract, actual_from=str(self.display_pixels.model_path))
         self.display_pixels.validate_native_grid(
             labels=labels_meta["root"], shape=self.shape, scale=self.scale, origin=self.origin,
         )
@@ -90,10 +105,8 @@ class FieldSource(NativeFieldSource):
         self.crop_reader = CellCropReader(
             labels=self.labels,
             channels={
-                "pi": self.arrays["561"],
+                **{key: self.arrays[name] for name, key in self.raw_channels.items()},
                 "dapi": self.display_pixels.source.channels["pi"],
-                "edu": self.arrays["EdU"],
-                "brdu": self.arrays["BrdU"],
             },
             offset_zyx=(0, 0, 0),
             cache_bytes=4
@@ -138,56 +151,31 @@ class FieldSource(NativeFieldSource):
             )
         self.layer_path = REVIEW_ROOT / "vz-layers/cells.parquet"
 
-        _, prediction_dir, prediction_manifest, prediction_contract = (
+        _, prediction_dir, prediction_manifest, prediction_record = (
             load_prediction_pointer(REVIEW_ROOT / "cell-review/current.json")
         )
-        frame = ds.dataset(prediction_dir, format="parquet").to_table(
-            columns=["label", "cell", "brdu", "edu", "p_brdu", "p_edu"]
-        ).to_pandas()
-        if frame.label.duplicated().any() or frame[["brdu", "edu"]].isna().any().any():
-            raise ValueError("Prod3 prediction identities must be unique and complete")
-        if not frame.cell.equals(self.cell_prefix + "|" + frame.label.astype(str)):
-            raise ValueError("Prod3 prediction cell identities do not match labels")
-
-        self.calls = np.full(int(frame.label.max()) + 1, 4, dtype=np.uint8)
-        self.calls[frame.label] = (
-            frame.edu.to_numpy(dtype=np.uint8)
-            + 2 * frame.brdu.to_numpy(dtype=np.uint8)
+        self._require_contract(
+            prediction_contract(prediction_record, where=str(prediction_manifest)),
+            actual_from=str(prediction_manifest),
         )
-        uncertainty = combined_uncertainty(
-            frame.p_brdu.to_numpy(),
-            frame.p_edu.to_numpy(),
-            brdu_threshold=float(prediction_contract["brdu_cutoff"]),
-            edu_threshold=float(prediction_contract["edu_cutoff"]),
-        )
-        self.uncertainty = np.full(len(self.calls), np.nan, dtype=np.float32)
-        self.uncertainty[frame.label] = uncertainty
-        finite = np.log1p(uncertainty[np.isfinite(uncertainty)])
-        self.uncertainty_log_vmax = float(np.quantile(finite, 0.999))
-        self.model_version = str(prediction_contract["model_sha256"])[:12]
+        markers = self.config.contract.markers
+        columns = ["label", "cell", *markers, *(probability_column(marker) for marker in markers)]
+        frame = ds.dataset(prediction_dir, format="parquet").to_table(columns=columns).to_pandas()
+        cutoffs = {marker: float(prediction_record[cutoff_key(marker)]) for marker in markers}
+        self._adopt_model_calls(frame, cutoffs=cutoffs, cell_prefix=self.cell_prefix)
+        self.model_version = str(prediction_record["model_sha256"])[:12]
         self.prediction_manifest = str(prediction_manifest)
-        self.classifier_caption = (
-            f"Classifier {str(prediction_contract['model_sha256'])[:12]} · "
-            f"BrdU cutoff {float(prediction_contract['brdu_cutoff']):.10f} · "
-            f"EdU cutoff {float(prediction_contract['edu_cutoff']):.10f}"
-        )
-        self.training_review_manifest = str(prediction_contract["review_manifest"])
+        self.classifier_caption = classifier_caption(self.model_version, self.config, cutoffs)
+        self.training_review_manifest = str(prediction_record["review_manifest"])
         self.training_predictions = load_review_predictions(
             Path(self.training_review_manifest), cell_prefix=self.cell_prefix,
-            model_sha256=str(prediction_contract["model_sha256"]),
+            model_sha256=str(prediction_record["model_sha256"]), contract=self.config.contract,
         )
-        self.annotation_paths = (
-            REVIEW_ROOT / "barrage-cortex-v1/labels.csv",
-            REVIEW_ROOT / "barrage-vz-svz-v1/labels.csv",
-        )
-        self.default_annotation_path = self.annotation_paths[-1]
-        self.contrast = np.asarray(
-            [
-                [787.3379356892904, 28686.583613151608],
-                [0.0, self.crop_contract["display_max"]["brdu"]],
-                [0.0, self.crop_contract["display_max"]["edu"]],
-            ]
-        )
+        display_max = self.crop_contract["display_max"]
+        self.contrast = {
+            self.config.reference.key: (787.3379356892904, 28686.583613151608),
+            **{marker: (0.0, display_max[marker]) for marker in markers},
+        }
         print(
             f"Ready: {len(frame):,} prod3 model calls; default Z={self.default_z:.3f} µm",
             flush=True,
@@ -220,7 +208,6 @@ class FieldSource(NativeFieldSource):
     @lru_cache(maxsize=32)
     def cell_crop(self, label: int):
         from dino.crop_rendering import render_crop
-        from dino_markers import default_config
 
         crop, plane_z = self._read_cell_crop(label)
         output = io.BytesIO()
@@ -228,19 +215,19 @@ class FieldSource(NativeFieldSource):
             crop,
             cell=self.cell_id(label),
             display_max=self.crop_contract["display_max"],
-            panels=default_config().panels,
+            panels=self.config.panels,
         ).save(output, format="PNG")
         return output.getvalue(), plane_z
 
-    @lru_cache(maxsize=64)
-    def edu_cell_crop(self, label: int):
+    @lru_cache(maxsize=128)
+    def marker_crop(self, label: int, marker: str):
+        if marker not in self.config.contract.markers:
+            raise ValueError(f"Unexpected crop marker: {marker}")
         crop, plane_z = self._read_cell_crop(label)
-        return render_edu_crop(crop, self.crop_contract["display_max"]["edu"]), plane_z
-
-    @lru_cache(maxsize=64)
-    def brdu_cell_crop(self, label: int):
-        crop, plane_z = self._read_cell_crop(label)
-        return render_brdu_crop(crop, self.crop_contract["display_max"]["brdu"]), plane_z
+        image = render_marker_crop(
+            crop, marker, self.crop_contract["display_max"][marker], label=self.config.label(marker)
+        )
+        return image, plane_z
 
     @lru_cache(maxsize=8)
     def contours_at(self, z_index: int) -> list[np.ndarray]:
@@ -280,7 +267,7 @@ class FieldSource(NativeFieldSource):
         scale_xy, origin_xy = self.scale[:0:-1], self.origin[:0:-1]
         contours = self.contours_at(zi)
         selection = (zi, slice(lo[1], hi[1]), slice(lo[0], hi[0]))
-        images = {name: np.asarray(array[selection]) for name, array in self.arrays.items()}
+        images = {self.raw_channels[name]: np.asarray(array[selection]) for name, array in self.arrays.items()}
         images = self.display_pixels.field_images(images, selection)
         mask = np.asarray(self.labels[selection])
         ids, inverse = np.unique(mask, return_inverse=True)
@@ -301,7 +288,6 @@ class FieldSource(NativeFieldSource):
             position,
             contours,
             boundary_info,
-            anatomy_channel=self.anatomy_channel,
         )
 
     def _field_boundary_info(self, labels: list[int]) -> dict[int, dict[str, object]]:

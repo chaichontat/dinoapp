@@ -9,13 +9,20 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dino_markers import (
+    SPATIAL_REVIEW,
+    MarkerConfig,
+    probability_column,
+    require_same_contract,
+    resolve_directory,
+    rhu2_probability_column,
+)
 from skimage.segmentation import find_boundaries
 import zarr
 
-from dinoapp.native import Field, FieldSource, combined_uncertainty
+from dinoapp.native import Field, FieldSource, load_model_calls
 from dinoapp.sources import Crop
 from dino.crop_rendering import render_crop
-from dino_markers import default_config
 from dino.zarr_source import CellCrop
 
 
@@ -42,8 +49,24 @@ class SpatialSource:
         self.root = root.resolve()
         manifest_path = self.root / 'spatial.json'
         self.manifest = json.loads(manifest_path.read_text())
-        if self.manifest['artifact'] != 'rhu2-spatial-review-v1':
+        if not SPATIAL_REVIEW.recognizes(self.manifest):
             raise ValueError('Not an RHU2 spatial review manifest')
+        self.config = resolve_directory(self.root)
+        require_same_contract(
+            self.config.contract, SPATIAL_REVIEW.contract(self.manifest, where=str(manifest_path)),
+            expected_from=f'the annotations in {self.root}', actual_from=str(manifest_path),
+        )
+        markers = self.config.contract.markers
+        if self.manifest['probability_columns'] != [rhu2_probability_column(marker) for marker in markers]:
+            raise ValueError(
+                f"{manifest_path}: probability_columns {self.manifest['probability_columns']} "
+                f"disagree with {self.config.contract}"
+            )
+        if set(self.manifest['decision_thresholds']) != set(markers):
+            raise ValueError(
+                f"{manifest_path}: decision_thresholds name {sorted(self.manifest['decision_thresholds'])} "
+                f"but {self.config.contract} requires {sorted(markers)}"
+            )
         self.rois = tuple(sorted(self.manifest['rois'], key=lambda row: row['key']))
         if not self.rois or len({row['key'] for row in self.rois}) != len(self.rois):
             raise ValueError('Spatial ROI keys must be nonempty and unique')
@@ -58,7 +81,7 @@ class SpatialSource:
 
     @lru_cache(maxsize=4)
     def roi_source(self, roi_index: int) -> RoiSource:
-        return RoiSource(self.root, self.rois[roi_index], self.manifest)
+        return RoiSource(self.root, self.rois[roi_index], self.manifest, config=self.config)
 
     def resolve_cell(self, cell: str) -> tuple[RoiSource, int]:
         key, separator, value = cell.rpartition("|")
@@ -107,8 +130,16 @@ class SpatialSource:
 class RoiSource(FieldSource):
     """One immutable ROI reader; labels remain qualified by dataset and ROI."""
 
-    def __init__(self, root: Path, metadata: dict, manifest: dict):
+    @classmethod
+    def annotation_directories(cls, root: Path | None = None) -> tuple[Path, ...]:
+        if root is None:
+            raise ValueError('An RHU2 ROI source annotates its review directory; pass the review root')
+        return (root,)
+
+    def __init__(self, root: Path, metadata: dict, manifest: dict, *, config: MarkerConfig):
         self.root = root
+        self.config = config
+        contract = config.contract
         self.key = metadata['key']
         self.display_name = f"{metadata['dataset']} · ROI {metadata['roi']}"
         table_path = (root / metadata['table']).resolve()
@@ -136,7 +167,7 @@ class RoiSource(FieldSource):
         if self.labels.shape != self.shape or self.fused.shape[:3] != self.shape:
             raise ValueError(f'Native image geometry changed for {self.key}')
         keys = list(self.fused.attrs['key'])
-        if keys != metadata['channel_keys'] or set(keys) != {'brdu', 'edu', 'pi'}:
+        if keys != metadata['channel_keys'] or set(keys) != set(contract.channel_keys):
             raise ValueError(f'Native channel identities changed for {self.key}')
         self.channels = {name: keys.index(name) for name in keys}
         self.xy_scale = float(metadata['pixel_size_um'])
@@ -148,21 +179,20 @@ class RoiSource(FieldSource):
         self.annotation_paths = (root / 'labels.csv',)
         self.default_annotation_path = self.annotation_paths[0]
         self.thresholds = manifest['decision_thresholds']
-        uncertainty = combined_uncertainty(
-            self.rows.brdu_prob.to_numpy(), self.rows.edu_prob.to_numpy(),
-            brdu_threshold=self.thresholds['brdu'], edu_threshold=self.thresholds['edu'],
+        probabilities = {marker: self.rows[rhu2_probability_column(marker)] for marker in contract.markers}
+        predictions = pd.DataFrame({
+            'label': self.rows.label, 'cell': self.rows.cell,
+            **{probability_column(marker): probabilities[marker] for marker in contract.markers},
+            **{marker: probabilities[marker] >= self.thresholds[marker] for marker in contract.markers},
+        })
+        model = load_model_calls(
+            predictions, dataset=self.key, contract=contract, cutoffs=self.thresholds, cell_prefix=self.key,
+            uncertainty_log_vmax=float(manifest['uncertainty_log_vmax']),
         )
-        n = int(self.rows.label.max()) + 1
-        self.calls = np.full(n, 4, dtype=np.uint8)
-        self.calls[self.rows.label] = (
-            2 * self.rows.brdu_prob.ge(self.thresholds['brdu']).to_numpy(dtype=np.uint8)
-            + self.rows.edu_prob.ge(self.thresholds['edu']).to_numpy(dtype=np.uint8)
-        )
-        self.uncertainty = np.full(n, np.nan, dtype=np.float32)
-        self.uncertainty[self.rows.label] = uncertainty
-        self.uncertainty_log_vmax = float(manifest['uncertainty_log_vmax'])
+        self.calls, self.uncertainty = model.calls, model.uncertainty
+        self.uncertainty_log_vmax = model.uncertainty_log_vmax
         self.display_max = float(manifest['display_max'])
-        self.contrast = np.tile([0, self.display_max], (3, 1))
+        self.contrast = dict.fromkeys(contract.channel_keys, (0.0, self.display_max))
 
     def cell_id(self, label: int) -> str:
         return f'{self.key}|{label}'
@@ -171,7 +201,10 @@ class RoiSource(FieldSource):
         if label not in self.by_label.index:
             return 'No saved call probabilities for this segmented cell.'
         row = self.by_label.loc[label]
-        return f'BrdU probability {row.brdu_prob:.4f} · EdU probability {row.edu_prob:.4f}'
+        return ' · '.join(
+            f'{self.config.label(marker)} probability {row[rhu2_probability_column(marker)]:.4f}'
+            for marker in self.config.contract.markers
+        )
 
     def _bounds(self, x: float, y: float, size: int) -> tuple[int, int]:
         if size <= 0 or size > min(self.shape[1:]):
@@ -208,8 +241,7 @@ class RoiSource(FieldSource):
         mask = np.where(np.isin(mask, self.rows.label.to_numpy()), mask, 0)
         ids, inverse = np.unique(mask, return_inverse=True)
         return RoiField(
-            images={name: raw[..., self.channels[channel]] for name, channel in
-                    [('561', 'pi'), ('BrdU', 'brdu'), ('EdU', 'edu')]},
+            images={key: raw[..., self.channels[key]] for key in self.config.contract.channel_keys},
             mask=mask, ids=ids, inverse=inverse.reshape(mask.shape),
             borders=find_boundaries(mask, mode='inner') & (mask > 0),
             origin_xy_um=np.array([x0, y0]) * self.xy_scale,
@@ -220,11 +252,12 @@ class RoiSource(FieldSource):
         )
 
     @lru_cache(maxsize=16)
-    def cell_crop(self, label: int, display_max: tuple[float, float, float] | None = None) -> tuple[bytes, int]:
-        """Render the annotation crop with PI, BrdU and EdU display maxima in the cache key."""
-        limits = (self.display_max,) * 3 if display_max is None else display_max
-        if len(limits) != 3 or not np.isfinite(limits).all() or min(limits) <= 0:
-            raise ValueError('Crop display maxima must contain three finite positive values')
+    def cell_crop(self, label: int, display_max: tuple[float, ...] | None = None) -> tuple[bytes, int]:
+        """Render the annotation crop with one display maximum per contract channel in the cache key."""
+        keys = self.config.contract.channel_keys
+        limits = (self.display_max,) * len(keys) if display_max is None else display_max
+        if len(limits) != len(keys) or not np.isfinite(limits).all() or min(limits) <= 0:
+            raise ValueError(f'Crop display maxima must contain {len(keys)} finite positive values')
         row = self.by_label.loc[label]
         size = 100
         x0, y0 = self._bounds(row.x, row.y, size)
@@ -239,8 +272,8 @@ class RoiSource(FieldSource):
         crop = CellCrop(plane, plane == label, (plane > 0) & (plane != label),
                         {name: raw[..., index] for name, index in self.channels.items()})
         image = render_crop(crop, cell=self.cell_id(label),
-                             display_max=dict(zip(('pi', 'brdu', 'edu'), limits, strict=True)),
-                             panels=default_config().panels)
+                             display_max=dict(zip(keys, limits, strict=True)),
+                             panels=self.config.panels)
         buffer = io.BytesIO()
         image.save(buffer, format='PNG')
         return buffer.getvalue(), zi
@@ -253,8 +286,9 @@ class FieldCropSource:
     datasets = ("All datasets",)
     subsets = ("All labeled",)
 
-    def __init__(self, roi: RoiSource, contrast: tuple[float, float, float], target_id: str, revision: str):
+    def __init__(self, roi: RoiSource, contrast: tuple[float, ...], target_id: str, revision: str):
         self.field_source = roi
+        self.config = roi.config
         self.contrast = contrast
         self.target_id, self.source_id = target_id, revision
         self.display_name = roi.display_name

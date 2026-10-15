@@ -9,12 +9,12 @@ from threading import Lock
 
 import numpy as np
 import pyarrow.parquet as pq
+from dino_markers import contract_of, require_same_contract
 
 from dino.crop_rendering import read_crop, render_crop
-from dino_markers import default_config
 from dino.zarr_source import CellCropReader
 from dinoapp.display_pixels import DisplayPixels
-from dinoapp.native import render_brdu_crop, render_edu_crop
+from dinoapp.native import render_marker_crop
 from dinoapp.sources import BarrageSource, Crop
 
 
@@ -26,6 +26,10 @@ class CorrectedBarrageSource(BarrageSource):
         spec = json.loads((self.root / 'display.json').read_text())
         if spec['schema'] != 'dino-corrected-display-v1':
             raise ValueError('Unsupported corrected barrage display contract')
+        require_same_contract(
+            self.config.contract, contract_of(Path(spec['source'])),
+            expected_from=f'barrage {self.root}', actual_from=f"corrected display source {spec['source']}",
+        )
         self.display_pixels = DisplayPixels(Path(spec['model']), Path(spec['source']))
         self.contract = json.loads((self.root / 'run.json').read_text())
         self.reader = CellCropReader(labels=self.display_pixels.source.labels,
@@ -49,7 +53,7 @@ class CorrectedBarrageSource(BarrageSource):
 
     @lru_cache(maxsize=64)
     def crop(self, cell: str, marker: str) -> Crop:
-        if marker not in {'brdu', 'edu', 'combined'}:
+        if marker != 'combined' and marker not in self.config.contract.markers:
             raise ValueError(f'Unexpected crop marker: {marker}')
         if cell not in self._by_cell.index:
             raise KeyError(f'Cell is absent from barrage index: {cell}')
@@ -62,15 +66,16 @@ class CorrectedBarrageSource(BarrageSource):
                   int(np.rint(row.centroid_x)) + self.reader.offset_zyx[2] - size // 2)
         with self.lock:
             crop = read_crop(self.reader, row, size=size)
-            crop = self.display_pixels.crop(crop, origin, reference='pi')
+            crop = self.display_pixels.crop(crop, origin, reference=self.config.reference.key)
         if not crop.mask.any():
             raise ValueError(f'Cell {cell} has no mask on its saved crop plane')
         if marker == 'combined':
             output = io.BytesIO()
             render_crop(crop, cell=cell, display_max=self.contract['display_max'],
-                        panels=default_config().panels).save(output, format='PNG')
+                        panels=self.config.panels).save(output, format='PNG')
             image = output.getvalue()
         else:
-            render = {'brdu': render_brdu_crop, 'edu': render_edu_crop}[marker]
-            image = render(crop, self.contract['display_max'][marker])
+            image = render_marker_crop(
+                crop, marker, self.contract['display_max'][marker], label=self.config.label(marker)
+            )
         return Crop(image, f'Cell {index.label}', self.display_pixels.description)

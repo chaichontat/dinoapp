@@ -6,9 +6,9 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import pandas as pd
+from dino_markers import DEFAULT_CONTRACT, SPATIAL_REVIEW, rhu2_probability_column
 
 from dino.review_contracts import combined_uncertainty
-
 
 
 def prepare_branches(review_root: Path, release: Path, rows: pd.DataFrame) -> dict:
@@ -43,9 +43,11 @@ def prepare(review_root: Path, release: Path) -> None:
     if target.exists() or (review_root / 'spatial.json').exists():
         raise FileExistsError(f'Spatial snapshot already exists: {review_root}')
     cohort = release / 'cohort/cells.h5ad'
+    contract = DEFAULT_CONTRACT
+    probability_columns = [rhu2_probability_column(marker) for marker in contract.markers]
     data = ad.read_h5ad(cohort, backed='r')
     try:
-        rows = data.obs[['dataset', 'roi', 'ccf_adjusted', 'x', 'y', 'z', 'brdu_prob', 'edu_prob']].copy()
+        rows = data.obs[['dataset', 'roi', 'ccf_adjusted', 'x', 'y', 'z', *probability_columns]].copy()
     finally:
         data.file.close()
     rows.index.name = 'cell'
@@ -54,9 +56,9 @@ def prepare(review_root: Path, release: Path) -> None:
     rows['label'] = rows.cell.str.rsplit('|', n=1).str[-1].astype('int64')
     if rows.cell.duplicated().any():
         raise ValueError('Duplicate RHU2 cell identifiers')
-    if not np.isfinite(rows[['x', 'y', 'z', 'brdu_prob', 'edu_prob']].to_numpy()).all():
+    if not np.isfinite(rows[['x', 'y', 'z', *probability_columns]].to_numpy()).all():
         raise ValueError('RHU2 coordinates and probabilities must be finite')
-    if not rows[['brdu_prob', 'edu_prob']].apply(lambda x: x.between(0, 1)).all().all():
+    if not rows[probability_columns].apply(lambda x: x.between(0, 1)).all().all():
         raise ValueError('RHU2 probabilities must be in [0, 1]')
     metadata = []
     groups = []
@@ -70,7 +72,7 @@ def prepare(review_root: Path, release: Path) -> None:
         segmentation = json.loads((Path(source['segmentation']) / 'zarr.json').read_text())
         shape = segmentation['shape']
         keys = fused['attributes']['key']
-        if fused['shape'][:3] != shape or set(keys) != {'brdu', 'edu', 'pi'}:
+        if fused['shape'][:3] != shape or set(keys) != set(contract.channel_keys):
             raise ValueError(f'Invalid channel/segmentation geometry: {key}')
         if pixel_size <= 0 or not np.isfinite(pixel_size):
             raise ValueError(f'Invalid physical XY spacing: {key}')
@@ -90,15 +92,21 @@ def prepare(review_root: Path, release: Path) -> None:
     for meta, group in zip(metadata, groups, strict=True):
         group.to_parquet(review_root / meta['table'], index=False)
         pd.testing.assert_frame_equal(group, pd.read_parquet(review_root / meta['table']))
-    uncertainty = combined_uncertainty(rows.brdu_prob.to_numpy(), rows.edu_prob.to_numpy(),
-                                       brdu_threshold=0.5, edu_threshold=0.5)
+    thresholds = dict.fromkeys(contract.markers, 0.5)
+    uncertainty = combined_uncertainty(
+        {marker: rows[column].to_numpy() for marker, column in zip(contract.markers, probability_columns)},
+        thresholds,
+    )
     log_vmax = float(np.quantile(np.log1p(uncertainty[np.isfinite(uncertainty)]), 0.999))
-    manifest = dict(uncertainty_log_vmax=log_vmax, artifact='rhu2-spatial-review-v1', cohort=str(cohort),
-                    cells=len(rows), probability_columns=['brdu_prob', 'edu_prob'],
-                    decision_thresholds={'brdu': 0.5, 'edu': 0.5},
-                    sampling='uniform ROI, then uniform cell, with SeedSequence([seed, position])',
-                    z_coordinates='native image plane; no unrecorded physical Z spacing assumed',
-                    display_max=32768.0, rois=metadata, **prepare_branches(review_root, release, rows))
+    manifest = SPATIAL_REVIEW.stamp(
+        dict(uncertainty_log_vmax=log_vmax, cohort=str(cohort),
+             cells=len(rows), probability_columns=probability_columns,
+             decision_thresholds=thresholds,
+             sampling='uniform ROI, then uniform cell, with SeedSequence([seed, position])',
+             z_coordinates='native image plane; no unrecorded physical Z spacing assumed',
+             display_max=32768.0, rois=metadata, **prepare_branches(review_root, release, rows)),
+        contract,
+    )
     (review_root / 'spatial.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(f'Snapshotted {len(rows):,} cells in {len(metadata)} ROIs; probabilities unchanged.')
 

@@ -10,17 +10,28 @@ from uuid import uuid4
 
 import numpy as np
 import streamlit as st
+from dino_markers import (
+    ContractMismatchError,
+    Label,
+    MarkerConfig,
+    SavedFilter,
+    badge_colors,
+    decode_call,
+    hex_color,
+    identity_color,
+    identity_name,
+    prediction_column,
+    probability_column,
+    state_label,
+    toggle_marker,
+    uncalled_code,
+)
 from streamlit.components.v2 import component
 
 from dinoapp.native import (
-    AnnotationFiles,
     FieldSource,
-    IDENTITIES,
     pick_cell,
-    prefetch_brdu_crop,
-    prefetch_edu_crop,
-    toggle_brdu,
-    toggle_edu,
+    prefetch_marker_crop,
     training_gallery,
     training_miscalls,
 )
@@ -34,33 +45,28 @@ from dinoapp.review_session import (
     save_assignment as persist_assignment,
     undo_edit as persist_undo,
 )
+from dinoapp.sources import AnnotationFiles
 
 
-IDENTITY_BACKGROUNDS = (
-    "#404040",
-    "#008f3a",
-    "#ff00ff",
-    "#ffffff",
-    "#777777",
-)
-IDENTITY_FOREGROUNDS = ("#ffffff", "#ffffff", "#ffffff", "#202020", "#ffffff")
+EDIT_REJECTED = (LabelConflictError, ContractMismatchError)
 
 
 @st.cache_resource(hash_funcs={type: id})
-def get_source(source_type: type[FieldSource]) -> FieldSource:
-    """Invalidate native readers when a code reload replaces their source class."""
+def get_source(source_type: type[FieldSource], marker_revision: str) -> FieldSource:
+    """Invalidate native readers when a code reload or a marker configuration change replaces them."""
     return source_type()
 
 
 @st.cache_data(max_entries=6, show_spinner=False, hash_funcs={type: id})
 def get_field(
     source_type: type[FieldSource],
+    marker_revision: str,
     seed: int,
     position: int,
     z_um: float,
     width_um: float,
 ):
-    return get_source(source_type).field(seed, position, z_um, width_um)
+    return get_source(source_type, marker_revision).field(seed, position, z_um, width_um)
 
 
 @st.cache_resource
@@ -237,9 +243,9 @@ def save_assignment(
     annotations: AnnotationFiles,
     state_dir: Path,
     cell: str,
-    value: tuple[int, int],
+    value: Label,
     *,
-    expected: tuple[int, int] | None,
+    expected: Label | None,
     record: dict,
 ):
     edit = persist_assignment(
@@ -251,17 +257,36 @@ def save_assignment(
 
 
 def undo_edit(annotations: AnnotationFiles, state_dir: Path, edit) -> None:
-    persist_undo(annotations, get_active_context(), state_dir, edit)
+    context = get_active_context()
+    persist_undo(annotations, context, state_dir, edit)
+    context["drafts"].pop(edit.cell, None)
     update_resident_gallery_cards(edit.cell, edit.previous)
 
 
-GALLERY_IDENTITIES = {
-    "BrdU− / EdU−": (0, 0),
-    "BrdU− / EdU+": (0, 1),
-    "BrdU+ / EdU−": (1, 0),
-    "BrdU+ / EdU+": (1, 1),
-}
 GALLERY_PAGE_SIZE = 24
+
+
+def cell_draft(context: dict, cell: str, saved: Label | None, markers: tuple[str, ...]) -> dict:
+    """Return the displayed cell's draft; other cells' drafts and drafts the saved value left behind are dropped."""
+    drafts = context["drafts"]
+    for other in [name for name in drafts if name != cell]:
+        del drafts[other]
+    draft = drafts.get(cell)
+    if draft is not None and draft["expected"] != saved:
+        context["notice"] = f"{cell} changed on disk; its unsaved marker edits were discarded."
+        draft = None
+    if draft is None:
+        draft = drafts[cell] = {
+            "expected": saved,
+            "values": dict(zip(markers, saved if saved is not None else (None,) * len(markers))),
+        }
+    return draft
+
+
+def draft_label(markers: tuple[str, ...], draft: dict) -> Label | None:
+    """The draft as a complete assignment in contract order, or None while any marker is unset."""
+    values = tuple(draft["values"][key] for key in markers)
+    return None if None in values else values
 
 
 def refresh_gallery_queue(signature: tuple) -> None:
@@ -274,13 +299,8 @@ def refresh_gallery_queue(signature: tuple) -> None:
     get_active_context()["native"]["gallery_client_token"] = None
 
 
-def gallery_target(card: dict, value: tuple[int, int]) -> tuple[int, int]:
-    """Return the card's next valid assignment."""
-    return {"brdu": toggle_brdu, "edu": toggle_edu}[card["marker"]](value)
-
-
 def update_gallery_card(
-    card: dict, value: tuple[int, int] | None, initial: tuple[int, int]
+    card: dict, value: Label | None, initial: Label, *, config: MarkerConfig
 ) -> None:
     """Update one resident card without rebuilding its encoded crop."""
     if value is None:
@@ -288,24 +308,23 @@ def update_gallery_card(
                     ariaLabel=f"{card['label']}, no saved call", disabled=True,
                     expected=None, value=None)
         return
-    target = gallery_target(card, value)
-    marker_name = {"brdu": "BrdU", "edu": "EdU"}[card["marker"]]
-    marker_index = {"brdu": 0, "edu": 1}[card["marker"]]
-    action = f"Set {marker_name}{'+' if target[marker_index] else '−'}"
-    state = f"BrdU{'+' if value[0] else '−'} / EdU{'+' if value[1] else '−'}"
-    aria_label = f"{card['label']}, {state}. {action}"
+    contract = config.contract
+    marker = card["marker"]
+    target = toggle_marker(contract, value, marker)
+    action = f"Set {config.label(marker)}{'+' if target[contract.markers.index(marker)] else '−'}"
+    state = state_label(config, value)
     card.update(
         state=state,
         changed=value != initial,
         action=action,
-        ariaLabel=aria_label,
+        ariaLabel=f"{card['label']}, {state}. {action}",
         disabled=False,
         expected=list(value),
         value=list(target),
     )
 
 
-def update_resident_gallery_cards(cell: str, value: tuple[int, int] | None) -> None:
+def update_resident_gallery_cards(cell: str, value: Label | None) -> None:
     """Patch a saved value into any loaded page containing that cell."""
     for gallery in get_active_context()["native"]["gallery_states"].values():
         initial = gallery["initial"].get(cell)
@@ -313,7 +332,7 @@ def update_resident_gallery_cards(cell: str, value: tuple[int, int] | None) -> N
             for page in gallery["pages"].values():
                 for card in page["cards"]:
                     if card["cell"] == cell:
-                        update_gallery_card(card, value, initial)
+                        update_gallery_card(card, value, initial, config=gallery["config"])
 
 
 def new_gallery_state(
@@ -355,6 +374,8 @@ def review_gallery(
 ) -> None:
     """Render, persist, and undo one resident paginated crop gallery."""
     context = get_active_context()
+    config = source.config
+    gallery["config"] = config
     item_ids = gallery["item_ids"]
     total = len(item_ids)
     page_count = max(1, (total + GALLERY_PAGE_SIZE - 1) // GALLERY_PAGE_SIZE)
@@ -385,7 +406,7 @@ def review_gallery(
     ):
         try:
             undo_edit(annotations, state_dir, last_edit)
-        except LabelConflictError as exc:
+        except EDIT_REJECTED as exc:
             context["notice"] = str(exc)
         st.rerun()
     if context["notice"]:
@@ -398,9 +419,6 @@ def review_gallery(
     start = page * GALLERY_PAGE_SIZE
     stop = min(start + GALLERY_PAGE_SIZE, total)
     page_item_ids = item_ids[start:stop]
-
-    crop_cells = {"edu": source.edu_cell_crop, "brdu": source.brdu_cell_crop}
-    prefetch_crops = {"edu": prefetch_edu_crop, "brdu": prefetch_brdu_crop}
 
     pages = gallery["pages"]
     if current_key not in pages:
@@ -419,7 +437,7 @@ def review_gallery(
                 if gallery["crop_kind"] == "audit_marker"
                 else gallery["crop_kind"]
             )
-            crop, plane_z = crop_cells[crop_kind](label)
+            crop, plane_z = source.marker_crop(label, crop_kind)
             card = {
                 "kind": gallery["kind"],
                 "itemId": item_id,
@@ -429,14 +447,14 @@ def review_gallery(
                 + base64.b64encode(crop).decode("ascii"),
             }
             if gallery["kind"] == "miscall":
-                marker_name = {"brdu": "BrdU", "edu": "EdU"}[crop_kind]
+                marker_name = config.label(crop_kind)
                 card.update(
                     marker=crop_kind,
                     detail=(
                         f"{marker_name} miscall · Model {marker_name}"
-                        f"{'+' if row[f'pred_{crop_kind}'] else '−'} · "
+                        f"{'+' if row[prediction_column(crop_kind)] else '−'} · "
                         f"{str(row['split']).capitalize()} · {row['tranche']} · "
-                        f"p({marker_name}+) {row[f'p_{crop_kind}']:.3f} · "
+                        f"p({marker_name}+) {row[probability_column(crop_kind)]:.3f} · "
                         f"Z {source.origin[0] + plane_z * source.scale[0]:.1f} µm"
                     ),
                 )
@@ -448,13 +466,15 @@ def review_gallery(
                         f"Z {source.origin[0] + plane_z * source.scale[0]:.1f} µm"
                     ),
                 )
-            update_gallery_card(card, current, gallery["initial"][cell])
+            update_gallery_card(card, current, gallery["initial"][cell], config=config)
             cards.append(card)
         pages[current_key] = {"cards": cards, "missing": missing}
     page_data = pages[current_key]
     cards = page_data["cards"]
     for card in cards:
-        update_gallery_card(card, annotations.values.get(card["cell"]), gallery["initial"][card["cell"]])
+        update_gallery_card(
+            card, annotations.values.get(card["cell"]), gallery["initial"][card["cell"]], config=config
+        )
     if page_data["missing"]:
         st.warning(
             f"{len(page_data['missing'])} queued cell(s) no longer have a saved label. "
@@ -470,13 +490,12 @@ def review_gallery(
             executor = gallery_prefetch_executor()
             prefetches[next_key] = tuple(
                 executor.submit(
-                    prefetch_crops[
-                        str(gallery["rows"].loc[item_id, "audit_marker"])
-                        if gallery["crop_kind"] == "audit_marker"
-                        else gallery["crop_kind"]
-                    ],
+                    prefetch_marker_crop,
                     source,
                     str(gallery["rows"].loc[item_id, "cell"]),
+                    str(gallery["rows"].loc[item_id, "audit_marker"])
+                    if gallery["crop_kind"] == "audit_marker"
+                    else gallery["crop_kind"],
                 )
                 for item_id in next_item_ids
             )
@@ -546,7 +565,7 @@ def review_gallery(
             "That cell changed after this gallery view was rendered; no edit was saved."
         )
         st.rerun()
-    target = gallery_target(card, current)
+    target = toggle_marker(config.contract, current, card["marker"])
     if value != target:
         context["notice"] = (
             "Ignored an invalid gallery edit; no label was changed."
@@ -558,8 +577,8 @@ def review_gallery(
         record = {
             "action": f"miscall_toggle_{card['marker']}",
             "split": str(row["split"]),
-            "model_call": int(row[f"pred_{card['marker']}"]),
-            "probability": float(row[f"p_{card['marker']}"]),
+            "model_call": int(row[prediction_column(card["marker"])]),
+            "probability": float(row[probability_column(card["marker"])]),
         }
     else:
         record = {
@@ -578,13 +597,32 @@ def review_gallery(
         )
     except LabelConflictError as exc:
         context["notice"] = str(exc)
+    except ContractMismatchError as exc:
+        context["notice"] = str(exc)
+        st.error(str(exc))
+        return
     else:
         update_resident_gallery_cards(cell, target)
         context["notice"] = (
-            f"Saved {cell} as {IDENTITIES[2 * target[0] + target[1]]} "
+            f"Saved {cell} as {identity_name(config, target)} "
             f"in {edit.path.parent.name}."
         )
     st.rerun()
+
+
+def saved_filter_controls(context: dict, config: MarkerConfig, prefix: str) -> SavedFilter:
+    """One select per marker; "Any" leaves the marker unconstrained."""
+    chosen: dict[str, int | None] = {}
+    for key in config.display_markers:
+        label = config.label(key)
+        options = ("Any", f"{label}+", f"{label}−")
+        name = f"{prefix}:{key}"
+        widget = widget_key(context, name, "Any")
+        if st.session_state[widget] not in options:
+            st.session_state[widget] = context["widgets"][name] = "Any"
+        selected = st.selectbox(label, options, key=widget, on_change=remember_widget, args=(context, name))
+        chosen[key] = None if selected == "Any" else int(selected.endswith("+"))
+    return tuple(chosen[key] for key in config.contract.markers)
 
 
 def review_marker_gallery(
@@ -594,40 +632,38 @@ def review_marker_gallery(
     marker: str,
 ) -> None:
     """Rapidly toggle one marker in a stable snapshot of labeled cell crops."""
-    marker_name = {"brdu": "BrdU", "edu": "EdU"}[marker]
-    other_name = {"brdu": "EdU", "edu": "BrdU"}[marker]
-    annotations = AnnotationFiles(paths, source.default_annotation_path)
+    config = source.config
+    marker_name = config.label(marker)
+    others = ", ".join(config.label(key) for key in config.display_markers if key != marker)
+    context = get_active_context()
+    annotations = AnnotationFiles(paths, source.default_annotation_path, contract=config.contract)
     with st.sidebar:
         st.header(f"{marker_name} correction gallery")
         split_name = st.selectbox(
             "Examples",
             ("Training", "Validation", "All labeled"),
             index=2,
-            key=widget_key(get_active_context(), "gallery_split", 'All labeled'), on_change=remember_widget, args=(get_active_context(), "gallery_split"),
+            key=widget_key(context, "gallery_split", 'All labeled'), on_change=remember_widget, args=(context, "gallery_split"),
         )
-        identity_name = st.selectbox(
-            "Saved state",
-            tuple(GALLERY_IDENTITIES),
-            key=widget_key(get_active_context(), "gallery_identity", 'BrdU− / EdU−'), on_change=remember_widget, args=(get_active_context(), "gallery_identity"),
-        )
+        identity = saved_filter_controls(context, config, "gallery_saved")
         st.caption(
             "Matches use the current saved labels. The queue stays fixed while you edit."
         )
     split = {"Training": "training", "Validation": "validation", "All labeled": "all"}[
         split_name
     ]
-    identity = GALLERY_IDENTITIES[identity_name]
     signature = (marker, split, identity)
     with st.sidebar:
         if st.button("Refresh matches", width="stretch"):
             refresh_gallery_queue(signature)
             st.rerun()
 
-    gallery_states = get_active_context()["native"]["gallery_states"]
+    gallery_states = context["native"]["gallery_states"]
     if signature not in gallery_states:
         matches = training_gallery(
             source.training_predictions,
             annotations.values,
+            contract=config.contract,
             split=split,
             identity=identity,
         )
@@ -643,8 +679,9 @@ def review_marker_gallery(
         gallery_states[signature],
         title=f"{marker_name} correction gallery",
         caption=(
-            f"Click a crop to flip {marker_name} while keeping {other_name} unchanged. "
-            "Each filter keeps its loaded crops until you refresh its matches."
+            f"Click a crop to flip {marker_name}"
+            + (f" while keeping {others} unchanged. " if others else ". ")
+            + "Each filter keeps its loaded crops until you refresh its matches."
         ),
         group_label=f"{marker_name} correction cells",
         empty_message="No cells match this saved state.",
@@ -657,42 +694,46 @@ def review_training_miscalls(
     state_dir: Path,
 ) -> None:
     """Correct ranked model disagreements from a resident crop gallery."""
-    annotations = AnnotationFiles(paths, source.default_annotation_path)
+    config = source.config
+    context = get_active_context()
+    annotations = AnnotationFiles(paths, source.default_annotation_path, contract=config.contract)
+    any_marker = "Either marker" if len(config.markers) == 2 else "Any marker"
+    targets = {config.label(key): key for key in config.display_markers}
     with st.sidebar:
         st.header("Training miscalls")
         split_name = st.selectbox(
             "Examples",
             ("Training", "Validation", "All labeled"),
             index=2,
-            key=widget_key(get_active_context(), "miscall_split", 'All labeled'), on_change=remember_widget, args=(get_active_context(), "miscall_split"),
+            key=widget_key(context, "miscall_split", 'All labeled'), on_change=remember_widget, args=(context, "miscall_split"),
         )
+        target_options = (any_marker, *targets)
+        target_widget = widget_key(context, "miscall_target", any_marker)
+        if st.session_state[target_widget] not in target_options:
+            st.session_state[target_widget] = context["widgets"]["miscall_target"] = any_marker
         target_name = st.selectbox(
-            "Disagreement", ("Either marker", "BrdU", "EdU"), key=widget_key(get_active_context(), "miscall_target", 'Either marker'), on_change=remember_widget, args=(get_active_context(), "miscall_target")
+            "Disagreement", target_options, key=target_widget, on_change=remember_widget, args=(context, "miscall_target")
         )
-        identity_name = st.selectbox(
-            "Saved state",
-            tuple(GALLERY_IDENTITIES),
-            key=widget_key(get_active_context(), "miscall_identity", 'BrdU− / EdU−'), on_change=remember_widget, args=(get_active_context(), "miscall_identity"),
-        )
+        identity = saved_filter_controls(context, config, "miscall_saved")
         st.caption(
             "Ranked by the probability assigned against the current saved label."
         )
     split = {"Training": "training", "Validation": "validation", "All labeled": "all"}[
         split_name
     ]
-    target = {"Either marker": "either", "BrdU": "brdu", "EdU": "edu"}[target_name]
-    identity = GALLERY_IDENTITIES[identity_name]
+    target = targets.get(target_name)
     signature = ("miscall", split, target, identity)
     with st.sidebar:
         if st.button("Refresh matches", width="stretch"):
             refresh_gallery_queue(signature)
             st.rerun()
 
-    gallery_states = get_active_context()["native"]["gallery_states"]
+    gallery_states = context["native"]["gallery_states"]
     if signature not in gallery_states:
         scored = training_miscalls(
             source.training_predictions,
             annotations.values,
+            contract=config.contract,
             split=split,
             target=target,
             identity=identity,
@@ -709,7 +750,7 @@ def review_training_miscalls(
         gallery_states[signature],
         title="Training miscall gallery",
         caption=(
-            "Each marker disagreement is a separate card, so a cell can appear twice. "
+            "Each marker disagreement is a separate card, so a cell can appear more than once. "
             "Click a card to flip only its displayed marker; the queue stays fixed until refreshed."
         ),
         group_label="Training miscall cells",
@@ -723,7 +764,9 @@ def select_field_cell(source, field, paths, state_dir, *, event_token: str):
     event = st.session_state.get("picker-right-panel", {}).get("clicked")
     if not event or event.get("token") != event_token or context["event_token"] != event_token:
         return
-    annotations = AnnotationFiles(paths, source.default_annotation_path)
+    config = source.config
+    contract = config.contract
+    annotations = AnnotationFiles(paths, source.default_annotation_path, contract=contract)
     seed = field.seed
     calls = source.field_calls(field, annotations)
     label = pick_cell(field.mask, float(event["x"]), float(event["y"]))
@@ -740,8 +783,8 @@ def select_field_cell(source, field, paths, state_dir, *, event_token: str):
             "x": float(event["x"]),
             "y": float(event["y"]),
         }
-        if cell not in annotations.values and identity < 4:
-            value = (identity // 2, identity % 2)
+        if cell not in annotations.values and identity < uncalled_code(contract):
+            value = decode_call(contract, identity)
             try:
                 save_assignment(
                     annotations,
@@ -758,13 +801,13 @@ def select_field_cell(source, field, paths, state_dir, *, event_token: str):
                         "center_xy_um": field.center_xy_um.tolist(),
                     },
                 )
-            except LabelConflictError as exc:
+            except EDIT_REJECTED as exc:
                 context["native"]["selection"] = None
                 context["notice"] = str(exc)
             else:
                 context["native"]["selection"]["expected"] = value
                 context["notice"] = (
-                    f"Confirmed cell {label} as {IDENTITIES[identity]} in "
+                    f"Confirmed cell {label} as {identity_name(config, value)} in "
                     f"{annotations.destination(cell).parent.name}."
                 )
         else:
@@ -781,6 +824,9 @@ def review_field(
 ):
     """Save edits and update vector markers without rerendering the field images."""
     context = get_active_context()
+    config = source.config
+    contract = config.contract
+    uncalled = uncalled_code(contract)
     geometry = f"{field.token}:{field.origin_xy_um.tolist()}:{field.scale_xy_um.tolist()}:{field.center_xy_um.tolist()}"
     if context["native"]["field_token"] != geometry:
         if context["native"]["selection"] is None:
@@ -795,7 +841,7 @@ def review_field(
     selection_expected = str(context["native"]["selection"]["expected"]) if context["native"]["selection"] else ""
     view_token = activate_view(context, (*field_location, selection_cell, selection_expected))
     select_field_cell(source, field, paths, state_dir, event_token=view_token)
-    annotations = AnnotationFiles(paths, source.default_annotation_path)
+    annotations = AnnotationFiles(paths, source.default_annotation_path, contract=contract)
     if previous_token != view_token and context["native"]["selection"] is not None:
         context["native"]["selection"]["expected"] = annotations.values.get(source.cell_id(context["native"]["selection"]["label"]))
     focus = context["workspace"].pop("focus_cell", None)
@@ -811,6 +857,12 @@ def review_field(
     calls = source.field_calls(field, annotations)
     selection = context["native"]["selection"]
     selected = selection["label"] if selection else None
+    cell = source.cell_id(selected) if selected is not None else ""
+    editable = selected is not None and (
+        cell in annotations.values
+        or (selected < len(source.calls) and source.calls[selected] < uncalled)
+    )
+    draft = cell_draft(context, cell, annotations.values.get(cell), contract.markers) if editable else None
     z_caption = f"Z {field.z_um:.1f} µm" if field.z_um is not None else f"Z plane {field.z_index}"
     st.caption(
         (f"Seed {seed} · Position {field.position} · " if show_seed and seed is not None else "")
@@ -820,9 +872,8 @@ def review_field(
         if selected is None:
             st.info("Select a segmented cell in the field.")
         else:
-            cell = source.cell_id(selected)
             selected_index = int((field.ids == selected).nonzero()[0][0])
-            identity = IDENTITIES[int(calls[selected_index])]
+            identity = identity_name(config, decode_call(contract, int(calls[selected_index])))
             label_source = (
                 "saved annotation" if cell in annotations.values else "model call"
             )
@@ -841,27 +892,30 @@ def review_field(
             st.caption(selected_caption(selected) if selected_caption else membership)
         if context["notice"]:
             st.write(context["notice"])
-    actions = st.columns([1, 1, 1, 1, 1])
-    choices = [
-        ("EdU only", (0, 1)),
-        ("BrdU only", (1, 0)),
-        ("Dual positive", (1, 1)),
-        ("Neither", (0, 0)),
-    ]
-    editable = selected is not None and (
-        source.cell_id(selected) in annotations.values
-        or (selected < len(source.calls) and source.calls[selected] < 4)
-    )
-    for column, (name, value) in zip(actions[:4], choices, strict=True):
-        if column.button(name, disabled=not editable, width="stretch", key=f"field-assign:{view_token}:{value}"):
-            cell = source.cell_id(selected)
+    markers = config.display_markers
+    actions = st.columns([1] * (len(markers) + 2))
+    for column, key in zip(actions, markers):
+        choice = column.segmented_control(
+            config.label(key),
+            (0, 1),
+            format_func=lambda value: "+" if value else "−",
+            default=draft["values"][key] if draft is not None else None,
+            disabled=not editable,
+            key=f"field-mark:{context['session_id']}:{cell}:{key}:{view_token}:{draft['expected'] if draft is not None else None}",
+        )
+        if draft is not None:
+            draft["values"][key] = choice
+    value = draft_label(contract.markers, draft) if draft is not None else None
+    if actions[len(markers)].button("Save", disabled=value is None, width="stretch", key=f"field-save:{view_token}"):
+        saved = annotations.values.get(cell)
+        if value != saved:
             try:
                 edit = save_assignment(
                     annotations,
                     state_dir,
                     cell,
                     value,
-                    expected=selection["expected"],
+                    expected=draft["expected"],
                     record={
                         "action": "assign",
                         "seed": seed,
@@ -871,22 +925,23 @@ def review_field(
                         "center_xy_um": field.center_xy_um.tolist(),
                     },
                 )
-            except LabelConflictError as exc:
+            except EDIT_REJECTED as exc:
                 context["native"]["selection"] = None
                 context["notice"] = str(exc)
                 st.rerun(scope="fragment")
-            context["native"]["selection"]["expected"] = value
             context["notice"] = (
-                f"Saved cell {selected} as {name} in {edit.path.parent.name}."
+                f"Saved cell {selected} as {identity_name(config, value)} in {edit.path.parent.name}."
             )
-            st.rerun(scope="fragment")
+        context["native"]["selection"]["expected"] = value
+        del context["drafts"][cell]
+        st.rerun(scope="fragment")
     if actions[-1].button(
         "Undo last edit", disabled=not context["history"], width="stretch", key=f"field-undo:{view_token}"
     ):
         edit = context["history"][-1]
         try:
             undo_edit(annotations, state_dir, edit)
-        except LabelConflictError as exc:
+        except EDIT_REJECTED as exc:
             context["notice"] = str(exc)
             st.rerun(scope="fragment")
         if selected is not None and edit.cell == source.cell_id(selected):
@@ -900,12 +955,15 @@ def review_field(
         if selected_action.button("Review selected cell", disabled=not editable, key=f"field-open-cell:{view_token}"):
             capture_queue(context, [source.cell_id(selected)], crop_source)
             st.rerun(scope="app")
-        eligible = [source.cell_id(int(label)) for label in field.ids if label > 0 and label < len(source.calls) and source.calls[int(label)] < 4]
+        eligible = [source.cell_id(int(label)) for label in field.ids if label > 0 and label < len(source.calls) and source.calls[int(label)] < uncalled]
         if field_action.button("Review cells in this field", disabled=not eligible, key=f"field-open-queue:{view_token}"):
             capture_queue(context, eligible, crop_source)
             st.rerun(scope="app")
     marks = []
-    colors = ["#404040", "#00ff00", "#ff00ff", "#ffffff", "#999999"]
+    colors = {
+        code: hex_color(identity_color(config, decode_call(contract, code)))
+        for code in range(uncalled + 1)
+    }
     # The fixed image stays unchanged while X marks show every saved annotation.
     for mark_index, raw_label in enumerate(field.ids):
         label = int(raw_label)
@@ -936,11 +994,14 @@ def review_field(
             st.caption("This segmented cell has no saved call or review crop geometry.")
         else:
             crop, plane_z = (render_cell_crop or source.cell_crop)(selected)
+            badge_background, badge_foreground = badge_colors(
+                config, decode_call(contract, int(calls[selected_index]))
+            )
             st.markdown(
                 f"""
                 <div data-testid="selected-label-state" data-state="{identity}"
-                     style="background: {IDENTITY_BACKGROUNDS[int(calls[selected_index])]};
-                            color: {IDENTITY_FOREGROUNDS[int(calls[selected_index])]};
+                     style="background: {badge_background};
+                            color: {badge_foreground};
                             border: 1px solid #b8b8b8; border-radius: 0.5rem;
                             padding: 0.55rem 0.75rem; margin-bottom: 0.25rem; line-height: 1.15;">
                   <span style="font-size: 0.8rem; font-weight: 600; letter-spacing: 0.08em;">LABEL STATE</span><br>
@@ -958,7 +1019,7 @@ def review_field(
             )
     with right:
         st.subheader(
-            "EdU / BrdU · cell identities"
+            f"{' / '.join(config.label(key) for key in markers)} · cell identities"
             if right_view == "Cell identities"
             else "Combined model uncertainty"
         )

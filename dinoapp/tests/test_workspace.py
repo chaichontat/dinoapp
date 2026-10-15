@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from dino_markers import DEFAULT_CONTRACT, default_config
 
 from dinoapp.prod3 import FieldSource
 from dinoapp.sources import NativeSource
@@ -23,8 +24,9 @@ def native_source(tmp_path):
     )
     reader.annotation_paths = (tmp_path / "labels.csv",)
     reader.default_annotation_path = reader.annotation_paths[0]
+    reader.config = default_config()
     reader.cell_crop = lambda label: (str(label).encode(), int(reader.cell_geometry(label).plane_z))
-    reader.edu_cell_crop = reader.brdu_cell_crop = reader.cell_crop
+    reader.marker_crop = lambda label, marker: reader.cell_crop(label)
     return NativeSource(reader, label_root=tmp_path)
 
 
@@ -75,15 +77,12 @@ def test_geometry_read_is_filtered_to_requested_label(native_source, monkeypatch
     ]
 
 
-@pytest.fixture
-def workspace_review(tmp_path, monkeypatch):
+def build_reader(reader, tmp_path):
     import io
     from types import SimpleNamespace
     from PIL import Image
-    from streamlit.testing.v1 import AppTest
-    from dinoapp import app, native_app
 
-    reader = object.__new__(FieldSource)
+    reader.config = default_config()
     reader.shape = (3, 64, 64)
     reader.origin = np.array([100.0, 0.0, 0.0])
     reader.scale = np.array([2.0, 10.0, 10.0])
@@ -121,7 +120,7 @@ def workspace_review(tmp_path, monkeypatch):
     reader.calls = np.array([4, 0, 3], dtype=np.uint8)
     reader.uncertainty = np.array([np.nan, 1.0, 2.0])
     reader.uncertainty_log_vmax = 3.0
-    reader.contrast = np.array([[0.0, 5000.0]] * 3)
+    reader.contrast = {"pi": (0.0, 5000.0), "brdu": (0.0, 5000.0), "edu": (0.0, 5000.0)}
 
     def crop(label):
         row = reader.cell_geometry(label)
@@ -129,10 +128,23 @@ def workspace_review(tmp_path, monkeypatch):
         Image.new("RGB", (8, 8), (label * 40, 0, 0)).save(output, format="PNG")
         return output.getvalue(), int(row.plane_z)
 
-    reader.cell_crop = reader.edu_cell_crop = reader.brdu_cell_crop = crop
-    monkeypatch.setattr(native_app, "get_source", lambda cls: reader)
+    reader.cell_crop = crop
+    reader.marker_crop = lambda label, marker: crop(label)
+    return reader
+
+
+@pytest.fixture
+def workspace_review(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from dinoapp import app, native_app
+
+    reader = build_reader(object.__new__(FieldSource), tmp_path)
+    monkeypatch.setattr(FieldSource, "annotation_directories", classmethod(lambda cls, root=None: (tmp_path,)), raising=False)
+    monkeypatch.setattr(native_app, "get_source", lambda cls, marker_revision: reader)
     monkeypatch.setattr(
-        native_app, "get_field", lambda cls, seed, position, z, width: reader.field(seed, position, z, width)
+        native_app,
+        "get_field",
+        lambda cls, marker_revision, seed, position, z, width: reader.field(seed, position, z, width),
     )
     monkeypatch.setenv("DINO_REVIEW_SOURCE", "Native fields")
     monkeypatch.setenv("DINO_NATIVE_DATASET", "Prod3")
@@ -267,7 +279,7 @@ def test_native_viewport_loader_preserves_geometry_and_adapter_pixels(tmp_path, 
     reader.origin, reader.scale = np.array([100.0, 200.0, 300.0]), np.array([2.0, 3.0, 4.0])
     reader.arrays = {
         name: np.arange(np.prod(reader.shape)).reshape(reader.shape)
-        for name in (reader.anatomy_channel if adapter != "prod2" else "561", "EdU", "BrdU")
+        for name in reader.raw_channels
     }
     reader.labels = np.ones(reader.shape, dtype=np.uint16)
     reader.contours_at = lambda zi: []
@@ -289,7 +301,7 @@ def test_native_viewport_loader_preserves_geometry_and_adapter_pixels(tmp_path, 
     np.testing.assert_array_equal(field.origin_xy_um, [328.0, 218.0])
     assert field.seed is None and field.position is None
     expected = reader.arrays["EdU"][1, 6:14, 7:13]
-    np.testing.assert_array_equal(field.images["EdU"], expected if adapter == "prod2" else expected + 5)
+    np.testing.assert_array_equal(field.images["edu"], expected if adapter == "prod2" else expected + 5)
     if adapter != "prod2":
         assert seen == [(1, slice(6, 14), slice(7, 13))]
 
@@ -298,13 +310,343 @@ def test_captured_assignment_rejects_label_changed_since_render(workspace_review
     from dinoapp.label_store import update_label
     review, reader, root = workspace_review
     path = root / "labels.csv"
-    update_label(path, "prod3-realigned-v1|1", (0, 0))
+    update_label(path, "prod3-realigned-v1|1", (0, 0), contract=DEFAULT_CONTRACT)
     press(review, "Review cells in this field")
-    button = next(widget for widget in review.button if widget.label == "BrdU− / EdU+")
-    update_label(path, "prod3-realigned-v1|1", (1, 1), expected=(0, 0))
+    next(widget for widget in review.segmented_control if widget.label == "EdU").set_value(1).run()
+    assert not review.exception
+    save = next(widget for widget in review.button if widget.label == "Save and next")
+    assert not save.disabled
+    update_label(path, "prod3-realigned-v1|1", (1, 1), contract=DEFAULT_CONTRACT, expected=(0, 0))
     before = path.read_bytes()
-    button.click().run()
+    save.click().run()
     assert not review.exception
     assert path.read_bytes() == before
     assert not context_of(review)["history"]
     assert not list(root.rglob("changes-*.jsonl"))
+
+
+THREE_MARKERS = {
+    "version": 1,
+    "reference": {"key": "dapi", "label": "DAPI"},
+    "markers": [
+        {"key": "edu", "label": "EdU", "color": "#00ff00"},
+        {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+        {"key": "pcna", "label": "PCNA", "color": "#00ffff"},
+    ],
+    "presentation": {
+        "crop_panels": ["dapi", "edu", "brdu", "pcna"],
+        "negative_color": [0.25, 0.25, 0.25],
+        "uncalled_color": "#999999",
+    },
+}
+THREE_MARKER_CELLS = ("tri|1", "tri|2", "tri|3")
+
+
+def write_three_marker_barrage(root, labels=None, markers=THREE_MARKERS):
+    import json
+    from PIL import Image
+
+    for index, cell in enumerate(THREE_MARKER_CELLS, start=1):
+        for stem in ("combined", "edu", "brdu", "pcna"):
+            Image.new("RGB", (8, 8), (index * 40, 0, 0)).save(root / f"{cell.split('|')[1]}_{stem}.png")
+    rows = ["cell,rank,combined_image_path,edu_image_path,brdu_image_path,pcna_image_path"]
+    for index, cell in enumerate(THREE_MARKER_CELLS, start=1):
+        paths = ",".join(f"{index}_{stem}.png" for stem in ("combined", "edu", "brdu", "pcna"))
+        rows.append(f"{cell},{index},{paths}")
+    (root / "index.csv").write_text("\n".join(rows) + "\n")
+    (root / "markers.json").write_text(json.dumps(markers))
+    if labels is not None:
+        (root / "labels.csv").write_text("cell,edu,brdu,pcna\n" + "".join(f"{row}\n" for row in labels))
+
+
+@pytest.fixture
+def three_marker_barrage(tmp_path, monkeypatch):
+    from dinoapp import app
+
+    monkeypatch.setenv("DINO_REVIEW_SOURCE", "Barrage")
+    monkeypatch.setenv("DINO_REVIEW_BARRAGE_DIR", str(tmp_path))
+    app.st.cache_resource.clear()
+
+    def open_review(labels=None):
+        from streamlit.testing.v1 import AppTest
+
+        write_three_marker_barrage(tmp_path, labels)
+        review = AppTest.from_file(app.__file__).run(timeout=20)
+        assert not review.exception
+        return review
+
+    return tmp_path, open_review
+
+
+def control(review, label):
+    return next(widget for widget in review.segmented_control if widget.label == label)
+
+
+def set_marker(review, label, value):
+    control(review, label).set_value(value).run()
+    assert not review.exception
+
+
+def select_in_sidebar(review, label, value):
+    next(widget for widget in review.sidebar.selectbox if widget.label == label).select(value).run()
+    assert not review.exception
+
+
+def test_cell_review_offers_one_control_per_marker_and_starts_unset(three_marker_barrage):
+    root, open_review = three_marker_barrage
+    review = open_review()
+    select_in_sidebar(review, "Review view", "Cell review")
+    assert [widget.label for widget in review.segmented_control] == ["EdU", "BrdU", "PCNA"]
+    assert [widget.value for widget in review.segmented_control] == [None, None, None]
+    save = next(widget for widget in review.button if widget.label == "Save and next")
+    assert save.disabled
+    assert "No saved call" in [element.value for element in review.main.markdown]
+    assert not (root / "labels.csv").exists()
+
+
+def test_save_and_next_waits_for_every_marker_then_writes_one_row_and_advances(three_marker_barrage):
+    root, open_review = three_marker_barrage
+    review = open_review()
+    select_in_sidebar(review, "Review view", "Cell review")
+    set_marker(review, "EdU", 1)
+    set_marker(review, "BrdU", 0)
+    assert next(widget for widget in review.button if widget.label == "Save and next").disabled
+    set_marker(review, "PCNA", 1)
+    save = next(widget for widget in review.button if widget.label == "Save and next")
+    assert not save.disabled
+    assert not (root / "labels.csv").exists()
+    save.click().run()
+    assert not review.exception
+    assert (root / "labels.csv").read_text() == "cell,edu,brdu,pcna\ntri|1,1,0,1\n"
+    context = context_of(review)
+    assert context["history"][-1].value == (1, 0, 1)
+    assert context["drafts"] == {"tri|2": {"expected": None, "values": {"edu": None, "brdu": None, "pcna": None}}}
+    (queue,) = context["cell_queues"].values()
+    assert queue["position"] == 1
+    assert "**Cell 2 of 3**" in [element.value for element in review.main.markdown]
+    assert [widget.value for widget in review.segmented_control] == [None, None, None]
+    journal_path, = (root / "cell-review").glob("changes-*.jsonl")
+    import json
+    record = json.loads(journal_path.read_text().splitlines()[0])
+    assert (record["cell"], record["previous"], record["value"], record["action"]) == ("tri|1", None, [1, 0, 1], "assign")
+
+
+def test_unsaved_cells_exclude_saved_all_negative_and_saved_cells_filter_per_marker(three_marker_barrage):
+    root, open_review = three_marker_barrage
+    review = open_review(labels=["tri|1,0,0,0", "tri|2,1,0,1"])
+    select_in_sidebar(review, "Review view", "Cell review")
+    (queue,) = context_of(review)["cell_queues"].values()
+    assert queue["cells"] == ["tri|3"]
+    select_in_sidebar(review, "Cells", "All cells")
+    assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|1", "tri|2", "tri|3"]
+    select_in_sidebar(review, "Cells", "Saved")
+    assert [widget.label for widget in review.sidebar.selectbox][-3:] == ["EdU", "BrdU", "PCNA"]
+    assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|1", "tri|2"]
+    select_in_sidebar(review, "EdU", "EdU+")
+    assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|2"]
+    select_in_sidebar(review, "BrdU", "BrdU−")
+    select_in_sidebar(review, "PCNA", "PCNA−")
+    assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == []
+    select_in_sidebar(review, "PCNA", "PCNA+")
+    assert [q["cells"] for q in context_of(review)["cell_queues"].values()][-1] == ["tri|2"]
+    assert "No saved call" not in [element.value for element in review.main.markdown]
+    assert "EdU+ / BrdU− / PCNA+" in [element.value for element in review.main.markdown]
+
+
+def send_flip(review, payload):
+    import json
+    from streamlit.components.v2.bidi_component.main import _make_trigger_id
+
+    states = review._tree.get_widget_states()
+    component_id = review.get("bidi_component")[0].proto.id
+    states.widgets.add(id=component_id, json_value="{}")
+    event = states.widgets.add(id=_make_trigger_id(component_id, "events"))
+    event.json_trigger_value = json.dumps([{"event": "flipped", "value": payload}])
+    review._run(states)
+
+
+def test_gallery_views_and_per_marker_filters_follow_the_config_and_a_card_toggles_one_marker(three_marker_barrage):
+    root, open_review = three_marker_barrage
+    review = open_review(labels=["tri|1,0,0,0", "tri|2,1,0,1", "tri|3,1,1,0"])
+    views = next(widget for widget in review.sidebar.selectbox if widget.label == "Review view").options
+    assert views == ["Cell review", "EdU correction gallery", "BrdU correction gallery", "PCNA correction gallery"]
+    select_in_sidebar(review, "Review view", "PCNA correction gallery")
+    (gallery,) = context_of(review)["galleries"].values()
+    assert gallery["cells"] == ["tri|1", "tri|2", "tri|3"]
+    assert [widget.label for widget in review.sidebar.selectbox][-3:] == ["EdU", "BrdU", "PCNA"]
+    select_in_sidebar(review, "EdU", "EdU+")
+    select_in_sidebar(review, "BrdU", "BrdU−")
+    context = context_of(review)
+    gallery = next(g for key, g in context["galleries"].items() if key[-1] == (1, 0, None))
+    assert gallery["cells"] == ["tri|2"]
+    assert gallery["marker"] == "pcna"
+    page = gallery["pages"][(gallery["queue_id"], 0)]
+    (card,) = page
+    assert (card["state"], card["action"], card["expected"], card["value"]) == (
+        "EdU+ / BrdU− / PCNA+", "Set PCNA−", [1, 0, 1], [1, 0, 0],
+    )
+    send_flip(review, {
+        "itemId": "tri|2", "cell": "tri|2", "expected": card["expected"], "value": card["value"],
+        "token": context["event_token"],
+    })
+    assert not review.exception
+    assert (root / "labels.csv").read_text() == "cell,edu,brdu,pcna\ntri|1,0,0,0\ntri|2,1,0,0\ntri|3,1,1,0\n"
+    assert context_of(review)["history"][-1].previous == (1, 0, 1)
+    assert "EdU+ / BrdU− / PCNA−" in context_of(review)["notice"]
+
+
+def test_gallery_rejects_a_flip_that_changes_more_than_its_marker(three_marker_barrage):
+    root, open_review = three_marker_barrage
+    review = open_review(labels=["tri|2,1,0,1"])
+    select_in_sidebar(review, "Review view", "BrdU correction gallery")
+    before = (root / "labels.csv").read_bytes()
+    send_flip(review, {
+        "itemId": "tri|2", "cell": "tri|2", "expected": [1, 0, 1], "value": [1, 1, 0],
+        "token": context_of(review)["event_token"],
+    })
+    assert not review.exception
+    assert (root / "labels.csv").read_bytes() == before
+    assert "Ignored an invalid gallery edit" in context_of(review)["notice"]
+
+
+def test_changing_only_a_label_rebuilds_the_source_and_survives_a_stale_filter(three_marker_barrage):
+    import json
+    import os
+
+    root, open_review = three_marker_barrage
+    review = open_review(labels=["tri|1,0,0,0"])
+    select_in_sidebar(review, "Review view", "EdU correction gallery")
+    select_in_sidebar(review, "EdU", "EdU+")
+    markers = json.loads(json.dumps(THREE_MARKERS))
+    markers["markers"][0]["label"] = "EdU label"
+    stat = (root / "markers.json").stat()
+    (root / "markers.json").write_text(json.dumps(markers))
+    os.utime(root / "markers.json", ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    review.run()
+    assert not review.exception
+    views = next(widget for widget in review.sidebar.selectbox if widget.label == "Review view").options
+    assert views == ["Cell review", "EdU label correction gallery", "BrdU correction gallery", "PCNA correction gallery"]
+    select_in_sidebar(review, "Review view", "EdU label correction gallery")
+    assert [widget.label for widget in review.sidebar.selectbox][-3:] == ["EdU label", "BrdU", "PCNA"]
+    assert review.sidebar.selectbox[-3].value == "Any"
+    select_in_sidebar(review, "Review view", "Cell review")
+    assert [widget.label for widget in review.segmented_control] == ["EdU label", "BrdU", "PCNA"]
+
+
+def test_stale_session_write_shows_the_mismatch_and_leaves_labels_unchanged(three_marker_barrage, monkeypatch):
+    import json
+    from dinoapp import review_session
+
+    root, open_review = three_marker_barrage
+    review = open_review(labels=["tri|1,0,0,0"])
+    select_in_sidebar(review, "Review view", "Cell review")
+    select_in_sidebar(review, "Cells", "All cells")
+    for label, value in (("EdU", 1), ("BrdU", 1), ("PCNA", 1)):
+        set_marker(review, label, value)
+    reordered = json.loads(json.dumps(THREE_MARKERS))
+    reordered["markers"].reverse()
+    persist = review_session.save_assignment
+
+    def stale_save(annotations, state_dir, context, cell, value, **kwargs):
+        (root / "markers.json").write_text(json.dumps(reordered))
+        return persist(annotations, state_dir, context, cell, value, **kwargs)
+
+    monkeypatch.setattr(review_session, "save_assignment", stale_save)
+    before = (root / "labels.csv").read_bytes()
+    next(widget for widget in review.button if widget.label == "Save and next").click().run()
+    assert not review.exception
+    assert (root / "labels.csv").read_bytes() == before
+    assert not context_of(review)["history"]
+    assert any("Marker contract mismatch" in element.value for element in review.info)
+    assert not list((root / "cell-review").glob("changes-*.jsonl"))
+
+
+def test_annotation_marker_change_rebuilds_the_source_and_the_sampled_field(tmp_path, monkeypatch):
+    import json
+    import os
+    import streamlit as st
+    from dino_markers import config_to_json, resolve_directory
+    from streamlit.testing.v1 import AppTest
+    from dinoapp import app, prod3
+
+    built = {"sources": 0, "fields": 0}
+
+    class Reader(FieldSource):
+        def __init__(self):
+            built["sources"] += 1
+            build_reader(self, tmp_path)
+            self.config = resolve_directory(tmp_path)
+
+        @classmethod
+        def annotation_directories(cls, root=None):
+            return (tmp_path,)
+
+        def field(self, *args):
+            built["fields"] += 1
+            return super().field(*args)
+
+    monkeypatch.setattr(prod3, "FieldSource", Reader)
+    monkeypatch.setenv("DINO_REVIEW_SOURCE", "Native fields")
+    monkeypatch.setenv("DINO_NATIVE_DATASET", "Prod3")
+    monkeypatch.setenv("DINO_REVIEW_LABEL_ROOT", str(tmp_path))
+    app.st.cache_resource.clear()
+    st.cache_data.clear()
+    (tmp_path / "labels.csv").write_text("cell,brdu,edu\nprod3-realigned-v1|1,0,0\n")
+    review = AppTest.from_file(app.__file__).run(timeout=20)
+    assert not review.exception
+    assert built == {"sources": 1, "fields": 1}
+    review.run()
+    assert not review.exception
+    assert built == {"sources": 1, "fields": 1}
+
+    markers = config_to_json(default_config())
+    markers["markers"][1]["label"] = "EdU label"
+    markers["presentation"]["crop_panels"] = ["pi", "edu", "brdu"]
+    stat = (tmp_path / "labels.csv").stat()
+    (tmp_path / "markers.json").write_text(json.dumps(markers))
+    os.utime(tmp_path / "markers.json", ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    review.run()
+    assert not review.exception
+    assert built == {"sources": 2, "fields": 2}
+    assert [widget.label for widget in review.segmented_control] == ["EdU label", "BrdU"]
+    review.run()
+    assert built == {"sources": 2, "fields": 2}
+
+
+def test_a_reordered_two_marker_contract_is_rejected_at_save(tmp_path, monkeypatch):
+    import json
+    from PIL import Image
+    from streamlit.testing.v1 import AppTest
+    from dinoapp import app, review_session
+
+    Image.new("RGB", (8, 8)).save(tmp_path / "crop.png")
+    (tmp_path / "index.csv").write_text("cell,rank,image_path\ntwo|1,0,crop.png\ntwo|2,1,crop.png\n")
+    (tmp_path / "labels.csv").write_text("cell,brdu,edu\ntwo|1,0,0\n")
+    monkeypatch.setenv("DINO_REVIEW_SOURCE", "Barrage")
+    monkeypatch.setenv("DINO_REVIEW_BARRAGE_DIR", str(tmp_path))
+    app.st.cache_resource.clear()
+    review = AppTest.from_file(app.__file__).run(timeout=20)
+    assert not review.exception
+    select_in_sidebar(review, "Review view", "Cell review")
+    assert [widget.label for widget in review.segmented_control] == ["EdU", "BrdU"]
+    set_marker(review, "EdU", 1)
+    set_marker(review, "BrdU", 0)
+    reordered = {**json.loads(json.dumps(THREE_MARKERS)), "reference": {"key": "pi", "label": "PI"}}
+    reordered["markers"] = [marker for marker in reordered["markers"] if marker["key"] != "pcna"]
+    reordered["presentation"]["crop_panels"] = ["pi", "edu", "brdu"]
+    persist = review_session.save_assignment
+
+    def stale_save(annotations, state_dir, context, cell, value, **kwargs):
+        (tmp_path / "markers.json").write_text(json.dumps(reordered))
+        return persist(annotations, state_dir, context, cell, value, **kwargs)
+
+    monkeypatch.setattr(review_session, "save_assignment", stale_save)
+    before = (tmp_path / "labels.csv").read_bytes()
+    next(widget for widget in review.button if widget.label == "Save and next").click().run()
+    assert not review.exception
+    assert (tmp_path / "labels.csv").read_bytes() == before
+    assert any(
+        "records reference 'pi', markers ['edu', 'brdu'], but this review session requires reference 'pi', markers ['brdu', 'edu']"
+        in element.value
+        for element in review.info
+    )

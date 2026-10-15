@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from dino import clean_labels
-from dino_markers import MarkerContract, parse_config, save_config
+from dino_markers import DEFAULT_CONTRACT, MarkerContract, parse_config, save_config
 from dinoapp.label_store import update_label
 
 
@@ -57,7 +57,7 @@ def test_cleaner_holds_reviewer_lock_and_preserves_reviewer_edit(monkeypatch, tm
             with path.with_suffix(".csv.lock").open("a") as lock:
                 with pytest.raises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            editing = reviewer.submit(update_label, path, "r|1", (1, 0))
+            editing = reviewer.submit(update_label, path, "r|1", (1, 0), contract=DEFAULT_CONTRACT)
             assert writer_waiting.wait(10), "Reviewer did not attempt the shared lock"
         finally:
             resume.set()

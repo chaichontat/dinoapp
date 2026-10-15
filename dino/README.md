@@ -1,8 +1,8 @@
 # DINO cell classification
 
-`thesis-dino` trains and runs frozen Cell-DINO feature extractors with logistic-regression heads for BrdU and EdU classification.
+`thesis-dino` trains and runs frozen Cell-DINO feature extractors with one logistic-regression head per binary marker. The packaged [marker configuration](#marker-configuration) defines the markers BrdU and EdU.
 
-The separate `dino-zarr` executable reads large fused and masked-label Zarrs directly. It is additive: the existing `dino` commands and their H5AD/workspace contracts are unchanged.
+The separate `dino-zarr` executable reads large fused and masked-label Zarrs directly. Its commands take the marker configuration. The `dino` commands for H5AD and workspace inputs classify BrdU and EdU only.
 
 The package owns the complete barrage and classification workflow under one `dino` command:
 
@@ -22,7 +22,9 @@ The package owns the complete barrage and classification workflow under one `din
 
 The base installation provides source and crop readers, fitted pixel corrections,
 review artifact validation, and crop rendering. It does not install the reviewer,
-Torch, DINOv2, or OSQP. Native review requires Python 3.12 or newer.
+Torch, DINOv2, or OSQP. Native review requires Python 3.12 or newer. The marker definitions come from the
+`dino-markers` package in the repository's `markers/` directory, a core dependency
+that is installed from there alongside this package.
 
 Use `[compute]` for encoder execution, spatial fitting, direct-Zarr preparation,
 and pixelwise regionprops measurements. Use `[workspace]` for H5AD and microscopy
@@ -35,6 +37,7 @@ microscopy workspace, crop, and barrage readers. Run these commands from the
 uv venv
 uv pip install --no-deps -e /home/chaichontat/dinov2
 uv pip install \
+  -e ./markers \
   -e /home/chaichontat/fishtools2 \
   -e /home/chaichontat/squisher/squisher \
   -e /home/chaichontat/squisher/segment \
@@ -42,6 +45,165 @@ uv pip install \
 ```
 
 Cell-DINO requires the Cell-DINO DINOv2 checkout installed editable in the same environment and the selected Cell-DINO checkpoint. `--dinov2-repo` (or the path recorded in the model bundle) must identify that installed checkout: transforms are imported from the installed package, and model loading uses its local `hubconf.py`. The `--no-deps` install above preserves the environment's existing Torch stack; the checkout's legacy dependency pins should not replace it. The optional MNIST validation command requires DINOv3 to be importable in the environment.
+
+## Marker configuration
+
+Commands that name markers read them from a marker configuration, a JSON file
+with one reference channel and one to seven binary markers. The packaged default
+`dino_markers/markers.json` defines the reference `pi` and the markers `brdu` and
+`edu`:
+
+```json
+{
+  "version": 1,
+  "reference": {"key": "pi", "label": "PI"},
+  "markers": [
+    {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+    {"key": "edu", "label": "EdU", "color": "#00ff00"}
+  ],
+  "presentation": {
+    "crop_panels": ["pi", "edu", "brdu"],
+    "negative_color": [0.25, 0.25, 0.25],
+    "uncalled_color": "#999999",
+    "badge_colors": [
+      {"state": {"brdu": 0, "edu": 1}, "background": "#008f3a", "foreground": "#ffffff"},
+      {"state": null, "background": "#777777", "foreground": "#ffffff"}
+    ]
+  }
+}
+```
+
+A key starts with a lowercase letter and continues with lowercase letters, digits,
+or underscores. Keys are unique across the reference and the markers, may not
+equal a reserved column or record name (`dino_markers.RESERVED_KEYS`, for example
+`cell`, `label`, `labels`, and `cell_sha256`), and may not derive the same column
+or record name as another key or a reserved name (`brdu` with `p_brdu`, `embedding`
+with `embedding_model`). Labels are nonempty and unique. A
+color is `#rrggbb` or a list of three numbers in [0, 1].
+
+`presentation` holds display settings only. `crop_panels` lists the reference and
+every marker once and sets the panel order of combined barrage crops. It is
+independent of the marker order that defines labels and models.
+`negative_color` colors a call with every marker negative, and `uncalled_color`
+colors a cell without a saved call. A positive state blends its markers' colors by
+adding them per channel and clipping at 1. The optional `badge_colors` list sets
+the reviewer badge of named states: `state` maps every marker key to `0` or `1`,
+and `null` is "no saved call". A state without an entry uses its blended color,
+with a dark or white text color chosen from its luminance.
+
+A three-marker configuration with the reference `dapi` is:
+
+```json
+{
+  "version": 1,
+  "reference": {"key": "dapi", "label": "DAPI"},
+  "markers": [
+    {"key": "edu", "label": "EdU", "color": "#00ff00"},
+    {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+    {"key": "pcna", "label": "PCNA", "color": "#00ffff"}
+  ],
+  "presentation": {
+    "crop_panels": ["dapi", "edu", "brdu", "pcna"],
+    "negative_color": "#404040",
+    "uncalled_color": "#999999"
+  }
+}
+```
+
+### Marker contract
+
+The marker contract is the reference key and the ordered marker keys, for example
+`{"version": 1, "reference": "pi", "markers": ["brdu", "edu"]}`. Every artifact
+that depends on the markers records it, and each reader compares the recorded
+list with the active one. Labels, colors, and panel order are presentation and
+never invalidate features or models, but marker order does. A reordered list of
+the same markers is a different contract, and every command fails on it with a
+message naming both orders. A marker count above seven is rejected because call
+codes are `uint8`.
+
+Everything persisted per marker derives from its key. The label column is the
+key `k`. Predictions use `p_k` and `k`, bundles use `k_cutoff`, `k_model`, and
+`k_feature_scaler`, barrage indexes use `k_image_path` and `k_mean`, `k_min`,
+`k_max`, `k_median`, `k_std`, and regionprops tables use `intensity_k_mean`. Under
+the default configuration these are the `brdu` and `edu` names. A call code is the
+label read as a binary number with the first contract marker as the most
+significant bit, and "no call" is `2**N`; for the default configuration the code is
+`edu + 2 * brdu` and "no call" is 4.
+
+### Commands
+
+Without `--markers`, a command that creates an artifact uses the packaged default.
+A command that consumes an existing artifact takes its contract from the
+artifact. There, `--markers PATH` only asserts compatibility: it must equal the
+artifact's contract, and it never reinterprets the artifact.
+
+| Command | `--markers PATH` | Contract from |
+| --- | --- | --- |
+| `dino-zarr prepare` | Defines the new source; `--channel KEY=PATH` supplies each channel | The file, or the packaged default; an output directory that already declares a contract must equal it |
+| `dino-zarr barrage` | Asserts | The source; an output directory that already declares a contract must equal it |
+| `dino-zarr train` | Asserts | Every `--barrage-dir` and the target source, all equal |
+| `dino-zarr infer` | Asserts | The model bundle, which must equal the source's |
+| `dino-zarr periodic fit` | Defines the fitted targets, in order | The file, or the packaged default |
+| `dino-zarr periodic apply`, `measure` | none | The field bundle's `targets` and the classifier's contract, which must agree |
+| `dino clean-labels` | none | The barrage directory, under the label-file lock |
+| `python -m dino.cortex_score`, `dino.joint_train`, `dino.review_activation` | none | The bundles and records they read |
+
+A source prepared with `--markers` carries that file as `markers.json` beside
+`source.json`, and a barrage carries the resolved configuration as `markers.json`
+in its directory. A reader that finds a `markers.json` uses its presentation. A
+directory without one uses the packaged default. A different `markers.json` is
+rejected when its contract differs from the contract the directory's records
+declare. A new prepare or barrage run fails when the directory's `markers.json`
+differs from the run's configuration in any way, including presentation; supply that file with `--markers` or
+use a new output directory. Every
+`labels.csv` write also checks the directory's contract under the label-file lock.
+
+### Artifact records
+
+Every new artifact carries the current version of its family and a
+`marker_contract` field, under the default contract too. A current record without
+the field fails with an error naming the artifact. An existing artifact is never
+rewritten. The reader normalizes a legacy record in memory to the default
+contract before it compares records:
+
+| Artifact | Current version | Legacy version, read as the default contract |
+| --- | --- | --- |
+| Prepared source `complete.json` | `dino-zarr-source-complete-v2` | `dino-zarr-source-complete-v1` |
+| Barrage `run.json`, `complete.json` | `dino-zarr-barrage-v4`, with `crop_panels` | `dino-zarr-barrage-v3`, with panels PI, EdU, BrdU |
+| Feature cache metadata | `dino-zarr-features-v3` | `dino-zarr-features-v2` |
+| Model bundle | `dino-zarr-model-v7` | `dino-zarr-model-v6` |
+| Intensity-context bundle | `dino-knn-intensity-v2` | `dino-knn-intensity-v1` |
+| Joint bundle | `dino-joint-dataset-v2` | `dino-joint-dataset-v1` |
+| Inference `contract.json`, `complete.json`, partition metadata | `dino-zarr-infer-v3` | `dino-zarr-infer-v2` |
+| Cortex rescore `complete.json`, partition metadata | `dino-cortex-rescore-v2` | `dino-cortex-rescore-v1` |
+| RHU2 `spatial.json` | `rhu2-spatial-review-v2` | `rhu2-spatial-review-v1` |
+| Reviewer change journal | `dino-review-journal-v1` | records without `schema` |
+
+A directory without records, such as a hand-made barrage, has the default
+contract unless it holds a `markers.json`. The periodic field bundle,
+`correction.json`, and the measure records keep their versions: the field
+bundle's ordered `targets` list is their recorded contract.
+
+A run that already holds a versioned record continues in that version. An
+interrupted inference, rescore, or barrage run, an extended feature cache, an existing
+change journal, and an existing RHU2 `spatial.json` keep the version they were
+started in, so no run mixes versions. A legacy run can continue only under the default contract. A new
+output directory writes the current version throughout. Records of one run are
+compared with each other exactly, so partitions and completion records must agree
+in version with their run record.
+
+A derived artifact is a new file built from an existing one, and it is written in
+the current version with the input's contract while the input is left
+untouched. The classifiers that `dino periodic apply` and `measure` write and the
+bundle that `dino.spatial_pixels.bind_spatial_subtraction` returns are derived: a
+`dino-zarr-model-v6` or `dino-knn-intensity-v1` input yields a v7 or v2 bundle
+with the default contract. Source files, chunk partials, `display.json` caches, and
+embedding partitions carry no marker identity and are not stamped.
+
+The legacy H5AD pipeline (`dino train`, `infer`, `barrage`, `rf-*`, `model-sweep`,
+`roc`, `run`), the RHU2 training, embedding, and prediction modules, the residual
+BrdU analyses, and the BrdU/DAPI spatial subtraction fitting classify BrdU and
+EdU only and run under the default contract.
 
 ## Inputs
 
@@ -57,8 +219,8 @@ repository's `dinoapp/` directory. The
 `dino label` compatibility command runs `python -m dinoapp` using the current
 Python interpreter. Install the reviewer separately in that environment. It
 discovers datasets from the barrage index and uses explicit
-`brdu_image_path`, `edu_image_path`, and `combined_image_path` columns when
-present. Choose **Review target → Prod2** or **Prod3** for spatial
+`{key}_image_path` columns for each marker (`brdu_image_path` and `edu_image_path`
+by default) and `combined_image_path` when present. Choose **Review target → Prod2** or **Prod3** for spatial
 field and model-miscall modes; native dependencies load only after selection.
 The adapters, renderer, label store, legacy labeler, and reviewer tests are
 maintained in `dinoapp`; no reviewer source files are retained in this package.
@@ -72,10 +234,11 @@ DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
   conda run -n multi dinoapp --server.port 8502
 ```
 
-For every labeled cell, training reads its registered fused image and segmentation, masks the crop to the target cell, and places BrdU and EdU in the first two model channels. The frozen backbone produces features; separate cross-validated logistic regressions classify BrdU and EdU. The held-out test fraction defaults to 20%.
+For every labeled cell, training reads its registered fused image and segmentation, masks the crop to the target cell, and places each marker's input channels in the model channels. The frozen backbone produces features; separate cross-validated logistic regressions classify each marker. The held-out test fraction defaults to 20%.
 
 Both trainers use fixed-seed
-joint-label, BrdU, then EdU stratification policies, checking partition capacity
+stratification policies on the joint label, then on each marker in contract order
+(BrdU, then EdU by default), checking partition capacity
 and `--limit`. A supported split needs both classes for each marker in the
 held-out partition and at least two of each class in training; otherwise
 training fails before feature extraction.
@@ -152,9 +315,9 @@ Prepare the globally reconciled masked labels once, then generate the barrage wi
 ```bash
 dino-zarr prepare \
   --labels /working/eduseg/20260808-prod2/cp-large/masked/labels.zarr \
-  --pi /working/eduseg/20260808-prod2/234-3-514561638/fusion-405-l0-g20-d40/fused.ch0.ome.zarr \
-  --edu /working/eduseg/20260808-prod2/234-3-514561638/fusion-514-l0-t1k/fused.ch0.ome.zarr \
-  --brdu /working/eduseg/20260808-prod2/234-3-514561638/fusion-638-l0/fused.ch1.ome.zarr \
+  --channel pi=/working/eduseg/20260808-prod2/234-3-514561638/fusion-405-l0-g20-d40/fused.ch0.ome.zarr \
+  --channel edu=/working/eduseg/20260808-prod2/234-3-514561638/fusion-514-l0-t1k/fused.ch0.ome.zarr \
+  --channel brdu=/working/eduseg/20260808-prod2/234-3-514561638/fusion-638-l0/fused.ch1.ome.zarr \
   --offset-zyx 0 4304 2911 \
   --out-dir /working/eduseg/20260808-prod2/dino-src
 
@@ -162,6 +325,18 @@ dino-zarr barrage \
   --source-dir /working/eduseg/20260808-prod2/dino-src \
   --out-dir /working/eduseg/20260808-prod2/dino-barrage
 ```
+
+`--channel KEY=PATH` is repeated once for each key of the marker contract, the
+reference and every marker, so the keys must equal that set exactly. With
+`--markers PATH`, the file defines the source (for example the three-marker
+configuration above with `--channel dapi=... --channel edu=... --channel brdu=...
+--channel pcna=...`). Preparation writes `dino-zarr-source-complete-v2` with the
+contract and a `markers.json` beside `source.json`; `source.json` and its digest do
+not depend on the configuration. The barrage takes its contract from the source,
+renders one panel per `crop_panels` entry, and writes `markers.json`,
+`{key}_image_path` and `{key}_mean`, `_min`, `_max`, `_median`, and `_std` columns
+for every marker. `--display-max KEY=VALUE` overrides the rendered maximum of any
+contract channel key.
 
 For native postprocessed labels, `prepare --measured-props /path/to/props.parquet`
 reuses the regionprops table. The label store must record its indexed
@@ -185,6 +360,26 @@ dino-zarr infer \
   --model-dir /working/eduseg/20260808-prod2/dino-model \
   --out-dir /working/eduseg/20260808-prod2/dino-infer
 ```
+
+`--input-channel TARGET=CHANNEL` names the source channels that fill a marker's
+model input slots. It is repeated, in flag order, for each slot of a target. The
+target must be a marker of the contract and the channel a key of the reference or
+a marker, unique within the target, and no more than the encoder's input slots.
+Under the default contract a target without the flag uses the channels `brdu` and
+`edu`. Under any other contract every marker must be given its channels. This
+example pairs each marker with `pi`:
+
+```bash
+dino-zarr train --barrage-dir BARRAGE --out-dir MODEL \
+  --input-channel brdu=brdu --input-channel brdu=pi \
+  --input-channel edu=edu --input-channel edu=pi
+```
+
+Training writes a `dino-zarr-model-v7` bundle and `dino-zarr-features-v3` cache
+metadata with the contract, and `dino-zarr infer` writes
+`dino-zarr-infer-v3` records, as listed under [Artifact records](#artifact-records).
+Prediction partitions hold `cell`, `dataset`, `roi`, `label`, then `p_k` for each
+marker in contract order, then each marker's binary call `k`.
 
 For large sources, run one chunk-preserving shard per GPU. Each label chunk is
 assigned wholly to one shard, so workers do not duplicate the expensive label
@@ -222,8 +417,8 @@ identity and its preparation, barrage, model, and feature-cache contracts. Older
 metadata-only manifests must be regenerated in a new preparation directory,
 followed by the dependent barrage/model workflow; they are not silently upgraded.
 
-Inference publishes `contract.json` before processing. It binds the prepared
-table bytes, requested input and cell order, model bundle, source content,
+Inference publishes `contract.json` before processing. It binds the marker
+contract, the prepared table bytes, requested input and cell order, model bundle, source content,
 external intensity-context table when used,
 classification cutoffs, shard, precision, and partition layout. Resume validates
 saved prediction metadata and cell IDs and, when requested, BF16 embedding shape
@@ -250,7 +445,17 @@ channels, preprocessing, and precision; a contract change invalidates the
 entries instead of mixing incompatible embeddings. Without this option, the
 cache remains under `<out-dir>/features.joblib`.
 
-The barrage displays raw 405/514/638 crops as PI/EdU/BrdU. The masked labels only define cell pixels and outlines. Training selects separate BrdU and EdU probability cutoffs on the held-out set; inference retains probabilities alongside the binary calls.
+The barrage displays the raw crops of the reference and each marker as the panels of `presentation.crop_panels`, PI, EdU, then BrdU by default (raw 405/514/638 nm for the production source). The masked labels only define cell pixels and outlines. Training selects a separate probability cutoff for each marker on the held-out set; inference retains probabilities alongside the binary calls.
+
+### Read inference calls
+
+`dino.call_provenance.load_calls(inference, expected_cells, source_hash)` validates
+every shard against its `complete.json` and returns `(calls, records)`. `calls` maps
+each marker key, in contract order, to its binary call array over the requested
+cells, and `records` lists the shard records. The contract is the one the shards'
+`complete.json` files record, and all shards must agree; a `dino-zarr-infer-v2` and
+a `dino-zarr-infer-v3` shard of the default contract combine. A caller reads
+`calls["brdu"]` and `calls["edu"]` by key.
 
 ### Shared periodic intensity correction
 
@@ -273,9 +478,14 @@ dino periodic apply --model periodic-fit/model.joblib \
   --out-dir periodic-applied
 ```
 
+`fit` takes `--markers` and fits one gain field per marker of the configuration,
+and the field bundle records the ordered `targets`. Its coefficient columns follow
+that order. `apply` and `measure` take the targets from the field bundle and require
+them to equal the markers of the classifier's contract.
+
 Fit population columns: unique `label`, `centroid_z/y/x` in pixels, `u`, `v`,
-`r_vz` in µm, original acquisition `tile_index`, and `intensity_brdu_mean` /
-`intensity_edu_mean`. Select the intended anatomical population before fitting;
+`r_vz` in µm, original acquisition `tile_index`, and `intensity_<key>_mean` for
+each target (`intensity_brdu_mean` and `intensity_edu_mean` by default). Select the intended anatomical population before fitting;
 only cells within the specified half-open Z range are sampled. Derive periods
 from recorded acquisition tile placement. XY phases use centroid times voxel
 spacing, with zero origin. Each Z slab must populate every held-out tile fold.
@@ -285,6 +495,8 @@ before the existing intensity-context loader computes cell and neighbor features
 Use `props-corrected.parquet` for subsequent context-model refits. Supplying
 `--classifier` writes `model.joblib` bound to that table for `dino-zarr infer
 --model-dir periodic-applied`; coefficients and embeddings are preserved. The
+written classifier is a derived artifact: it is in the current version with its
+input's contract, and the input file is unchanged. The
 classifier must already reference the supplied uncorrected props and spacing.
 Parquet provenance rejects repeat correction. Existing fitted shared-field
 artifacts with the same spline/period/coefficient fields are accepted by apply.
@@ -307,13 +519,16 @@ dino-zarr infer --source-dir dino-source --model-dir pixel-model \
 The source must have aligned image/label grids. The classifier must reference
 that source and the same voxel spacing. Gain values are evaluated on the
 original image grid before regional min/mean/max or DINO preprocessing, using
-float32 multiplication. The shared model is applied to BrdU/EdU, with raw source
+float32 multiplication. The shared model is applied to each of its targets (BrdU and EdU
+by default), with raw source
 pixels read through existing chunk caches. A bounded in-memory 960×960 gain-tile
 cache reuses the field across Z; corrected image volumes and gain maps are never
 materialized. Regionprops measurements retain their existing resumable partial
 measurement tables. `pixel-model` contains measured `props.parquet`, a bound
 `model.joblib`, and provenance/completion records. Classifier coefficients are
 preserved for reembedding; refit classifiers using the new embeddings and props.
+Like `apply`, `measure` writes a derived classifier in the current version with its
+input's contract.
 
 Completed pixel-measurement runs verify their recorded output digests before
 reuse. A directory containing final properties or a final model without
@@ -440,9 +655,13 @@ preparation records.
 ### Smooth raw BrdU subtraction for reembedding
 
 Bind a saved `dino.spatial_subtraction.SpatialSubtraction` to a copied inference
-bundle through `dino.spatial_pixels.bind_spatial_subtraction`. This adds the
-`spatial_subtraction` contract and preserves the encoder, classifiers, context
-properties and existing periodic correction:
+bundle through `dino.spatial_pixels.bind_spatial_subtraction`. It returns a derived
+bundle in the current version with the input's contract and leaves the supplied
+bundle unchanged. The result adds the `spatial_subtraction` contract and preserves
+the encoder, classifiers, context properties and existing periodic correction.
+Subtraction supports only BrdU against the `pi` channel verified as 405 nm DAPI:
+a bundle whose contract has another reference or no `brdu` marker, and a
+subtraction of another target or reference, are rejected:
 
 ```python
 from pathlib import Path
@@ -495,12 +714,13 @@ by the config's `context_features`: either `log1p_cell_mean`,
 log((marker + 1)/(DAPI + 1)) centered on the median and divided by 1.4826 × MAD
 of that ratio over its 100 nearest cells, a local background reference that
 tolerates the labeled minority of a neighborhood. The
-validation holdout is stratified by dataset and joint BrdU/EdU label, and one
+validation holdout is stratified by dataset and the joint label of the contract
+markers, falling back to dataset and each marker in order, and one
 cutoff per marker is chosen on it. `metrics.json` also reports out-of-fold
 metrics per dataset. Within one dataset the intercept and other-dataset columns
 are constant, so `OUT/deploy/<dataset>/model.joblib` stores the exactly
-collapsed `dino-knn-intensity-v1` bundle for that dataset; existing scorers
-apply it unchanged. Example: `/working/eduseg/prod2-prod3-joint/config.json`.
+collapsed `dino-knn-intensity-v2` bundle for that dataset with the marker
+contract of the embedding bundle; the scorers read it directly. Example: `/working/eduseg/prod2-prod3-joint/config.json`.
 `--workers` sets the processes for reading labeled embeddings and for the
 single-threaded logistic fits (C search, final and out-of-fold fits); results
 are identical for any worker count.
@@ -508,7 +728,10 @@ are identical for any worker count.
 `python -m dino.cortex_score` takes the arguments of
 `full-run2/score-cortex.py` plus `--workers N` and writes the same prediction
 parquets with their provenance and `complete.json`, scoring partitions in
-parallel worker processes. It does not copy embeddings into the output
+parallel worker processes. Its prediction files hold `p_k` and `k` for each marker, in the
+contract order of the classifier bundle, and `complete.json` records
+`dino-cortex-rescore-v2` with `marker_contract` and a `<key>_positive`
+count for each marker. It does not copy embeddings into the output
 (`stores_embeddings: false`); they stay in the source embedding run. Each worker
 loads the bundle and kNN intensity context once. PCA-projected bundles are
 rejected. Source shards and partitions must match their recorded counts and
@@ -523,6 +746,10 @@ its acquisition metadata or explicit `--z-step-um` and records `spacing_by_roi`
 in `prepared.json`. Measurement and fitting require this prepared spacing;
 an explicit fitting value must agree. Scoring uses the fitted bundle's
 `spacing_by_roi` so its neighbor geometry matches training.
+
+The RHU2 spatial snapshot is `rhu2-spatial-review-v2` with the default contract,
+because it holds the frozen release's `brdu_prob` and `edu_prob` columns. Activation
+requires that contract, accepts a v1 or v2 snapshot, and keeps the snapshot's version.
 
 RHU2 rescoring marks inference incomplete before publishing ROI tables and
 marks it complete only after all ROIs pass validation. Activation stages tables
@@ -560,6 +787,6 @@ results do not provide this controlled comparison.
 on all supplied labels, then fits all labels. Its `FinalFit.fitted.collapse(d)`
 returns an ordinary `StandardScaler` and `LogisticRegression` over the original
 embedding and three context columns, preserving probabilities for dataset `d`.
-These objects and `FinalFit.cutoffs[d]` can populate the existing
-`dino-knn-intensity-v1` deployment bundle consumed by `dino.cortex_score`.
+These objects and `FinalFit.cutoffs[d]` can populate a `dino-knn-intensity`
+deployment bundle consumed by `dino.cortex_score`.
 The estimator and evaluation APIs do not activate an application model.

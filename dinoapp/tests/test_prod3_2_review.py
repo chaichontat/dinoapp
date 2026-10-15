@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+from dino_markers import default_config
 
 from dinoapp.sources import NativeSource
 
@@ -16,8 +17,8 @@ def test_saved_labels_can_be_reviewed_without_becoming_training_rows(tmp_path: P
         training_predictions=frame.iloc[:0], gallery_predictions=frame,
         cell_id=lambda label: f'235-4-edu-workflow|{label}',
         display_name='Prod3-2 native', model_version='baseline', origin=[0.], scale=[.6],
-        edu_cell_crop=lambda label: (b'corrected crop', 4),
-        brdu_cell_crop=lambda label: (b'corrected crop', 4),
+        config=default_config(),
+        marker_crop=lambda label, marker: (b'corrected crop', 4),
         cell_crop=lambda label: (b'corrected crop', 4),
     )
     adapter = NativeSource(source, label_root=tmp_path)

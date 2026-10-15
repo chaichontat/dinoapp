@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from dino_markers import DEFAULT_CONTRACT, default_config, toggle_marker
 from PIL import Image
 from skimage.segmentation import find_boundaries
 
@@ -51,15 +52,15 @@ INDEX_CELLS = ["tiny:r1|1", "tiny:r1|2", "tiny:r1|3"]
 
 
 def _update(path: Path, cell: str, value, *, expected="any"):
-    return update_label(path, cell, value, expected=expected)
+    return update_label(path, cell, value, contract=DEFAULT_CONTRACT, expected=expected)
 
 
 def _annotations(paths: tuple[Path, ...], default: Path) -> AnnotationFiles:
-    return AnnotationFiles(paths, default)
+    return AnnotationFiles(paths, default, contract=DEFAULT_CONTRACT)
 
 
 def _barrage_annotations(source: BarrageSource) -> AnnotationFiles:
-    return AnnotationFiles(source.annotation_paths, source.default_annotation_path)
+    return AnnotationFiles(source.annotation_paths, source.default_annotation_path, contract=source.config.contract)
 
 
 def _saved_values(annotations: AnnotationFiles) -> dict[str, tuple[int, int]]:
@@ -75,7 +76,7 @@ def _crop(source, cell: str, marker: str):
 
 
 def _toggle(value, marker: str):
-    return {"brdu": native.toggle_brdu, "edu": native.toggle_edu}[marker](value)
+    return toggle_marker(DEFAULT_CONTRACT, value, marker)
 
 
 def _save(annotations, state_dir: Path, context, cell: str, value, *, expected, record):
@@ -87,7 +88,8 @@ def _undo(annotations, context, state_dir: Path, edit) -> None:
 
 
 def _render_marker_crop(crop: CellCrop, marker: str, display_max: float) -> bytes:
-    return {"brdu": native.render_brdu_crop, "edu": native.render_edu_crop}[marker](crop, display_max)
+    label = {"brdu": "BrdU", "edu": "EdU"}[marker]
+    return native.render_marker_crop(crop, marker, display_max, label=label)
 
 
 def _load_native_calls(root: Path) -> np.ndarray:
@@ -96,11 +98,12 @@ def _load_native_calls(root: Path) -> np.ndarray:
 
 def _overlay_calls(field_ids: np.ndarray, predicted: np.ndarray, manual: dict[str, tuple[int, int]]) -> np.ndarray:
     source = object.__new__(native.FieldSource)
+    source.config = default_config()
     source.calls = predicted
     return source.field_calls(SimpleNamespace(ids=field_ids), SimpleNamespace(values=manual))
 
 
-FIELD_MODES = {"brdu": "BrdU", "edu": "EdU", "merge": "Cell identities", "identities": "Cell identities"}
+FIELD_MODES = {"brdu": "brdu", "edu": "edu", "merge": "Cell identities", "identities": "Cell identities"}
 
 
 def _render_field_pixels(
@@ -119,7 +122,7 @@ def _render_field_pixels(
     ids, inverse = np.unique(mask, return_inverse=True)
     borders = find_boundaries(mask, mode="inner") & (mask > 0)
     field = native.Field(
-        images={"561": np.zeros_like(brdu), "BrdU": brdu, "EdU": edu},
+        images={"pi": np.zeros_like(brdu), "brdu": brdu, "edu": edu},
         mask=mask,
         ids=ids,
         inverse=inverse.reshape(mask.shape),
@@ -137,11 +140,12 @@ def _render_field_pixels(
     url = native.render_field(
         field,
         calls,
+        config=default_config(),
         mode=FIELD_MODES[view],
         selected=None,
         border_alpha=1.0,
         boundary_alpha=0.0,
-        contrast=np.array([[0.0, 1.0], contrast["brdu"], contrast["edu"]]),
+        contrast={"pi": (0.0, 1.0), "brdu": contrast["brdu"], "edu": contrast["edu"]},
     )
     prefix = "data:image/png;base64,"
     assert url.startswith(prefix)
@@ -533,6 +537,8 @@ def test_marker_crop_rendering_reproduces_the_frozen_barrage_crops(marker):
 # Change journal and backups.
 # ---------------------------------------------------------------------------
 
+DEFAULT_JSON = {"version": 1, "reference": "pi", "markers": ["brdu", "edu"]}
+
 EDIT_KEYS = {
     "assign": ["action", "source_id", "dataset_filter", "cell", "previous", "value", "path", "time_utc"],
     "gallery_toggle_edu": ["action", "source_id", "queue_id", "cell", "previous", "value", "path", "time_utc"],
@@ -631,7 +637,11 @@ def test_new_session_backs_up_labels_before_its_first_edit_and_journals_undo(tmp
     assert (state_dir / "barrage-fresh002.csv").read_bytes() == before
     assert (root / "labels.csv").read_bytes() == b"cell,brdu,edu\ntiny:r1|1,0,1\ntiny:r1|2,0,0\ntiny:r1|3,1,1\n"
     records = [json.loads(line) for line in (state_dir / "changes-fresh002.jsonl").read_text().splitlines()]
-    assert [list(record) for record in records] == [EDIT_KEYS[record["action"]] for record in records]
+    assert [list(record) for record in records] == [
+        [*EDIT_KEYS[record["action"]][:-1], "schema", "marker_contract", "time_utc"] for record in records
+    ]
+    assert {record["schema"] for record in records} == {"dino-review-journal-v1"}
+    assert all(record["marker_contract"] == DEFAULT_JSON for record in records)
     assert [(record["action"], record["cell"], record["previous"], record["value"]) for record in records] == [
         ("gallery_toggle_brdu", "tiny:r1|2", [1, 0], [0, 0]),
         ("assign", "tiny:r1|1", [0, 1], [1, 1]),

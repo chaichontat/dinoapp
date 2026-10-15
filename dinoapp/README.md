@@ -1,9 +1,10 @@
 # dinoapp
 
-`dinoapp` lets you inspect cell images and save manual BrdU and EdU calls in a
-browser. Review individual cells, correct one marker across a gallery, or inspect
-cells in their spatial context. A **barrage** is a directory of cell crops with
-an index connecting each image to its cell.
+`dinoapp` lets you inspect cell images and save manual calls for binary markers
+in a browser. The markers are BrdU and EdU unless the target's
+[`markers.json`](#markers) defines others. Review individual cells, correct one
+marker across a gallery, or inspect cells in their spatial context. A **barrage** is
+a directory of cell crops with an index connecting each image to its cell.
 
 dinoapp is one of two packages in the `dinoinfer` repository. The other,
 [`thesis-dino`](../dino/README.md) in `dino/`, generates barrages, trains
@@ -17,7 +18,7 @@ the Python environment where you want to install and launch the app:
 ```bash
 git clone https://github.com/chaichontat/dinoapp.git dinoinfer
 cd dinoinfer/dinoapp
-python -m pip install -e .
+python -m pip install -e ../markers -e .
 
 export DINO_REVIEW_BARRAGE_DIR=/path/to/barrage
 dinoapp --server.port 8502
@@ -30,10 +31,13 @@ forwarded to Streamlit.
 1. In the sidebar, choose **Review target → Crop directory** and check **Barrage directory**.
 2. Choose **Review scope → Dataset cells** and **Review view → Cell review**.
    Correction galleries require saved labels and can be empty on a new target.
-3. Choose a **Dataset** and **Saved state → Unlabeled**.
-4. Inspect the combined crop and click the BrdU/EdU identity you want to save.
-   `+` means positive and `−` means negative. Each click saves immediately and
-   advances to the next cell.
+3. Choose a **Dataset** and **Cells → Unsaved**.
+4. Inspect the combined crop and set each marker with its `−` or `+` control (BrdU
+   and EdU by default). `+` means positive and `−` means negative. The controls
+   change a draft only. **Save and next** is available once every marker has a
+   value; it writes the complete call in one save and advances to the next cell.
+   A cell with no saved call is never shown or filtered as all-negative; that state
+   exists only after you save every marker as `−`.
 5. Use **Undo last edit** to reverse the most recent edit for the current review
    target. Its history is shared across crop, gallery, and spatial views in this
    browser session. Switching targets keeps their histories separate; restarting
@@ -45,6 +49,25 @@ forwarded to Streamlit.
 Labels are saved to `labels.csv` inside the barrage directory. It is created on
 the first saved label if it does not exist.
 
+## Markers
+
+dinoapp takes no marker input. It reads the markers of each review target from the
+target's own directory: the `markers.json` in the crop or annotation directory, or
+the packaged default (reference `pi`, markers `brdu` and `edu`) when the directory
+has none. `markers.json` sets each marker's key, label, and color, the crop panel
+order, and the badge colors; its format is described in the
+[thesis-dino README](../dino/README.md#marker-configuration). The control labels,
+filters, badges, field colors, and `labels.csv` columns follow it.
+
+The artifacts that `thesis-dino` writes record the ordered marker keys, and the
+directory's records and `markers.json` must agree. A hand-made barrage without
+records has the default contract unless it holds a `markers.json`. Every write to
+`labels.csv` first checks that the directory still has the contract the session
+was opened with. If it changed, the write is rejected, `labels.csv` is left
+untouched, and the next render opens a new session with its own history and
+backup. Editing `markers.json` while the app runs, including a change of labels or
+colors, rebuilds that target's sources and fields on the next render.
+
 ## Choose a target, scope, and view
 
 **Review target** opens a crop directory or one of the configured native datasets.
@@ -54,11 +77,14 @@ supported by that target and scope.
 
 | View | Available with | What you do |
 | --- | --- | --- |
-| **Cell review** | Combined crops in a crop directory or native dataset; captured cells | Assign both markers from one combined crop. |
-| **EdU correction gallery** | Targets with EdU crops | Click an EdU crop to flip EdU while preserving BrdU. |
-| **BrdU correction gallery** | Targets with BrdU crops | Click a BrdU crop to flip BrdU while preserving EdU. |
+| **Cell review** | Combined crops in a crop directory or native dataset; captured cells | Assign every marker from one combined crop. |
+| **EdU correction gallery**, **BrdU correction gallery** | Targets with that marker's crops | Click a crop to flip that marker while preserving the others. |
 | **Spatial field** | Native datasets or a crop directory with an RHU2 `spatial.json` | Select and annotate cells in their spatial context. |
 | **Correction gallery** in **Training miscalls** scope | Native datasets | Review ranked model disagreements; each marker has its own card. |
+
+There is one correction gallery for each marker that has crops, titled
+`<label> correction gallery`, in the order of the configuration's display markers
+(EdU, then BrdU, by default).
 
 In a field, **Review selected cell** opens its crop and **Review cells in this
 field** captures a fixed queue of eligible cells. These actions create a
@@ -79,17 +105,22 @@ contract. A `display.json` binds corrected pixels; it does not link that directo
 annotations to a separately opened native target. Matching numeric labels do not
 establish a relationship between targets.
 
-Correction galleries match the **Saved state** filter against current manual
-labels. Their queues stay fixed while you edit: a corrected cell remains in its
-loaded position until you click **Refresh matches**. **Cell review** uses the
-same behavior; click **Refresh cells** to rebuild its dataset queue. To rebuild
+Correction galleries match one filter per marker against current manual labels.
+Each filter is **Any**, `<label>+`, or `<label>−`, and together they select the
+saved states to show; a cell without a saved call never matches a marker filter.
+Their queues stay fixed while you edit: a corrected cell remains in its
+loaded position until you click **Refresh matches**. **Cell review** has the
+same behavior; click **Refresh cells** to rebuild its dataset queue. Its **Cells**
+option is **Unsaved**, **Saved**, or **All cells**, and **Saved** adds the same
+per-marker filters. To rebuild
 a captured field queue, return to the field and choose **Review cells in this field**.
 
 Native galleries also have an **Examples** filter. **Training** and **Validation**
 refer to the selected model's actual fitting roster. **All labeled** in correction
 galleries can include saved annotations on cells outside that roster. The
 **Training miscalls** scope uses the model's training review rows; a cell may have
-separate cards for BrdU and EdU disagreements.
+a separate card for each marker's disagreement, and the **Disagreement** filter
+selects one marker or any marker.
 
 ## Barrage input files
 
@@ -102,6 +133,10 @@ sample:1|10,0,sample,1,images-brdu/0.png,images-edu/0.png,images-combined/0.png
 sample:1|20,1,sample,1,images-brdu/1.png,images-edu/1.png,images-combined/1.png
 ```
 
+Each marker has its own image column, `<key>_image_path`: `brdu_image_path` and
+`edu_image_path` here, and for example `pcna_image_path` with a `pcna` marker in
+`markers.json`.
+
 `cell` must be non-null and unique; `rank` must be unique and determines review
 order. Keep cell identifiers exactly as generated. `dataset` enables dataset
 filtering; `roi` adds context to crop captions. Image paths resolve from the
@@ -109,8 +144,9 @@ barrage directory and must stay inside it. An `image_path` column can supply
 the crop when a marker-specific path is absent.
 
 If `labels.csv` already exists, it must contain unique, non-null `cell` values
-and binary `brdu` and `edu` columns (`0` or `1`). Edits preserve other cells and
-extra columns, including annotations outside the displayed index.
+and a binary column (`0` or `1`) for each marker key (`brdu` and `edu` by default).
+Edits preserve other cells and extra columns, including annotations outside the
+displayed index.
 
 [docs/data-format.md](docs/data-format.md) gives the full input and output
 format, the image column each review mode needs, and a check to run before
@@ -131,7 +167,7 @@ Choose the inference workflow that matches your trained model:
 
 | Input and model | Command | Output |
 | --- | --- | --- |
-| A source prepared with `dino-zarr prepare` and a model from `dino-zarr train` | `dino-zarr infer` | Partitioned Parquet files in `predictions/`, with `p_brdu`, `p_edu`, `brdu`, and `edu`. |
+| A source prepared with `dino-zarr prepare` and a model from `dino-zarr train` | `dino-zarr infer` | Partitioned Parquet files in `predictions/`, with `p_<key>` and `<key>` for each marker (`p_brdu`, `p_edu`, `brdu`, and `edu` by default). |
 | H5AD cell metadata and a bundle from `dino train` | `dino infer` | A Parquet table containing `brdu_prob` and `edu_prob`. |
 
 For an existing direct-Zarr source and model, run:
@@ -144,8 +180,9 @@ conda run -n multi dino-zarr infer \
 ```
 
 The model directory must contain `model.joblib`. Inference checks the recorded
-source and feature settings, applies the model's saved marker cutoffs, and
-writes `complete.json` when the run finishes. Resume is enabled by default:
+source and feature settings and that the model and the source have the same
+marker contract, applies the model's saved marker cutoffs, and
+writes `complete.json` with `marker_contract` when the run finishes. Resume is enabled by default:
 rerun the same command to continue an interrupted run. Use a new output directory
 when changing the model or inputs.
 
@@ -188,8 +225,8 @@ paths below. To use them, those datasets must be accessible on the machine
 running the app. Installing the app does not download or prepare them.
 
 Native review requires Python 3.12 or newer and, in the same environment,
-`thesis-dino` from this repository's `dino/` directory and the local `squisher`
-package. The native extra declares these
+`thesis-dino` from this repository's `dino/` directory, `dino-markers` from
+`markers/`, and the local `squisher` package. The native extra declares these
 dependencies; it uses DINO's source readers, fitted corrections, review artifact
 validation, and renderer. Encoder execution and fitting dependencies are only
 needed when running DINO's compute commands. On the configured lab host, use the
@@ -198,6 +235,7 @@ existing `multi` environment:
 ```bash
 conda run -n multi python -m pip install --no-deps \
   -e /home/chaichontat/squisher/squisher \
+  -e ../markers \
   -e ../dino
 conda run -n multi python -m pip install -e '.[native]'
 DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
@@ -206,7 +244,9 @@ DINO_REVIEW_SOURCE="Native fields" DINO_NATIVE_DATASET=Prod3 \
 
 In the sidebar, choose **Review target → Prod2, Prod3, Prod2-2, or Prod3-2**, then
 choose **Review view → Spatial field**. The sidebar shows the selected classifier
-and its BrdU/EdU cutoffs.
+and its cutoff for each marker. The adapters read the reference and markers from the
+`markers.json` of the dataset's default labels directory, and they reject a
+classifier, prediction manifest, or inference record whose marker contract differs.
 
 Use **Position**, **Previous**, and **Next** to sample fields; adjust **Field
 width (µm)** and **Z (µm)** to inspect the surrounding tissue. Choose **Cell
@@ -214,8 +254,10 @@ identities** or **Model uncertainty** in **Right panel view**.
 
 Clicking an unannotated cell with a model call immediately confirms and saves
 that call. Clicking an already annotated cell selects it for inspection.
-Use **EdU only**, **BrdU only**, **Dual positive**, or **Neither** to change the
-selected cell's call. **Undo last edit** reverses the most recent saved edit.
+Use the `−` or `+` control of each marker, then **Save**, to change the selected
+cell's call; the badge names its state (for example **EdU only**, **Dual positive**,
+or **Neither** with two markers). **Undo last edit** reverses the most recent saved
+edit.
 
 ### Native save locations
 
@@ -278,8 +320,9 @@ visible in the raw images. The field has a 20 µm scale bar, and Z is shown as a
 native image plane. Selected-cell details show model probabilities and the saved
 identity. Clicking an unannotated cell saves its model call as described above.
 
-**BrdU vmax percentile** and **EdU vmax percentile** adjust each marker's upper
-display limit using pixels in the current field (default 99.8th percentile).
+One **`<label>` vmax percentile** input per marker (**BrdU vmax percentile** and
+**EdU vmax percentile** by default) adjusts that marker's upper display limit
+using pixels in the current field (default 99.8th percentile).
 The same limits apply to the selected-cell crop. These controls change display
 contrast only.
 
@@ -303,6 +346,9 @@ DINO_REVIEW_BARRAGE_DIR=/working/chaichontat/rhu2-barrage-review \
 ```
 
 Run preparation once: it refuses to overwrite an existing spatial snapshot.
+The snapshot is `rhu2-spatial-review-v2` with the default BrdU/EdU contract,
+because it holds the frozen release's `brdu_prob` and `edu_prob` columns; the app
+requires its probability columns and thresholds to match that contract.
 It records coordinates, existing probabilities, and cortical branch membership;
 it does not fit a model or copy images. Model calls use a probability cutoff of
 0.5 for each marker in the initial snapshot; an activated model supplies its own
@@ -313,14 +359,19 @@ separately from model prediction tables.
 
 Each annotation is saved immediately. Before the first edit to an existing labels
 file in a session, the app creates a CSV backup under `cell-review/`. Saved edits
-and successful undos are recorded in `changes-<session>.jsonl` there. Undo history
+and successful undos are recorded in `changes-<session>.jsonl` there. Each record of a new
+journal file holds the cell, its previous and new values as lists in marker order (or
+`null`), the label path, `schema` (`dino-review-journal-v1`), `marker_contract`, and
+the time. A journal that was started without `schema` and `marker_contract` keeps its
+form and continues only under the default contract. Undo history
 and loaded queues belong to the current Streamlit session; labels persist on disk.
 
 | What you see | What to do |
 | --- | --- |
-| An empty correction gallery | Select a saved identity that has labels. For a new barrage, start with **Cell review → Unlabeled**. For a transferred native model, try **All labeled**. |
+| An empty correction gallery | Set the per-marker filters to a saved state that has labels (**Any** matches both calls). For a new barrage, start with **Cell review → Cells → Unsaved**. For a transferred native model, try **All labeled**. |
 | An edited cell stays in the queue | Click **Refresh matches** or **Refresh cells** when you want to rebuild the queue from current labels. |
 | A message that a cell changed on disk | The edit or undo was rejected because another edit changed that cell. Reload the view before trying again. |
+| A marker contract mismatch | The directory's `markers.json` or records changed the ordered marker keys after the session opened, or the artifacts of one target disagree. Nothing was written. Reload to open a new session, and restore the intended `markers.json` or the matching artifacts. |
 | Missing `index.csv` or crop | Check **Barrage directory** and the image paths in `index.csv`. |
 | Native import or missing-file error | Check the native extras, local packages, and recorded dataset paths in the environment running the app. |
 | No **Spatial field** view for RHU2 | Open the prepared review directory containing `spatial.json`. |
@@ -330,14 +381,15 @@ and loaded queues belong to the current Streamlit session; labels persist on dis
 The random-forest-assisted labeler is available as `dinoapp-legacy` after
 `python -m pip install -e '.[legacy]'`. If `thesis-dino` is installed, `dino label`
 launches the main dinoapp. Barrage generation, training, inference, and periodic
-intensity correction belong to [`thesis-dino`](../dino/README.md).
+intensity correction belong to [`thesis-dino`](../dino/README.md). The legacy
+labeler assigns BrdU and EdU only.
 
 Run the following commands from this `dinoapp/` package directory. For development,
 install `.[dev,native,legacy]` and the local native packages, then
 run focused tests and lint checks:
 
 ```bash
-python -m pip install -e '.[dev,native,legacy]'
+python -m pip install -e ../markers -e '.[dev,native,legacy]'
 pytest tests/test_sources.py tests/test_label_store.py
 ruff check .
 ```

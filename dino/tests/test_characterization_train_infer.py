@@ -176,7 +176,7 @@ def _validate_feature_contract(bundle: dict, embedding_bundle: dict) -> None:
 
 def _combined_uncertainty(p_brdu, p_edu, *, brdu_cutoff: float, edu_cutoff: float) -> np.ndarray:
     return review_contracts.combined_uncertainty(
-        p_brdu, p_edu, brdu_threshold=brdu_cutoff, edu_threshold=edu_cutoff
+        {"brdu": p_brdu, "edu": p_edu}, {"brdu": brdu_cutoff, "edu": edu_cutoff}
     )
 
 

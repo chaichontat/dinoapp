@@ -7,6 +7,7 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+from dino_markers import DEFAULT_CONTRACT, SPATIAL_REVIEW, require_same_contract
 
 from dino.zarr_source import write_json_atomic
 from dino.review_contracts import combined_uncertainty
@@ -18,6 +19,8 @@ def activate(model_root: Path, review: Path) -> None:
         raise ValueError('Inference is incomplete')
     manifest_path = review / 'spatial.json'
     manifest = json.loads(manifest_path.read_text())
+    require_same_contract(DEFAULT_CONTRACT, SPATIAL_REVIEW.contract(manifest, where=str(manifest_path)),
+                          expected_from='RHU2 activation (BrdU/EdU)', actual_from=str(manifest_path))
     if complete['cells'] != manifest['cells']:
         raise ValueError('Cortical prediction count differs from the review cohort')
     thresholds = complete['decision_thresholds']
@@ -33,8 +36,8 @@ def activate(model_root: Path, review: Path) -> None:
         pd.testing.assert_frame_equal(old[['cell', 'label', 'x', 'y', 'z']], predictions[['cell', 'label', 'x', 'y', 'z']], check_dtype=False)
         if len(predictions) != source['cells'] or predictions.cell.duplicated().any():
             raise ValueError(f'Invalid prediction identity/count: {name}')
-        scores = combined_uncertainty(predictions.brdu_prob.to_numpy(), predictions.edu_prob.to_numpy(),
-                                      brdu_threshold=thresholds['brdu'], edu_threshold=thresholds['edu'])
+        scores = combined_uncertainty({'brdu': predictions.brdu_prob.to_numpy(), 'edu': predictions.edu_prob.to_numpy()},
+                                      {'brdu': thresholds['brdu'], 'edu': thresholds['edu']})
         uncertainty.append(np.log1p(scores[np.isfinite(scores)]))
         path = destination / name
         predictions.to_parquet(path, index=False)

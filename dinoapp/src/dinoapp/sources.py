@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import numpy as np
 import pandas as pd
+from dino_markers import (
+    MarkerConfig,
+    MarkerContract,
+    SavedFilter,
+    contract_of,
+    matches_saved,
+    require_same_contract,
+    resolve_directory,
+)
 
 from dinoapp.label_store import Label, load_labels, update_label
 
@@ -32,19 +43,20 @@ class ReviewSource(Protocol):
     target_id: str
     source_id: str
     display_name: str
+    config: MarkerConfig
     annotation_paths: tuple[Path, ...]
     default_annotation_path: Path
     subsets: tuple[str, ...]
     datasets: tuple[str, ...]
-    crop_markers: tuple[str, ...]
+    crop_markers: tuple[str, ...]  # ordered subset of ("combined", *config.display_markers)
 
     def review_rows(self, *, dataset: str) -> pd.DataFrame: ...
 
     def correction_rows(
         self,
-        live_labels: dict[str, Label],
+        live_labels: Mapping[str, Label],
         *,
-        identity: Label,
+        identity: SavedFilter,
         subset: str,
         dataset: str,
     ) -> pd.DataFrame: ...
@@ -52,37 +64,60 @@ class ReviewSource(Protocol):
     def crop(self, cell: str, marker: str) -> Crop: ...
 
 
+class NativeFieldSource(Protocol):
+    config: MarkerConfig
+    display_name: str
+    annotation_paths: tuple[Path, ...]
+    default_annotation_path: Path
+    gallery_predictions: pd.DataFrame
+    origin: np.ndarray
+    scale: np.ndarray
+
+    def cell_id(self, label: int) -> str: ...
+
+    def cell_crop(self, label: int) -> tuple[bytes, int]: ...
+
+    def marker_crop(self, label: int, marker: str) -> tuple[bytes, int]: ...
+
+    def field_at_cell(self, label: int, width_um: float) -> Any: ...
+
+
 class AnnotationFiles:
     """Route a cell back to the annotation file that already owns it."""
 
-    def __init__(self, paths: tuple[Path, ...], default: Path):
+    def __init__(self, paths: tuple[Path, ...], default: Path, *, contract: MarkerContract):
         if default not in paths:
             raise ValueError("Default annotation file must be one of the supplied files")
         self.paths = paths
         self.default = default
+        self.contract = contract
         self.values: dict[str, Label] = {}
         self.owners: dict[str, Path] = {}
         for path in paths:
-            for row in load_labels(path).itertuples(index=False):
-                cell = str(row.cell)
+            require_same_contract(
+                contract, contract_of(path.parent), expected_from="this review session", actual_from=str(path.parent)
+            )
+            frame = load_labels(path, contract=contract)
+            for cell, *marker_values in frame[["cell", *contract.markers]].itertuples(index=False):
+                cell = str(cell)
                 if cell in self.owners:
                     raise ValueError(f"{cell} is annotated in multiple files")
                 self.owners[cell] = path
-                self.values[cell] = (int(row.brdu), int(row.edu))
+                self.values[cell] = tuple(int(value) for value in marker_values)
 
     def destination(self, cell: str) -> Path:
         return self.owners.get(cell, self.default)
 
     def assign(self, cell: str, value: Label, *, expected: Label | None) -> Edit:
-        current = AnnotationFiles(self.paths, self.default)
+        current = AnnotationFiles(self.paths, self.default, contract=self.contract)
         path = current.destination(cell)
-        previous = update_label(path, cell, value, expected=expected)
+        previous = update_label(path, cell, value, contract=self.contract, expected=expected)
         self.values[cell] = value
         self.owners[cell] = path
         return Edit(path, cell, previous, value)
 
     def undo(self, edit: Edit) -> None:
-        update_label(edit.path, edit.cell, edit.previous, expected=edit.value)
+        update_label(edit.path, edit.cell, edit.previous, contract=self.contract, expected=edit.value)
         if edit.previous is None:
             self.values.pop(edit.cell, None)
             self.owners.pop(edit.cell, None)
@@ -91,21 +126,11 @@ class AnnotationFiles:
             self.owners[edit.cell] = edit.path
 
 
-def toggle_marker(value: Label, marker: str) -> Label:
-    if marker == "brdu":
-        return 1 - value[0], value[1]
-    if marker == "edu":
-        return value[0], 1 - value[1]
-    raise ValueError(f"Unexpected marker: {marker!r}")
-
-
-def state_label(value: Label) -> str:
-    return {
-        (0, 0): "BrdU− / EdU−",
-        (0, 1): "BrdU− / EdU+",
-        (1, 0): "BrdU+ / EdU−",
-        (1, 1): "BrdU+ / EdU+",
-    }[value]
+def _require_saved_filter(config: MarkerConfig, identity: SavedFilter) -> None:
+    if len(identity) != len(config.markers):
+        raise ValueError(
+            f"Saved filter {identity!r} must have one entry per marker of {list(config.contract.markers)!r}"
+        )
 
 
 def _path_digest(path: Path) -> str:
@@ -133,8 +158,9 @@ class BarrageSource:
             raise ValueError("Barrage ranks must be unique")
         self.rows = self.rows.sort_values(["rank", "cell"], kind="stable").reset_index(drop=True)
         self._by_cell = self.rows.set_index("cell", drop=False)
+        self.config = resolve_directory(self.root)
         self.crop_markers = tuple(
-            marker for marker in ("combined", "edu", "brdu")
+            marker for marker in ("combined", *self.config.display_markers)
             if f"{marker}_image_path" in self.rows or "image_path" in self.rows
         )
         self.annotation_paths = (self.root / "labels.csv",)
@@ -160,16 +186,17 @@ class BarrageSource:
 
     def correction_rows(
         self,
-        live_labels: dict[str, Label],
+        live_labels: Mapping[str, Label],
         *,
-        identity: Label,
+        identity: SavedFilter,
         subset: str,
         dataset: str,
     ) -> pd.DataFrame:
         if subset not in self.subsets:
             raise ValueError(f"Unsupported barrage subset: {subset}")
+        _require_saved_filter(self.config, identity)
         selected = self.review_rows(dataset=dataset)
-        cells = [cell for cell, value in live_labels.items() if value == identity]
+        cells = [cell for cell, value in live_labels.items() if matches_saved(value, identity)]
         return selected[selected["cell"].isin(cells)].reset_index(drop=True)
 
     def _image_path(self, row: pd.Series, marker: str) -> Path:
@@ -188,7 +215,7 @@ class BarrageSource:
         return path
 
     def crop(self, cell: str, marker: str) -> Crop:
-        if marker not in {"brdu", "edu", "combined"}:
+        if marker != "combined" and marker not in self.config.contract.markers:
             raise ValueError(f"Unexpected crop marker: {marker}")
         if cell not in self._by_cell.index:
             raise KeyError(f"Cell is absent from barrage index: {cell}")
@@ -207,15 +234,15 @@ class BarrageSource:
 class NativeSource:
     """Adapt native datasets to opaque-cell crops and fixed gallery rosters."""
 
-    crop_markers = ("combined", "edu", "brdu")
-
     def __init__(
         self,
-        field_source: Any,
+        field_source: NativeFieldSource,
         *,
         label_root: Path,
     ):
         self.field_source = field_source
+        self.config = field_source.config
+        self.crop_markers = ("combined", *self.config.display_markers)
         self.label_root = label_root.resolve()
         self.annotation_paths = tuple(field_source.annotation_paths)
         self.default_annotation_path = field_source.default_annotation_path
@@ -245,19 +272,20 @@ class NativeSource:
 
     def correction_rows(
         self,
-        live_labels: dict[str, Label],
+        live_labels: Mapping[str, Label],
         *,
-        identity: Label,
+        identity: SavedFilter,
         subset: str,
         dataset: str,
     ) -> pd.DataFrame:
         if subset not in self.subsets or dataset != "All datasets":
             raise ValueError("Unsupported native gallery filter")
+        _require_saved_filter(self.config, identity)
         selected = self._predictions[self._predictions["cell"].isin(live_labels)]
         if subset != "All labeled":
             selected = selected[selected["split"] == subset.lower()]
         selected = selected.loc[
-            selected["cell"].map(lambda cell: live_labels[str(cell)] == identity)
+            selected["cell"].map(lambda cell: matches_saved(live_labels[str(cell)], identity))
         ]
         return selected.sort_values("cell", kind="stable").reset_index(drop=True)
 
@@ -274,15 +302,13 @@ class NativeSource:
         return self.field_source.field_at_cell(self.cell_label(cell), width_um)
 
     def crop(self, cell: str, marker: str) -> Crop:
-        if marker not in {"brdu", "edu", "combined"}:
+        if marker != "combined" and marker not in self.config.contract.markers:
             raise ValueError(f"Unexpected crop marker: {marker}")
         label = self.cell_label(cell)
-        crop_method = {
-            "brdu": self.field_source.brdu_cell_crop,
-            "edu": self.field_source.edu_cell_crop,
-            "combined": self.field_source.cell_crop,
-        }[marker]
-        image, plane_z = crop_method(label)
+        if marker == "combined":
+            image, plane_z = self.field_source.cell_crop(label)
+        else:
+            image, plane_z = self.field_source.marker_crop(label, marker)
         z_um = self.field_source.origin[0] + plane_z * self.field_source.scale[0]
         parts = []
         if cell in self._by_cell.index:

@@ -6,6 +6,14 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from dino_markers import (
+    DEFAULT_CONTRACT,
+    ContractMismatchError,
+    MarkerConfig,
+    default_config,
+    parse_config,
+    save_config,
+)
 
 from dinoapp import app
 from dinoapp.app import (
@@ -17,6 +25,41 @@ from dinoapp.app import (
 )
 from dinoapp.label_store import LabelConflictError, load_labels, update_label
 from dinoapp.sources import AnnotationFiles, BarrageSource, NativeSource
+
+
+def three_marker_config() -> MarkerConfig:
+    return parse_config(
+        {
+            "version": 1,
+            "reference": {"key": "dapi", "label": "DAPI"},
+            "markers": [
+                {"key": "edu", "label": "EdU", "color": "#00ff00"},
+                {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+                {"key": "pcna", "label": "PCNA", "color": "#00ffff"},
+            ],
+            "presentation": {
+                "crop_panels": ["dapi", "pcna", "edu", "brdu"],
+                "negative_color": [0.25, 0.25, 0.25],
+                "uncalled_color": "#999999",
+            },
+        },
+        source="test",
+    )
+
+
+def write_three_marker_barrage(root: Path, *, views: tuple[str, ...] = ("combined", "edu", "brdu", "pcna")) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    save_config(three_marker_config(), root)
+    rows = []
+    for rank, cell in enumerate(("t:1|1", "t:1|2", "t:1|3")):
+        paths = {}
+        for view in views:
+            path = Path(f"{view}-{rank}.png")
+            (root / path).write_bytes(f"{view}-{cell}".encode())
+            paths[f"{view}_image_path"] = str(path)
+        rows.append({"rank": rank, "cell": cell, **paths})
+    pd.DataFrame(rows).to_csv(root / "index.csv", index=False)
+    (root / "labels.csv").write_text("cell,edu,brdu,pcna\nt:1|1,0,0,0\nt:1|2,1,0,1\nt:1|3,1,1,1\n")
 
 
 def write_barrage(root: Path) -> None:
@@ -52,7 +95,9 @@ def write_barrage(root: Path) -> None:
 def test_barrage_source_filters_live_labels_without_dropping_external_labels(tmp_path: Path):
     write_barrage(tmp_path)
     source = BarrageSource(tmp_path)
-    annotations = AnnotationFiles(source.annotation_paths, source.default_annotation_path)
+    annotations = AnnotationFiles(
+        source.annotation_paths, source.default_annotation_path, contract=source.config.contract
+    )
 
     rows = source.correction_rows(
         annotations.values,
@@ -95,10 +140,10 @@ def test_barrage_crop_title_uses_the_written_cell_identity(tmp_path: Path):
 
 def test_annotation_undo_uses_compare_and_set(tmp_path: Path):
     path = tmp_path / "labels.csv"
-    update_label(path, "cell|1", (0, 0))
-    annotations = AnnotationFiles((path,), path)
+    update_label(path, "cell|1", (0, 0), contract=DEFAULT_CONTRACT)
+    annotations = AnnotationFiles((path,), path, contract=DEFAULT_CONTRACT)
     edit = annotations.assign("cell|1", (1, 0), expected=(0, 0))
-    update_label(path, "cell|1", (0, 1), expected=(1, 0))
+    update_label(path, "cell|1", (0, 1), contract=DEFAULT_CONTRACT, expected=(1, 0))
 
     with pytest.raises(LabelConflictError):
         annotations.undo(edit)
@@ -134,8 +179,8 @@ def test_native_adapter_keeps_numeric_parsing_inside_source():
         model_version="model-1",
         origin=[100.0],
         scale=[2.0],
-        brdu_cell_crop=crop("brdu"),
-        edu_cell_crop=crop("edu"),
+        config=default_config(),
+        marker_crop=lambda label, marker: crop(marker)(label),
         cell_crop=crop("combined"),
     )
     source = NativeSource(field_source, label_root=Path("/tmp/native-labels"))
@@ -154,11 +199,12 @@ def test_native_adapter_keeps_numeric_parsing_inside_source():
 
 def test_native_adapter_uses_dataset_annotation_ownership(tmp_path: Path):
     paths = (tmp_path / "cortex.csv", tmp_path / "vz_svz.csv")
-    update_label(paths[0], "prod3|10", (0, 0))
+    update_label(paths[0], "prod3|10", (0, 0), contract=DEFAULT_CONTRACT)
     field_source = SimpleNamespace(
         annotation_paths=paths,
         default_annotation_path=paths[-1],
         display_name="Prod3 native",
+        config=default_config(),
         gallery_predictions=pd.DataFrame({"cell": ["prod3|10", "prod3|20"]}),
         model_version="model-3",
     )
@@ -168,7 +214,9 @@ def test_native_adapter_uses_dataset_annotation_ownership(tmp_path: Path):
     assert source.annotation_paths == paths
     assert source.default_annotation_path == paths[-1]
     assert source.display_name == "Prod3 native"
-    annotations = AnnotationFiles(source.annotation_paths, source.default_annotation_path)
+    annotations = AnnotationFiles(
+        source.annotation_paths, source.default_annotation_path, contract=source.config.contract
+    )
     annotations.assign("prod3|10", (1, 0), expected=(0, 0))
     annotations.assign("prod3|20", (0, 1), expected=None)
     assert load_labels(paths[0])[["cell", "brdu", "edu"]].values.tolist() == [["prod3|10", 1, 0]]
@@ -179,7 +227,9 @@ def test_native_adapter_uses_dataset_annotation_ownership(tmp_path: Path):
 def test_gallery_queue_is_stable_and_cards_change_only_one_marker(tmp_path: Path):
     write_barrage(tmp_path)
     source = BarrageSource(tmp_path)
-    annotations = AnnotationFiles(source.annotation_paths, source.default_annotation_path)
+    annotations = AnnotationFiles(
+        source.annotation_paths, source.default_annotation_path, contract=source.config.contract
+    )
     gallery = new_gallery_state(
         source,
         annotations,
@@ -192,7 +242,7 @@ def test_gallery_queue_is_stable_and_cards_change_only_one_marker(tmp_path: Path
 
     assert gallery["cells"] == ["one:1|10"]
     card = {"cell": "one:1|10", "cellLabel": "Cell 10", "marker": "edu"}
-    update_gallery_card(card, (1, 0), gallery["initial"]["one:1|10"])
+    update_gallery_card(card, (1, 0), gallery["initial"]["one:1|10"], config=source.config)
     assert card["expected"] == [1, 0]
     assert card["value"] == [1, 1]
     assert card["changed"] is True
@@ -294,7 +344,7 @@ def test_gallery_rejects_disagreement_between_item_and_cell(
 
     with pytest.raises(Rerun):
         app.render_gallery(
-            SimpleNamespace(source_id="source", crop_markers=("edu",)),
+            SimpleNamespace(source_id="source", crop_markers=("edu",), config=default_config()),
             SimpleNamespace(values={"cell|1": (0, 0), "cell|2": (0, 0)}),
             context,
             gallery,
@@ -367,11 +417,11 @@ def test_native_empty_gallery_preserves_row_schema(tmp_path, marker, empty_reaso
         frame = pd.DataFrame(columns=columns)  # The live Prod3 adapter's original schema.
     path = tmp_path / 'labels.csv'
     pd.DataFrame([{'cell': 'prod3|10', 'brdu': 0, 'edu': 1}]).to_csv(path, index=False)
-    annotations = AnnotationFiles((path,), path)
+    annotations = AnnotationFiles((path,), path, contract=DEFAULT_CONTRACT)
     if empty_reason == 'annotations':
         annotations.values.clear()
     field_source = SimpleNamespace(annotation_paths=(path,), default_annotation_path=path,
-                                   display_name='Prod3 native', gallery_predictions=frame,
+                                   display_name='Prod3 native', gallery_predictions=frame, config=default_config(),
                                    model_version='baseline')
     source = NativeSource(field_source, label_root=tmp_path)
     subset = 'Validation' if empty_reason == 'split' else 'All labeled'
@@ -391,7 +441,7 @@ def test_native_target_identity_tracks_annotation_ownership_not_review_revisions
 
     def reader(model, pixels, owners=paths):
         return SimpleNamespace(annotation_paths=owners, default_annotation_path=owners[-1],
-                               gallery_predictions=predictions, display_name='Native',
+                               gallery_predictions=predictions, display_name='Native', config=default_config(),
                                model_version=model, pixel_version=pixels)
 
     first = NativeSource(reader('model-1', 'display-1'), label_root=tmp_path / 'session-one')
@@ -411,3 +461,162 @@ def test_barrage_revision_does_not_replace_its_annotation_target(tmp_path):
     assert first.target_id == second.target_id
     assert first.source_id != second.source_id
     assert first.annotation_paths == second.annotation_paths
+
+
+def test_hand_made_three_marker_barrage_follows_display_markers_and_marker_image_paths(tmp_path: Path):
+    write_three_marker_barrage(tmp_path)
+    source = BarrageSource(tmp_path)
+
+    assert source.config == three_marker_config()
+    assert source.crop_markers == ("combined", "pcna", "edu", "brdu")
+    for marker in ("combined", "edu", "brdu", "pcna"):
+        assert source.crop("t:1|2", marker).image == f"{marker}-t:1|2".encode()
+    for marker in ("dapi", "pi", "other"):
+        with pytest.raises(ValueError, match="Unexpected crop marker"):
+            source.crop("t:1|2", marker)
+
+
+def test_three_marker_barrage_lists_only_views_with_an_image_column(tmp_path: Path):
+    write_three_marker_barrage(tmp_path, views=("combined", "pcna"))
+
+    assert BarrageSource(tmp_path).crop_markers == ("combined", "pcna")
+
+
+def test_three_marker_annotations_hold_triples_and_filter_per_marker(tmp_path: Path):
+    write_three_marker_barrage(tmp_path)
+    source = BarrageSource(tmp_path)
+    annotations = AnnotationFiles(
+        source.annotation_paths, source.default_annotation_path, contract=source.config.contract
+    )
+    assert annotations.values == {"t:1|1": (0, 0, 0), "t:1|2": (1, 0, 1), "t:1|3": (1, 1, 1)}
+
+    def cells(identity):
+        rows = source.correction_rows(
+            annotations.values, identity=identity, subset="All labeled", dataset="All datasets"
+        )
+        return rows.cell.tolist()
+
+    assert cells((1, 0, 1)) == ["t:1|2"]
+    assert cells((None, None, None)) == ["t:1|1", "t:1|2", "t:1|3"]
+    assert cells((1, None, 1)) == ["t:1|2", "t:1|3"]
+    assert cells((None, 0, None)) == ["t:1|1", "t:1|2"]
+    assert cells((None, None, 0)) == ["t:1|1"]
+    with pytest.raises(ValueError, match="one entry per marker"):
+        cells((0, 1))
+
+    edit = annotations.assign("t:1|1", (0, 1, 1), expected=(0, 0, 0))
+    assert edit.previous == (0, 0, 0) and annotations.values["t:1|1"] == (0, 1, 1)
+    annotations.undo(edit)
+    assert annotations.values["t:1|1"] == (0, 0, 0)
+    assert (tmp_path / "labels.csv").read_text().splitlines()[1] == "t:1|1,0,0,0"
+    with pytest.raises(ValueError, match="3-tuple"):
+        annotations.assign("t:1|1", (0, 1), expected=(0, 0, 0))
+
+
+def test_annotation_files_reject_a_directory_whose_contract_differs(tmp_path: Path):
+    write_three_marker_barrage(tmp_path / "three")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "labels.csv").write_text("cell,brdu,edu\nx|1,0,1\n")
+    three = three_marker_config().contract
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
+        AnnotationFiles((tmp_path / "three" / "labels.csv",), tmp_path / "three" / "labels.csv", contract=DEFAULT_CONTRACT)
+    with pytest.raises(ContractMismatchError):
+        AnnotationFiles((plain / "labels.csv",), plain / "labels.csv", contract=three)
+    with pytest.raises(ContractMismatchError):
+        AnnotationFiles(
+            (plain / "labels.csv", tmp_path / "three" / "labels.csv"), plain / "labels.csv", contract=DEFAULT_CONTRACT
+        )
+
+
+def test_reordered_markers_file_makes_an_open_session_stale(tmp_path: Path):
+    write_barrage(tmp_path)
+    source = BarrageSource(tmp_path)
+    annotations = AnnotationFiles(
+        source.annotation_paths, source.default_annotation_path, contract=source.config.contract
+    )
+    original = (tmp_path / "labels.csv").read_bytes()
+    reordered = parse_config(
+        {
+            "version": 1,
+            "reference": {"key": "pi", "label": "PI"},
+            "markers": [
+                {"key": "edu", "label": "EdU", "color": "#00ff00"},
+                {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+            ],
+            "presentation": {
+                "crop_panels": ["pi", "edu", "brdu"],
+                "negative_color": [0.25, 0.25, 0.25],
+                "uncalled_color": "#999999",
+            },
+        },
+        source="test",
+    )
+    save_config(reordered, tmp_path)
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
+        annotations.assign("one:1|10", (1, 0), expected=(0, 0))
+    with pytest.raises(ContractMismatchError):
+        update_label(tmp_path / "labels.csv", "one:1|10", (1, 0), contract=DEFAULT_CONTRACT)
+    assert (tmp_path / "labels.csv").read_bytes() == original
+
+
+def test_native_adapter_dispatches_crops_by_marker_through_marker_crop(tmp_path: Path):
+    calls: list[tuple[str, int, str | None]] = []
+    config = three_marker_config()
+    path = tmp_path / "labels.csv"
+    field_source = SimpleNamespace(
+        annotation_paths=(path,),
+        default_annotation_path=path,
+        display_name="Three marker",
+        config=config,
+        cell_id=lambda label: f"three|{label}",
+        gallery_predictions=pd.DataFrame(
+            {"cell": ["three|10"], "split": ["training"], "tranche": ["cortex"]}
+        ),
+        model_version="model-1",
+        origin=[100.0],
+        scale=[2.0],
+        cell_crop=lambda label: (calls.append(("combined", label, None)) or b"c", 3),
+        marker_crop=lambda label, marker: (calls.append(("marker", label, marker)) or marker.encode(), 3),
+    )
+    source = NativeSource(field_source, label_root=tmp_path)
+
+    assert source.config is config
+    assert source.crop_markers == ("combined", "pcna", "edu", "brdu")
+    assert source.crop("three|10", "combined").image == b"c"
+    assert source.crop("three|10", "pcna").image == b"pcna"
+    assert calls == [("combined", 10, None), ("marker", 10, "pcna")]
+    for marker in ("dapi", "other"):
+        with pytest.raises(ValueError, match="Unexpected crop marker"):
+            source.crop("three|10", marker)
+    assert calls == [("combined", 10, None), ("marker", 10, "pcna")]
+
+
+def test_native_correction_rows_accept_none_entries(tmp_path: Path):
+    config = three_marker_config()
+    path = tmp_path / "labels.csv"
+    predictions = pd.DataFrame(
+        {
+            "cell": ["three|1", "three|2", "three|3"],
+            "split": ["training", "training", "validation"],
+            "tranche": ["cortex"] * 3,
+        }
+    )
+    field_source = SimpleNamespace(
+        annotation_paths=(path,), default_annotation_path=path, display_name="Three marker",
+        config=config, gallery_predictions=predictions, model_version="m",
+    )
+    source = NativeSource(field_source, label_root=tmp_path)
+    live = {"three|1": (1, 0, 1), "three|2": (1, 1, 1), "three|3": (1, 0, 0)}
+
+    def cells(identity, subset="All labeled"):
+        return source.correction_rows(
+            live, identity=identity, subset=subset, dataset="All datasets"
+        ).cell.tolist()
+
+    assert cells((1, None, None)) == ["three|1", "three|2", "three|3"]
+    assert cells((None, 0, None)) == ["three|1", "three|3"]
+    assert cells((None, 0, None), "Training") == ["three|1"]
+    assert cells((1, 0, 1)) == ["three|1"]

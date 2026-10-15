@@ -2,41 +2,44 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from functools import reduce
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from dino_markers import (
+    CONTRACT_FIELD,
+    DEFAULT_CONTRACT,
+    MarkerConfigError,
+    MarkerContract,
+    cutoff_key,
+    prediction_column,
+    probability_column,
+    require_same_contract,
+)
+from numpy.typing import ArrayLike
 
 from dino.artifacts import file_sha256
 
 
-def combined_uncertainty(
-    p_brdu: np.ndarray,
-    p_edu: np.ndarray,
-    *,
-    brdu_threshold: float,
-    edu_threshold: float,
-) -> np.ndarray:
-    """Return the maximum inverse decision margin across the two classifiers."""
-    p_brdu = np.asarray(p_brdu, dtype=np.float64)
-    p_edu = np.asarray(p_edu, dtype=np.float64)
-    if p_brdu.ndim != 1 or p_edu.shape != p_brdu.shape or not len(p_brdu):
+def combined_uncertainty(probabilities: Mapping[str, ArrayLike], cutoffs: Mapping[str, float]) -> np.ndarray:
+    """Return the maximum inverse decision margin across the named classifiers."""
+    if not probabilities or set(probabilities) != set(cutoffs):
+        raise ValueError("Classifier probabilities and thresholds must name the same nonempty markers")
+    vectors = {marker: np.asarray(values, dtype=np.float64) for marker, values in probabilities.items()}
+    shapes = {vector.shape for vector in vectors.values()}
+    if any(vector.ndim != 1 for vector in vectors.values()) or len(shapes) != 1 or shapes == {(0,)}:
         raise ValueError("Classifier probabilities must be nonempty matching vectors")
-    if not np.isfinite(p_brdu).all() or not np.isfinite(p_edu).all():
+    if not all(np.isfinite(vector).all() for vector in vectors.values()):
         raise ValueError("Classifier probabilities must be finite")
-    if np.any((p_brdu < 0) | (p_brdu > 1) | (p_edu < 0) | (p_edu > 1)):
+    if any(np.any((vector < 0) | (vector > 1)) for vector in vectors.values()):
         raise ValueError("Classifier probabilities must lie in [0, 1]")
-    if not (
-        np.isfinite(brdu_threshold)
-        and np.isfinite(edu_threshold)
-        and 0 < brdu_threshold < 1
-        and 0 < edu_threshold < 1
-    ):
+    if not all(np.isfinite(cutoffs[marker]) and 0 < cutoffs[marker] < 1 for marker in vectors):
         raise ValueError("Classifier thresholds must lie strictly within (0, 1)")
-    margin = np.minimum(np.abs(p_brdu - brdu_threshold), np.abs(p_edu - edu_threshold))
     with np.errstate(divide="ignore"):
-        return 1.0 / margin
+        return 1.0 / reduce(np.minimum, (np.abs(vectors[marker] - cutoffs[marker]) for marker in vectors))
 
 
 def load_prediction_pointer(
@@ -71,17 +74,26 @@ def load_prediction_pointer(
     return model_dir.name, prediction_dir, manifest_path, contract
 
 
-def load_review_predictions(manifest_path: Path, *, model_sha256: str, cell_prefix: str) -> pd.DataFrame:
+def load_review_predictions(
+    manifest_path: Path, *, model_sha256: str, cell_prefix: str, contract: MarkerContract
+) -> pd.DataFrame:
     manifest = json.loads(manifest_path.read_text())
-    if manifest['artifact'] != 'dino-labeled-review-v1' or manifest['model_sha256'] != model_sha256:
+    if manifest.get('artifact') != 'dino-labeled-review-v1' or manifest['model_sha256'] != model_sha256:
         raise ValueError('Labeled review artifact differs from the selected classifier')
+    if CONTRACT_FIELD in manifest:
+        raise MarkerConfigError(f"{manifest_path}: dino-labeled-review-v1 records must not carry {CONTRACT_FIELD}")
+    require_same_contract(
+        contract, DEFAULT_CONTRACT, expected_from="the review target", actual_from=str(manifest_path)
+    )
     predictions = Path(manifest['predictions'])
     if predictions.parent.resolve() != manifest_path.parent.resolve():
         raise ValueError('Labeled review predictions are outside their artifact directory')
     if file_sha256(predictions) != manifest['predictions_sha256']:
         raise ValueError('Labeled review predictions differ from their recorded identity')
     frame = pq.read_table(predictions).to_pandas()
-    required = {'cell', 'label', 'tranche', 'split', 'p_brdu', 'pred_brdu', 'p_edu', 'pred_edu'}
+    required = {'cell', 'label', 'tranche', 'split'}
+    for marker in contract.markers:
+        required |= {probability_column(marker), prediction_column(marker)}
     if (required - set(frame.columns) or len(frame) != manifest['cells']
             or frame.cell.duplicated().any()):
         raise ValueError('Labeled review predictions have incomplete or duplicate identities')
@@ -90,12 +102,13 @@ def load_review_predictions(manifest_path: Path, *, model_sha256: str, cell_pref
             or int((frame.split == 'training').sum()) != manifest['training_cells']
             or int((frame.split == 'validation').sum()) != manifest['validation_cells']):
         raise ValueError('Labeled review identities or actual split counts differ from their manifest')
-    for target in ('brdu', 'edu'):
-        p = frame[f'p_{target}']
-        cutoff = manifest[f'{target}_cutoff']
+    for marker in contract.markers:
+        p = frame[probability_column(marker)]
+        cutoff = manifest[cutoff_key(marker)]
+        called = frame[prediction_column(marker)]
         if (not np.isfinite(cutoff) or not 0 < cutoff < 1 or not np.isfinite(p).all()
                 or not p.between(0, 1).all()
-                or not frame[f'pred_{target}'].isin([0, 1]).all()
-                or not np.array_equal(frame[f'pred_{target}'], p >= cutoff)):
+                or not called.isin([0, 1]).all()
+                or not np.array_equal(called, p >= cutoff)):
             raise ValueError('Labeled review probabilities or cutoff calls are invalid')
     return frame

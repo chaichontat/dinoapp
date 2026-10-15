@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from dino_markers import marker_revision
 
 from dinoapp import native, native_app
 from dinoapp.rhu2 import FieldCropSource, SpatialSource
@@ -12,14 +13,15 @@ from dinoapp.review_session import get_context, navigate, remember_widget, widge
 
 
 @st.cache_resource
-def get_source(root: str, manifest_mtime_ns: int) -> SpatialSource:
+def get_source(root: str, marker_revision: str) -> SpatialSource:
     return SpatialSource(Path(root))
 
 
 def spatial_mode(root: Path, *, target_id: str) -> None:
-    source = get_source(str(root), (root / 'spatial.json').stat().st_mtime_ns)
+    source = get_source(str(root), marker_revision((root,)))
+    config = source.config
     context = get_context(target_id)
-    annotations = AnnotationFiles((root / 'labels.csv',), root / 'labels.csv')
+    annotations = AnnotationFiles((root / 'labels.csv',), root / 'labels.csv', contract=config.contract)
     annotated_counts = source.branch_annotation_counts(tuple(sorted(annotations.values)))
     branch_order = sorted(
         (index for index, branch in enumerate(source.branches) if branch['cells'] > 0),
@@ -49,12 +51,15 @@ def spatial_mode(root: Path, *, target_id: str) -> None:
         width = float(st.select_slider('Field width (µm)', disabled=located_view, options=[100, 150, 200, 250, 300], key=widget_key(context, 'field_width', 200), on_change=remember_widget, args=(context, 'field_width')))
         border_alpha = st.slider('Cell border opacity', 0.0, 1.0, step=0.05, key=widget_key(context, 'field_border_alpha', .35), on_change=remember_widget, args=(context, 'field_border_alpha'))
         view = st.selectbox('Right panel view', ('Cell identities', 'Model uncertainty'), key=widget_key(context, 'field_view', 'Cell identities'), on_change=remember_widget, args=(context, 'field_view'))
-        brdu_percentile = st.number_input('BrdU vmax percentile', min_value=0.01, max_value=100.0,
-                                          step=0.1, format='%.2f', key=widget_key(context, 'rhu2_brdu_vmax_percentile', 99.8), on_change=remember_widget, args=(context, 'rhu2_brdu_vmax_percentile'),
-                                          help='Upper display limit from BrdU pixels in the current field.')
-        edu_percentile = st.number_input('EdU vmax percentile', min_value=0.01, max_value=100.0,
-                                         step=0.1, format='%.2f', key=widget_key(context, 'rhu2_edu_vmax_percentile', 99.8), on_change=remember_widget, args=(context, 'rhu2_edu_vmax_percentile'),
-                                         help='Upper display limit from EdU pixels in the current field.')
+        percentiles = {
+            marker: st.number_input(
+                f'{config.label(marker)} vmax percentile', min_value=0.01, max_value=100.0,
+                step=0.1, format='%.2f', key=widget_key(context, f'rhu2_{marker}_vmax_percentile', 99.8),
+                on_change=remember_widget, args=(context, f'rhu2_{marker}_vmax_percentile'),
+                help=f'Upper display limit from {config.label(marker)} pixels in the current field.',
+            )
+            for marker in config.contract.markers
+        }
         st.caption(f'{len(branch_order)} cortical CCF branches, fewest manual annotations first. '
                    'Counts include your saved barrage and spatial annotations. '
                    'Next and Previous browse reproducible fields within the selected branch.')
@@ -92,16 +97,15 @@ def spatial_mode(root: Path, *, target_id: str) -> None:
     st.caption(prefix + f"{int((field.ids > 0).sum()):,} in this field · 20 µm scale bar")
     st.caption('Only cortical cohort cells are colored and selectable. '
                'Cells outside the cohort remain visible in the raw image.')
-    contrast = roi.contrast.copy()
-    for index, marker, percentile in [(1, 'BrdU', brdu_percentile), (2, 'EdU', edu_percentile)]:
+    contrast = dict(roi.contrast)
+    for marker, percentile in percentiles.items():
         # One raw intensity unit keeps empty fields well defined with vmin=0.
-        contrast[index, 1] = max(1., float(np.percentile(field.images[marker], percentile)))
+        contrast[marker] = (contrast[marker][0], max(1., float(np.percentile(field.images[marker], percentile))))
+    display_max = tuple(contrast[key][1] for key in config.contract.channel_keys)
     context["workspace"]["active_field"] = (roi, field)
-    context["workspace"]["field_crop_source"] = FieldCropSource(
-        roi, tuple(float(value) for value in contrast[:, 1]), target_id, context["revision"],
-    )
+    context["workspace"]["field_crop_source"] = FieldCropSource(roi, display_max, target_id, context["revision"])
     image = native.render_field(
-        field, roi.field_calls(field, annotations), mode=view, selected=None,
+        field, roi.field_calls(field, annotations), config=config, mode=view, selected=None,
         border_alpha=border_alpha, boundary_alpha=0, contrast=contrast,
         uncertainty=roi.field_uncertainty(field), uncertainty_log_vmax=roi.uncertainty_log_vmax,
     )
@@ -109,5 +113,5 @@ def spatial_mode(root: Path, *, target_id: str) -> None:
         roi, field, roi.annotation_paths, root / 'cell-review', image, view,
         crop_plane_caption=lambda plane: f'largest-area slice · Z plane {plane}',
         selected_caption=roi.probability_caption, show_seed=False,
-        render_cell_crop=lambda label: roi.cell_crop(label, tuple(float(value) for value in contrast[:, 1])),
+        render_cell_crop=lambda label: roi.cell_crop(label, display_max),
     )

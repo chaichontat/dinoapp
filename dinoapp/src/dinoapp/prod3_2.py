@@ -10,13 +10,14 @@ import joblib
 import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from dino_markers import INFERENCE, cutoff_key, prediction_column, probability_column
 
 from dino.artifacts import file_sha256, read_parquet_artifact
 from dino.classifier_features import validate_feature_contract
 from dino.zarr_source import CellCropReader
 from dinoapp.display_pixels import DisplayPixels
-from dinoapp.native import AnnotationFiles as AnnotationFiles, combined_uncertainty
-from dinoapp.native import load_prediction_pointer
+from dinoapp.native import AnnotationFiles as AnnotationFiles, adapter_config, classifier_caption
+from dinoapp.native import load_prediction_pointer, prediction_contract
 from dinoapp.native import render_field as render_field
 from dinoapp.review_predictions import load_review_predictions
 from dinoapp.prod3 import FieldSource as Prod3FieldSource
@@ -31,7 +32,7 @@ class FieldSource(Prod3FieldSource):
 
     display_name = 'Prod3-2 native'
     cell_prefix = '235-4-edu-workflow-recovered'
-    anatomy_channel = 'DAPI'
+    raw_channels = {'DAPI': 'pi', 'BrdU': 'brdu', 'EdU': 'edu'}
 
     dataset_name = 'Prod3-2'
     dataset_root = ROOT
@@ -40,12 +41,27 @@ class FieldSource(Prod3FieldSource):
     surface_coordinates = reembedding_run / 'vz-coordinates/cells.parquet'
     prediction_pointer: Path | None = REVIEW_ROOT / 'cell-review/current.json'
 
+    @classmethod
+    def annotation_directories(cls, root: Path | None = None) -> tuple[Path, ...]:
+        root = cls.dataset_root if root is None else root
+        return (root / cls.review_directory / 'barrage-cortex-v1',)
+
     def __init__(self, root: Path | None = None):
         root = self.dataset_root if root is None else root
         self.root = root
         review_root = root / self.review_directory
+        self.annotation_paths = tuple(directory / 'labels.csv' for directory in self.annotation_directories(root))
+        self.default_annotation_path = self.annotation_paths[0]
+        self.config = adapter_config(
+            self.default_annotation_path.parent, self.raw_channels, adapter=self.dataset_name
+        )
+        markers = self.config.contract.markers
         run = self.reembedding_run
         complete = json.loads((run / 'complete.json').read_text())
+        self._require_contract(
+            prediction_contract(complete, where=str(run / 'complete.json')),
+            actual_from=str(run / 'complete.json'),
+        )
         if not complete['passed'] or not complete['baseline_classifier_preserved']:
             raise ValueError(f'{self.dataset_name} corrected baseline inference is not validated')
         model_path = Path(complete['model'])
@@ -53,24 +69,29 @@ class FieldSource(Prod3FieldSource):
             raise ValueError(f'{self.dataset_name} baseline inference model identity changed')
         embedding_model_path = model_path
         bundle = joblib.load(model_path)
-        prediction_contract = complete
+        prediction_record = complete
         prediction_manifest = run / 'complete.json'
         scored_directory = None
         if self.prediction_pointer is not None:
-            _, scored_directory, prediction_manifest, prediction_contract = load_prediction_pointer(self.prediction_pointer)
-            if (prediction_contract['source_sha256'] != complete['source_sha256']
-                    or prediction_contract['embedding_model_sha256'] != complete['model_sha256']
-                    or Path(prediction_contract['embedding_run']).resolve() != (run / 'infer').resolve()
-                    or prediction_contract['cells'] != complete['cells']):
+            _, scored_directory, prediction_manifest, prediction_record = load_prediction_pointer(self.prediction_pointer)
+            self._require_contract(
+                prediction_contract(prediction_record, where=str(prediction_manifest)),
+                actual_from=str(prediction_manifest),
+            )
+            if (prediction_record['source_sha256'] != complete['source_sha256']
+                    or prediction_record['embedding_model_sha256'] != complete['model_sha256']
+                    or Path(prediction_record['embedding_run']).resolve() != (run / 'infer').resolve()
+                    or prediction_record['cells'] != complete['cells']):
                 raise ValueError(f'{self.dataset_name} selected predictions differ from the corrected embeddings')
-            model_path = Path(prediction_contract['model'])
-            if file_sha256(model_path) != prediction_contract['model_sha256']:
+            model_path = Path(prediction_record['model'])
+            if file_sha256(model_path) != prediction_record['model_sha256']:
                 raise ValueError(f'{self.dataset_name} selected classifier identity changed')
             embedding_bundle = bundle
             bundle = joblib.load(model_path)
-            validate_feature_contract(bundle, embedding_bundle)
+            self._require_contract(validate_feature_contract(bundle, embedding_bundle), actual_from=str(model_path))
         register_jpegxr_codec()
         self.display_pixels = DisplayPixels(embedding_model_path, run / 'source')
+        self._require_contract(self.display_pixels.contract, actual_from=str(embedding_model_path))
         source = self.display_pixels.source
         if source.manifest['source_sha256'] != complete['source_sha256']:
             raise ValueError(f'{self.dataset_name} display and inference source identities differ')
@@ -82,12 +103,11 @@ class FieldSource(Prod3FieldSource):
             labels=source.manifest['labels']['root'], shape=self.shape,
             scale=self.scale, origin=self.origin,
         )
-        self.arrays = {'DAPI': source.channels['pi'], 'BrdU': source.channels['brdu'],
-                       'EdU': source.channels['edu']}
+        self.arrays = {name: source.channels[key] for name, key in self.raw_channels.items()}
         self.crop_reader = CellCropReader(
             labels=self.labels,
-            channels={'pi': self.arrays['DAPI'], 'dapi': self.arrays['DAPI'],
-                      'edu': self.arrays['EdU'], 'brdu': self.arrays['BrdU']},
+            channels={**{key: self.arrays[name] for name, key in self.raw_channels.items()},
+                      'dapi': self.arrays['DAPI']},
             offset_zyx=(0, 0, 0),
             cache_bytes=4 * int(np.prod(self.labels.chunks)) * self.labels.dtype.itemsize
             + 64 * 1024**2,
@@ -97,8 +117,8 @@ class FieldSource(Prod3FieldSource):
         self.display_name = f'{self.display_name} · {self.display_pixels.description}'
         self.props_path = run / 'source/cells.parquet'
         self.crop_contract = json.loads((review_root / 'barrage-cortex-v1/run.json').read_text())
-        self.contrast = np.asarray([[0., self.crop_contract['display_max'][key]]
-                                    for key in ('pi', 'brdu', 'edu')])
+        self.contrast = {key: (0., self.crop_contract['display_max'][key])
+                         for key in self.config.contract.channel_keys}
 
         spatial = root / 'spatial-workflow-v1'
         surface_path = spatial / 'vz-surface/surface.npz'
@@ -125,53 +145,46 @@ class FieldSource(Prod3FieldSource):
         if scored_directory is None:
             for shard in complete['shards']:
                 directory = run / 'infer' / f"shard-{shard['shard']:03d}"
-                contract = json.loads((directory / 'complete.json').read_text())
-                if (contract['model_sha256'] != complete['model_sha256']
-                        or contract['source_sha256'] != complete['source_sha256']
-                        or contract['cells'] != shard['cells']):
+                shard_record = json.loads((directory / 'complete.json').read_text())
+                self._require_contract(
+                    INFERENCE.contract(shard_record, where=str(directory / 'complete.json')),
+                    actual_from=str(directory / 'complete.json'),
+                )
+                if (shard_record['model_sha256'] != complete['model_sha256']
+                        or shard_record['source_sha256'] != complete['source_sha256']
+                        or shard_record['cells'] != shard['cells']):
                     raise ValueError(f'{self.dataset_name} inference shard identity differs')
                 files = sorted((directory / 'predictions').glob('*.parquet'))
                 if len(files) != shard['partitions']:
                     raise ValueError(f'{self.dataset_name} inference partition coverage differs')
-                parts.extend(files)
+                parts.extend((path, shard_record) for path in files)
         else:
-            parts = sorted(scored_directory.glob('*.parquet'))
-            if len(parts) != prediction_contract['prediction_partitions']:
+            files = sorted(scored_directory.glob('*.parquet'))
+            if len(files) != prediction_record['prediction_partitions']:
                 raise ValueError(f'{self.dataset_name} selected prediction partition coverage differs')
-        for path in parts:
+            parts.extend((path, prediction_record) for path in files)
+        for path, run_record in parts:
             metadata, _ = read_parquet_artifact(path)
-            if (metadata['model_sha256'] != prediction_contract['model_sha256']
+            if metadata.get('artifact') != run_record.get('artifact'):
+                raise ValueError(f'{self.dataset_name} prediction artifact differs from its run record: {path}')
+            self._require_contract(prediction_contract(metadata, where=str(path)), actual_from=str(path))
+            if (metadata['model_sha256'] != prediction_record['model_sha256']
                     or metadata['source_sha256'] != complete['source_sha256']
-                    or any(metadata[f'{marker}_cutoff'] != bundle[f'{marker}_cutoff']
-                           for marker in ('brdu', 'edu'))):
+                    or any(metadata[cutoff_key(marker)] != bundle[cutoff_key(marker)] for marker in markers)):
                 raise ValueError(f'{self.dataset_name} prediction provenance differs: {path}')
-        parts = [str(path) for path in parts]
-        frame = ds.dataset(parts, format='parquet').to_table(
-            columns=['cell', 'label', 'brdu', 'edu', 'p_brdu', 'p_edu'],
-        ).to_pandas()
-        if (len(frame) != complete['cells'] or frame.label.duplicated().any()
-                or not frame.cell.equals(self.cell_prefix + '|' + frame.label.astype(str))
-                or not frame[['brdu', 'edu']].isin([0, 1]).all().all()):
-            raise ValueError(f'{self.dataset_name} prediction cell identities or calls differ')
-        self.calls = np.full(int(frame.label.max()) + 1, 4, dtype=np.uint8)
-        self.calls[frame.label] = frame.edu.to_numpy(dtype=np.uint8) + 2 * frame.brdu.to_numpy(dtype=np.uint8)
-        uncertainty = combined_uncertainty(
-            frame.p_brdu.to_numpy(), frame.p_edu.to_numpy(),
-            brdu_threshold=float(bundle['brdu_cutoff']), edu_threshold=float(bundle['edu_cutoff']),
-        )
-        self.uncertainty = np.full(len(self.calls), np.nan, dtype=np.float32)
-        self.uncertainty[frame.label] = uncertainty
-        self.uncertainty_log_vmax = float(np.quantile(np.log1p(uncertainty[np.isfinite(uncertainty)]), .999))
-        self.model_version = prediction_contract['model_sha256'][:12]
+        columns = ['cell', 'label', *markers, *(probability_column(marker) for marker in markers)]
+        frame = ds.dataset([str(path) for path, _ in parts], format='parquet').to_table(columns=columns).to_pandas()
+        if len(frame) != complete['cells']:
+            raise ValueError(f'{self.dataset_name} prediction cell count differs from its inference')
+        cutoffs = {marker: float(bundle[cutoff_key(marker)]) for marker in markers}
+        self._adopt_model_calls(frame, cutoffs=cutoffs, cell_prefix=self.cell_prefix)
+        self.model_version = prediction_record['model_sha256'][:12]
         self.prediction_manifest = str(prediction_manifest)
-        self.classifier_caption = (
-            f"Classifier {self.model_version} · BrdU cutoff {bundle['brdu_cutoff']:.10f} · "
-            f"EdU cutoff {bundle['edu_cutoff']:.10f}"
-        )
+        self.classifier_caption = classifier_caption(self.model_version, self.config, cutoffs)
         train = frame.cell.isin(bundle['train_cells'])
         validation = frame.cell.isin(bundle['validation_cells'])
         self._gallery_predictions = frame.rename(
-            columns={'brdu': 'pred_brdu', 'edu': 'pred_edu'},
+            columns={marker: prediction_column(marker) for marker in markers},
         ).copy()
         self._gallery_predictions['split'] = 'untrained'
         self._gallery_predictions.loc[train, 'split'] = 'training'
@@ -180,11 +193,10 @@ class FieldSource(Prod3FieldSource):
         self.training_predictions = self._gallery_predictions.loc[train | validation].copy()
         if self.prediction_pointer is not None:
             self.training_predictions = load_review_predictions(
-                Path(prediction_contract['review_manifest']),
-                model_sha256=prediction_contract['model_sha256'], cell_prefix=self.cell_prefix,
+                Path(prediction_record['review_manifest']),
+                model_sha256=prediction_record['model_sha256'], cell_prefix=self.cell_prefix,
+                contract=self.config.contract,
             )
-        self.annotation_paths = (review_root / 'barrage-cortex-v1/labels.csv',)
-        self.default_annotation_path = self.annotation_paths[0]
 
     @property
     def gallery_predictions(self):

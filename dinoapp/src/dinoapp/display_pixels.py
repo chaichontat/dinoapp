@@ -6,10 +6,11 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+from dino_markers import bundle_contract, contract_of, require_same_contract
 
 from dino.artifacts import file_sha256
-from dino.periodic_pixels import PeriodicPixels
-from dino.spatial_pixels import SpatialPixels
+from dino.periodic_pixels import PeriodicPixels, require_periodic_targets
+from dino.spatial_pixels import SpatialPixels, require_spatial_subtraction_contract
 from dino.zarr_source import CellCrop, open_review_source
 from dino.pixel_corrections import correct_channels
 
@@ -25,6 +26,12 @@ class DisplayPixels:
         bundle = joblib.load(self.model_path)
         if bundle['source_sha256'] != self.source.manifest['source_sha256']:
             raise ValueError('Display model and source identities differ')
+        self.contract = bundle_contract(bundle, where=str(self.model_path))
+        require_same_contract(
+            contract_of(source_dir), self.contract,
+            expected_from=f'display source {source_dir}', actual_from=str(self.model_path),
+        )
+        require_spatial_subtraction_contract(self.contract, artifact=str(self.model_path))
         self.spatial = SpatialPixels.from_spec(bundle['spatial_subtraction'])
         manifest = self.source.manifest
         geometry = manifest['channels']['brdu']['ome']
@@ -40,6 +47,7 @@ class DisplayPixels:
             raise ValueError('Unsupported display periodic correction contract')
         if file_sha256(Path(self.periodic.path)) != self.periodic.sha256:
             raise ValueError('Display periodic correction artifact identity differs')
+        require_periodic_targets(self.periodic, self.contract, artifact=str(self.model_path))
         self.identity = file_sha256(self.model_path)
         self.description = 'BrdU/DAPI subtracted; periodic intensity corrected'
 
@@ -67,6 +75,6 @@ class DisplayPixels:
 
     def field_images(self, images, selection):
         z, ys, xs = selection
-        raw = {marker: np.asarray(self.source.channels[marker][selection]) for marker in ('brdu', 'edu', 'pi')}
-        corrected = self.channels(raw, (z, ys.start, xs.start), reference='pi')
-        return {**images, 'BrdU': corrected['brdu'], 'EdU': corrected['edu']}
+        raw = {key: np.asarray(self.source.channels[key][selection]) for key in self.contract.channel_keys}
+        corrected = self.channels(raw, (z, ys.start, xs.start), reference=self.spatial.reference)
+        return {**images, **{marker: corrected[marker] for marker in self.contract.markers}}
