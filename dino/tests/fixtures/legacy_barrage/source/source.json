@@ -1,0 +1,84 @@
+{
+  "channels": {
+    "brdu": {
+      "array": "",
+      "chunks": [
+        1,
+        20,
+        20
+      ],
+      "content_sha256": "42ac0fe7992028a0eaa80b74a306bc7dc231df0a0d7c7b0af01c7111a72a0880",
+      "dtype": "uint16",
+      "metadata_sha256": "8c5f54d92b9670d5dfdd84bb9f148c7c39611ccd689c1d6946abb1dd770db3cb",
+      "ome": null,
+      "root": "/tmp/dino-wf0-legacy-barrage/stores/brdu.zarr",
+      "shape": [
+        2,
+        40,
+        40
+      ]
+    },
+    "edu": {
+      "array": "",
+      "chunks": [
+        1,
+        20,
+        20
+      ],
+      "content_sha256": "a156dc85ca5231c5d432f52b1f327aa44979d208d8f1bb737d9ee13b42ea92ab",
+      "dtype": "uint16",
+      "metadata_sha256": "8c5f54d92b9670d5dfdd84bb9f148c7c39611ccd689c1d6946abb1dd770db3cb",
+      "ome": null,
+      "root": "/tmp/dino-wf0-legacy-barrage/stores/edu.zarr",
+      "shape": [
+        2,
+        40,
+        40
+      ]
+    },
+    "pi": {
+      "array": "",
+      "chunks": [
+        1,
+        20,
+        20
+      ],
+      "content_sha256": "f855395e26416649c093ee77405522f313e218a4744ee45dd101c2f5c634a527",
+      "dtype": "uint16",
+      "metadata_sha256": "8c5f54d92b9670d5dfdd84bb9f148c7c39611ccd689c1d6946abb1dd770db3cb",
+      "ome": null,
+      "root": "/tmp/dino-wf0-legacy-barrage/stores/pi.zarr",
+      "shape": [
+        2,
+        40,
+        40
+      ]
+    }
+  },
+  "dataset": "dataset",
+  "labels": {
+    "array": "",
+    "chunks": [
+      1,
+      16,
+      16
+    ],
+    "content_sha256": "cb60b34a6ecf7fa2d3f806b8e9eb4166a00226f07707642e114439f6c0deb861",
+    "dtype": "uint32",
+    "metadata_sha256": "f68681c6a13c67bb3dc0be1dc388f5b2a4331eb1a924a3fd7b32c08e1804dc93",
+    "root": "/tmp/dino-wf0-legacy-barrage/stores/dataset/roi/masked/labels.zarr",
+    "shape": [
+      2,
+      32,
+      32
+    ]
+  },
+  "offset_zyx": [
+    0,
+    4,
+    4
+  ],
+  "roi": "roi",
+  "schema": "dino-zarr-source-v1",
+  "source_sha256": "3d04ff646f0116132d780c5c2709a124c9f17f8288dbde3c3a2edec48f0d4d84"
+}

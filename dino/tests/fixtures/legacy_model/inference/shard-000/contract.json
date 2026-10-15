@@ -1,0 +1,27 @@
+{
+  "artifact": "dino-zarr-infer-v2",
+  "brdu_cutoff": 0.6463847160339355,
+  "cells": 16,
+  "edu_cutoff": 0.5182463526725769,
+  "embedding_dimension": 3,
+  "embedding_dtype": "bfloat16",
+  "embedding_format": "pytorch-tensor-v1",
+  "embedding_targets": [
+    "brdu",
+    "edu"
+  ],
+  "feature_execution": "native_sdpa",
+  "feature_precision": "bfloat16",
+  "model_schema": "dino-zarr-model-v6",
+  "model_sha256": "145d8e9230373b45923523129aaf3b7af1682d786946d4872b0cc8de1f1748a7",
+  "model_source_sha256": "53525f1db56678fdf6ea90bc9d41545a87a09fbacad7c1ba30d05f26c2071de3",
+  "partition_cells": 8,
+  "prepared_cells_sha256": "fdb006ed384a08aabb5740f8911e3402c563cc1c11265471c7ef0eebe791b634",
+  "requested_cells_sha256": "118a18e0b3fae7f2923d55f70cbb4a9e235de69e5f90b0d1f3750d38dca272be",
+  "requested_input_sha256": null,
+  "shard_count": 1,
+  "shard_index": 0,
+  "source_cells": 16,
+  "source_sha256": "e0bfc8407b5363493fb2ec81125e82c03cd5027428387a9a06c72032c25b97c3",
+  "stores_embeddings": true
+}

@@ -1,0 +1,168 @@
+{
+  "channels": {
+    "brdu": {
+      "array": "0",
+      "chunks": [
+        2,
+        5,
+        5
+      ],
+      "content_sha256": "0b9e5544c18ab0848cd6fcc2c3e1222ba49fe976688a9b4d472d09afb34dca9c",
+      "dtype": "uint16",
+      "metadata_sha256": "cd17168fe7abfc29286dfffb29186597624ea1e56dad8909381a73c8b421ce06",
+      "ome": {
+        "axes": [
+          {
+            "name": "z",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "y",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "x",
+            "type": "space",
+            "unit": "micrometer"
+          }
+        ],
+        "coordinate_transformations": [
+          {
+            "scale": [
+              1.0,
+              0.216,
+              0.216
+            ],
+            "type": "scale"
+          }
+        ]
+      },
+      "root": "/tmp/wf0-source/legacy_source/data/demo-dataset/fused/brdu.zarr",
+      "shape": [
+        4,
+        10,
+        10
+      ]
+    },
+    "edu": {
+      "array": "0",
+      "chunks": [
+        2,
+        5,
+        5
+      ],
+      "content_sha256": "4b8747434bf00fcade2dddc81fa4f684bf55ca163d4258079d62170875725a42",
+      "dtype": "uint16",
+      "metadata_sha256": "cd17168fe7abfc29286dfffb29186597624ea1e56dad8909381a73c8b421ce06",
+      "ome": {
+        "axes": [
+          {
+            "name": "z",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "y",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "x",
+            "type": "space",
+            "unit": "micrometer"
+          }
+        ],
+        "coordinate_transformations": [
+          {
+            "scale": [
+              1.0,
+              0.216,
+              0.216
+            ],
+            "type": "scale"
+          }
+        ]
+      },
+      "root": "/tmp/wf0-source/legacy_source/data/demo-dataset/fused/edu.zarr",
+      "shape": [
+        4,
+        10,
+        10
+      ]
+    },
+    "pi": {
+      "array": "0",
+      "chunks": [
+        2,
+        5,
+        5
+      ],
+      "content_sha256": "4a217ca74df828ec21c4a6742f1374eb710c5f05daee25c62b1bc567346d8e75",
+      "dtype": "uint16",
+      "metadata_sha256": "cd17168fe7abfc29286dfffb29186597624ea1e56dad8909381a73c8b421ce06",
+      "ome": {
+        "axes": [
+          {
+            "name": "z",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "y",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "x",
+            "type": "space",
+            "unit": "micrometer"
+          }
+        ],
+        "coordinate_transformations": [
+          {
+            "scale": [
+              1.0,
+              0.216,
+              0.216
+            ],
+            "type": "scale"
+          }
+        ]
+      },
+      "root": "/tmp/wf0-source/legacy_source/data/demo-dataset/fused/pi.zarr",
+      "shape": [
+        4,
+        10,
+        10
+      ]
+    }
+  },
+  "dataset": "demo-dataset",
+  "labels": {
+    "array": "",
+    "chunks": [
+      2,
+      3,
+      3
+    ],
+    "content_sha256": "f68741ac91012c0cee8c82e504ec227b937f9506bf068caf7dfa7a3996b21785",
+    "dtype": "uint32",
+    "metadata_sha256": "09c1dd24f98fc9df83497dbd0c2e6068ca6a9efbc7ce9a5815fb397652ac6022",
+    "root": "/tmp/wf0-source/legacy_source/data/demo-dataset/roi-a/masked/labels.zarr",
+    "shape": [
+      4,
+      6,
+      6
+    ]
+  },
+  "offset_zyx": [
+    0,
+    2,
+    3
+  ],
+  "roi": "roi-a",
+  "schema": "dino-zarr-source-v1",
+  "source_sha256": "cea57ee6fa467ec068d7e71668b4452a667514f62ed066a2e17585008ff635a6"
+}

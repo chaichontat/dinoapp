@@ -1,0 +1,84 @@
+{
+  "channels": {
+    "brdu": {
+      "array": "",
+      "chunks": [
+        1,
+        14,
+        52
+      ],
+      "content_sha256": "e2f21b9f1e3ae479d5417704b878729d12464a237a7cf20124f1e25b0f8d0bf3",
+      "dtype": "uint16",
+      "metadata_sha256": "5f95db8abc3d85e8dfea4dfc3b6886f1804e0997550f0700b0392f87ee41f1a2",
+      "ome": null,
+      "root": "zarr/brdu.zarr",
+      "shape": [
+        1,
+        14,
+        52
+      ]
+    },
+    "edu": {
+      "array": "",
+      "chunks": [
+        1,
+        14,
+        52
+      ],
+      "content_sha256": "779e5e2283c890d633b63e1a315bc326e5bdb94c0c96641373db3fa31391fecc",
+      "dtype": "uint16",
+      "metadata_sha256": "5f95db8abc3d85e8dfea4dfc3b6886f1804e0997550f0700b0392f87ee41f1a2",
+      "ome": null,
+      "root": "zarr/edu.zarr",
+      "shape": [
+        1,
+        14,
+        52
+      ]
+    },
+    "pi": {
+      "array": "",
+      "chunks": [
+        1,
+        14,
+        52
+      ],
+      "content_sha256": "843c1205969c0ead8385e8e96955cc4ea0dbe1aa8edc32f9d676fcc037cff7a9",
+      "dtype": "uint16",
+      "metadata_sha256": "5f95db8abc3d85e8dfea4dfc3b6886f1804e0997550f0700b0392f87ee41f1a2",
+      "ome": null,
+      "root": "zarr/pi.zarr",
+      "shape": [
+        1,
+        14,
+        52
+      ]
+    }
+  },
+  "dataset": "ds",
+  "labels": {
+    "array": "",
+    "chunks": [
+      1,
+      12,
+      48
+    ],
+    "content_sha256": "02e3316f6fe58ecc9d2f14d13d7926cead44d90a397bfded448e2f22d80abec6",
+    "dtype": "uint32",
+    "metadata_sha256": "f94b19057e8fb49040e8546eaf482aaf498ba3eae5c7fb600cf84f81df063d9a",
+    "root": "zarr/labels.zarr",
+    "shape": [
+      1,
+      12,
+      48
+    ]
+  },
+  "offset_zyx": [
+    0,
+    1,
+    2
+  ],
+  "roi": "roi",
+  "schema": "dino-zarr-source-v1",
+  "source_sha256": "e0bfc8407b5363493fb2ec81125e82c03cd5027428387a9a06c72032c25b97c3"
+}

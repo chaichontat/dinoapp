@@ -1,0 +1,20 @@
+{
+  "artifact": "dino-zarr-barrage-v3",
+  "candidate_cells": 6,
+  "cmap": "magma",
+  "display_max": {
+    "brdu": 991.0,
+    "edu": 588.0,
+    "pi": 1295.0
+  },
+  "display_min": 0.0,
+  "display_overrides": {},
+  "display_percentile": 99.9,
+  "figure_dpi": 200,
+  "n_bins": 6,
+  "n_cells": 4,
+  "renderer": "v3",
+  "seed": 0,
+  "size": 16,
+  "source_sha256": "3d04ff646f0116132d780c5c2709a124c9f17f8288dbde3c3a2edec48f0d4d84"
+}

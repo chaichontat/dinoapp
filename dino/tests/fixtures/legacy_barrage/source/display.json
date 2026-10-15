@@ -1,0 +1,16 @@
+{
+  "artifact": "dino-zarr-display-v1",
+  "percentile": 99.9,
+  "samples_per_channel": 32,
+  "source_sha256": "3d04ff646f0116132d780c5c2709a124c9f17f8288dbde3c3a2edec48f0d4d84",
+  "vmax": {
+    "brdu": 991.0,
+    "edu": 588.0,
+    "pi": 1295.0
+  },
+  "xy_stride": 8,
+  "z_indices": [
+    0,
+    1
+  ]
+}
