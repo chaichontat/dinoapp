@@ -1,10 +1,11 @@
 [tool.uv.workspace]
-members = ["dinoapp", "dino"]
+members = ["dinoapp", "dino", "markers"]
 
 [tool.uv.sources]
 dinoapp = { workspace = true }
+dino-markers = { workspace = true }
 thesis-dino = { workspace = true }
 
 [tool.pytest.ini_options]
-testpaths = ["dinoapp/tests", "dino/tests"]
+testpaths = ["dinoapp/tests", "dino/tests", "markers/tests"]
 markers = ["integration: public workflow and artifact behavior"]

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "reference": {"key": "pi", "label": "PI"},
+  "markers": [
+    {"key": "brdu", "label": "BrdU", "color": "#ff00ff"},
+    {"key": "edu", "label": "EdU", "color": "#00ff00"}
+  ],
+  "presentation": {
+    "crop_panels": ["pi", "edu", "brdu"],
+    "negative_color": [0.25, 0.25, 0.25],
+    "uncalled_color": "#999999",
+    "badge_colors": [
+      {"state": {"brdu": 0, "edu": 1}, "background": "#008f3a", "foreground": "#ffffff"},
+      {"state": null, "background": "#777777", "foreground": "#ffffff"}
+    ]
+  }
+}

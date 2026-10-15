@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "click",
     "contourpy",
+    "dino-markers>=0.1.0",
     "joblib",
     "loguru",
     "matplotlib",

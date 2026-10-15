@@ -13,6 +13,7 @@ authors = [
     { name = "Chaichontat Sriworarat" },
 ]
 dependencies = [
+    "dino-markers>=0.1.0",
     "pandas>=2.0",
     "streamlit>=1.63",
 ]

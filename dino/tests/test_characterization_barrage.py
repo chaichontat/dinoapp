@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib.axes
+import matplotlib
 import numpy as np
 import pandas as pd
 import joblib
@@ -26,6 +27,14 @@ from dino import crop_rendering, pixel_corrections, zarr_barrage, zarr_train
 from dino.artifacts import file_sha256
 from dino.periodic_pixels import PeriodicPixels
 from dino.zarr_source import CellCrop, manifest_digest
+
+
+@pytest.fixture(autouse=True)
+def _matplotlib_defaults():
+    """Render under the startup rc settings; dino.roc applies a global style."""
+    with matplotlib.rc_context():
+        matplotlib.rc_file_defaults()
+        yield
 
 FIXTURE = Path(__file__).parent / "fixtures" / "legacy_barrage"
 LEGACY_STORES = Path("/tmp/dino-wf0-legacy-barrage/stores")

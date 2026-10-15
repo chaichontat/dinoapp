@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dino-markers"
+version = "0.1.0"
+description = "Marker configuration and artifact contracts shared by thesis-dino and dinoapp"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dino_markers"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import matplotlib
 import numpy as np
 import pandas as pd
 import pytest
@@ -29,6 +30,14 @@ from dinoapp import native
 from dinoapp.label_store import LabelConflictError, load_labels, update_label
 from dinoapp.review_session import get_context, save_assignment, undo_edit
 from dinoapp.sources import AnnotationFiles, BarrageSource
+
+
+@pytest.fixture(autouse=True)
+def _matplotlib_defaults():
+    """Render under the startup rc settings; dino.roc applies a global style."""
+    with matplotlib.rc_context():
+        matplotlib.rc_file_defaults()
+        yield
 
 FIXTURES = Path(__file__).parent / "fixtures" / "legacy_review"
 LEGACY_BARRAGE = FIXTURES / "barrage"
