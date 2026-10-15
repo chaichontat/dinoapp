@@ -19,8 +19,8 @@ override-dependencies = [
 dinoapp = { workspace = true }
 dino-markers = { workspace = true }
 thesis-dino = { workspace = true }
-squisher = { git = "https://github.com/chaichontat/squisher", subdirectory = "squisher" }
-squisher-segment = { git = "https://github.com/chaichontat/squisher", subdirectory = "segment" }
+squisher = { git = "https://github.com/chaichontat/squisher", rev = "4cd1423aaacedda1fe3f4326411455e271eaf872", subdirectory = "squisher" }
+squisher-segment = { git = "https://github.com/chaichontat/squisher", rev = "4cd1423aaacedda1fe3f4326411455e271eaf872", subdirectory = "segment" }
 dinov2 = { git = "https://github.com/chaichontat/dinov2", rev = "76d1757bbb72097b7f0126c4d0081f4fea483e67" }
 
 [tool.pytest.ini_options]
