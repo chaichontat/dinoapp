@@ -26,8 +26,8 @@ def entry(**changes):
 
 @pytest.fixture
 def config_file(tmp_path, default_json, write):
-    def write_targets(targets, directory="lab"):
-        return write(tmp_path / directory / "markers.json", {**default_json, "review_targets": targets})
+    def write_targets(targets):
+        return write(tmp_path / "lab" / "markers.json", {**default_json, "review_targets": targets})
 
     return write_targets
 

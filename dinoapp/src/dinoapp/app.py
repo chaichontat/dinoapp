@@ -168,8 +168,6 @@ ADAPTERS = {
 
 @st.cache_resource
 def get_native_modules(adapter: str) -> tuple[Any, Any]:
-    if adapter not in ADAPTERS:
-        raise ValueError(f"Unknown review adapter: {adapter}")
     return importlib.import_module(ADAPTERS[adapter]), importlib.import_module("dinoapp.native_app")
 
 

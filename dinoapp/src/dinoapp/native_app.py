@@ -805,8 +805,7 @@ def review_field(
             )
             if draft is not None:
                 draft["values"][key] = choice
-        value = draft_label(contract.markers, draft) if draft is not None else None
-        chosen = value
+        chosen = draft_label(contract.markers, draft) if draft is not None else None
     if chosen is not None and chosen != saved:
         try:
             edit = save_assignment(

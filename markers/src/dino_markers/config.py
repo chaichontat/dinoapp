@@ -270,7 +270,6 @@ class ReviewTarget:
 
 def load_review_targets(path: Path) -> tuple[ReviewTarget, ...]:
     """The review targets of a marker configuration file, validated against its contract."""
-    path = Path(path)
     channels = load_config(path).contract.channel_keys
     nodes = json.loads(path.read_text(encoding="utf-8")).get("review_targets", [])
     base = path.absolute().parent

@@ -40,7 +40,7 @@ def test_sidebar_cache_miss_uses_reloaded_source_class(monkeypatch):
             "class Field: pass\n"
             "class Source:\n"
             "    def __init__(self, target):\n"
-            "        self.target = target\n"
+            "        pass\n"
             "    def field(self, *args):\n"
             "        result = Field()\n"
             "        result.settings = args\n"

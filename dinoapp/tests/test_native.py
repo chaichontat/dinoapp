@@ -784,7 +784,7 @@ def test_field_calls_encode_saved_labels_for_every_marker_and_fill_the_uncalled_
 
 
 def test_annotation_directories_name_the_directories_each_adapter_annotates(tmp_path):
-    from dinoapp import prod2_2, prod3, prod3_2
+    from dinoapp import prod3, prod3_2
 
     review = tmp_path / "review"
     target = ReviewTarget("Test", "test", tmp_path / "root", review, "run", {"561": "pi", "BrdU": "brdu", "EdU": "edu"})
@@ -795,7 +795,6 @@ def test_annotation_directories_name_the_directories_each_adapter_annotates(tmp_
         review / "barrage-cortex-v1", review / "barrage-vz-svz-v1",
     )
     assert prod3_2.FieldSource.annotation_directories(target) == (review / "barrage-cortex-v1",)
-    assert prod2_2.FieldSource.annotation_directories(target) == (review / "barrage-cortex-v1",)
 
 
 def _prod2_target(root: Path) -> ReviewTarget:

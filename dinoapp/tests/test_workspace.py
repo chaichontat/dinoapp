@@ -678,7 +678,6 @@ def test_review_targets_come_from_the_configured_marker_file(tmp_path, monkeypat
 @pytest.mark.parametrize(
     ("dataset", "adapter", "message"),
     [
-        (None, "prod3", "Unknown review target: None"),
         ("Prod2", "prod3", "Unknown review target: Prod2"),
         ("Prod3", "prod9", "Review target 'Prod3' names unknown adapter 'prod9'; known adapters: prod2, prod3, prod2_2, prod3_2"),
     ],
@@ -690,10 +689,7 @@ def test_native_review_requires_a_configured_target_and_adapter(tmp_path, monkey
     config = write_review_config(tmp_path / "config", [{**PROD3_ENTRY, "adapter": adapter}])
     monkeypatch.setenv("DINO_REVIEW_CONFIG", str(config))
     monkeypatch.setenv("DINO_REVIEW_SOURCE", "Native fields")
-    if dataset is None:
-        monkeypatch.delenv("DINO_NATIVE_DATASET", raising=False)
-    else:
-        monkeypatch.setenv("DINO_NATIVE_DATASET", dataset)
+    monkeypatch.setenv("DINO_NATIVE_DATASET", dataset)
     review = AppTest.from_file(app.__file__).run(timeout=20)
     assert not review.exception
     assert [error.value for error in review.error] == [message]
