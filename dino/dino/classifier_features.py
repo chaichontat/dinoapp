@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 import pyarrow.parquet as pq
+from dino_markers import (
+    INTENSITY_MODEL,
+    MarkerContract,
+    bundle_contract,
+    require_same_contract,
+    scaler_key,
+)
 
 from dino.artifacts import file_sha256
-from dino.intensity_context import MODEL_SCHEMA, IntensityContext
-
-
-TARGETS = ("brdu", "edu")
+from dino.intensity_context import IntensityContext
 
 
 BASE_CONTEXT_FEATURES = ("log1p_cell_mean", "log_cell_over_local_mean")
@@ -87,8 +92,9 @@ class DapiIntensityContext:
         dapi_props: Path,
         *,
         scale_zyx_um: np.ndarray,
+        markers: Sequence[str],
     ) -> DapiIntensityContext:
-        marker = IntensityContext.load(marker_props, scale_zyx_um=scale_zyx_um)
+        marker = IntensityContext.load(marker_props, scale_zyx_um=scale_zyx_um, markers=markers)
         dapi_means = _load_ordered_dapi_means(dapi_props, marker_props)
         if len(dapi_means) != len(marker.points_zyx_um):
             raise ValueError("DAPI and marker context cell counts differ")
@@ -101,8 +107,8 @@ class DapiIntensityContext:
         indices = np.asarray(labels, dtype=np.int64) - 1
         dapi = np.log1p(self.dapi_means[indices])[:, None]
         return {
-            target: np.column_stack((marker_features[target], dapi))
-            for target in TARGETS
+            target: np.column_stack((features, dapi))
+            for target, features in marker_features.items()
         }
 
 
@@ -124,8 +130,7 @@ class DapiRatioIntensityContext:
         local = self.dapi.marker.neighbor_indices_for_labels(labels, neighbors=RATIO_NEIGHBORS)
         dapi = self.dapi.dapi_means
         features = {}
-        for target in TARGETS:
-            means = self.dapi.marker.means[target]
+        for target, means in self.dapi.marker.means.items():
             ratio = np.log((means[indices] + 1.0) / (dapi[indices] + 1.0))
             around = np.log((means[local] + 1.0) / (dapi[local] + 1.0))
             center = np.median(around, axis=1)
@@ -142,9 +147,12 @@ def load_context(
     dapi_props: Path,
     *,
     scale_zyx_um: np.ndarray,
+    markers: Sequence[str],
 ) -> DapiIntensityContext | DapiRatioIntensityContext:
     """Load the DAPI-based context that produces exactly the named features."""
-    context = DapiIntensityContext.load(marker_props, dapi_props, scale_zyx_um=scale_zyx_um)
+    context = DapiIntensityContext.load(
+        marker_props, dapi_props, scale_zyx_um=scale_zyx_um, markers=markers
+    )
     if features == DAPI_CONTEXT_FEATURES:
         return context
     if features == DAPI_RATIO_CONTEXT_FEATURES:
@@ -154,6 +162,7 @@ def load_context(
 
 def load_classifier_context(bundle: dict[str, object]) -> Context:
     """Load exactly the scalar-feature context declared by a model bundle."""
+    markers = bundle_contract(bundle, where="classifier bundle").markers
     features = tuple(str(value) for value in bundle.get("context_features", ()))
     marker_props = Path(str(bundle["intensity_props"]))
     expected_marker_hash = bundle.get("intensity_props_sha256")
@@ -163,31 +172,32 @@ def load_classifier_context(bundle: dict[str, object]) -> Context:
         raise ValueError(f"Marker regionprops SHA-256 differs: {marker_props}")
     scale = np.asarray(bundle["intensity_scale_zyx_um"], dtype=np.float64)
     if features == BASE_CONTEXT_FEATURES:
-        return IntensityContext.load(marker_props, scale_zyx_um=scale)
+        return IntensityContext.load(marker_props, scale_zyx_um=scale, markers=markers)
     if features not in (DAPI_CONTEXT_FEATURES, DAPI_RATIO_CONTEXT_FEATURES):
         raise ValueError(f"Unsupported classifier context features: {features}")
     dapi_props = Path(str(bundle["dapi_props"]))
     expected_hash = bundle.get("dapi_props_sha256")
     if not isinstance(expected_hash, str) or file_sha256(dapi_props) != expected_hash:
         raise ValueError(f"DAPI regionprops SHA-256 differs: {dapi_props}")
-    return load_context(features, marker_props, dapi_props, scale_zyx_um=scale)
+    return load_context(features, marker_props, dapi_props, scale_zyx_um=scale, markers=markers)
 
 
 def assemble_classifier_features(
-    embeddings: dict[str, np.ndarray],
-    context_features: dict[str, np.ndarray],
+    embeddings: Mapping[str, np.ndarray],
+    context_features: Mapping[str, np.ndarray],
     *,
     target: str,
     mode: str,
+    markers: Sequence[str],
 ) -> np.ndarray:
-    """Assemble classifier columns in the persisted marker order."""
-    if target not in TARGETS:
+    """Assemble classifier columns in the order of `markers`, the bundle's persisted marker order."""
+    if target not in markers:
         raise ValueError(f"Unknown classifier target: {target}")
     if mode == "marker":
         arrays = (embeddings[target], context_features[target])
     elif mode == "joint":
-        arrays = tuple(embeddings[name] for name in TARGETS) + tuple(
-            context_features[name] for name in TARGETS
+        arrays = tuple(embeddings[name] for name in markers) + tuple(
+            context_features[name] for name in markers
         )
     else:
         raise ValueError(f"Unknown classifier feature mode: {mode}")
@@ -218,10 +228,24 @@ FEATURE_MODES = ("marker", "joint")
 EMBEDDING_WIDTH = 1024
 
 
-def validate_feature_contract(bundle: dict[str, object], embedding_bundle: dict[str, object]) -> None:
-    """Require the classifier to consume the persisted embeddings' exact feature contract."""
-    if bundle.get("schema") != MODEL_SCHEMA or embedding_bundle.get("schema") != MODEL_SCHEMA:
-        raise ValueError(f"Expected model and embedding schema {MODEL_SCHEMA}")
+def validate_feature_contract(
+    bundle: dict[str, object], embedding_bundle: dict[str, object]
+) -> MarkerContract:
+    """Require the classifier to consume the persisted embeddings' exact feature contract.
+
+    Returns the shared marker contract, whose marker order callers use to assemble features.
+    """
+    if not (INTENSITY_MODEL.recognizes(bundle) and INTENSITY_MODEL.recognizes(embedding_bundle)):
+        raise ValueError(
+            f"Expected model and embedding schema {INTENSITY_MODEL.legacy} or {INTENSITY_MODEL.current}"
+        )
+    contract = bundle_contract(bundle, where="classifier bundle")
+    require_same_contract(
+        contract,
+        bundle_contract(embedding_bundle, where="embedding bundle"),
+        expected_from="classifier bundle",
+        actual_from="persisted embeddings",
+    )
     mismatched = [key for key in FEATURE_KEYS if bundle.get(key) != embedding_bundle.get(key)]
     if mismatched:
         raise ValueError(f"Persisted embeddings use a different feature contract: {mismatched}")
@@ -240,8 +264,9 @@ def validate_feature_contract(bundle: dict[str, object], embedding_bundle: dict[
     expected = (
         EMBEDDING_WIDTH + len(context_features)
         if mode == "marker"
-        else len(TARGETS) * (EMBEDDING_WIDTH + len(context_features))
+        else len(contract.markers) * (EMBEDDING_WIDTH + len(context_features))
     )
-    actual = {target: int(bundle[f"{target}_feature_scaler"].n_features_in_) for target in TARGETS}
+    actual = {marker: int(bundle[scaler_key(marker)].n_features_in_) for marker in contract.markers}
     if set(actual.values()) != {expected}:
         raise ValueError(f"Classifier feature dimensions differ from the saved contract: {actual} versus {expected}")
+    return contract

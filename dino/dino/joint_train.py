@@ -5,7 +5,7 @@ each dataset gets its own regularized intercept, encoded as an indicator column;
 each dataset also gets its own coefficients on the intensity terms, encoded as
 indicator-masked copies of the context features. Within one dataset those extra
 columns are constant, so the joint fit collapses exactly into one standard
-`dino-knn-intensity-v1` bundle per dataset, which the existing scorers apply.
+`dino-knn-intensity` bundle per dataset, which the existing scorers apply.
 """
 from __future__ import annotations
 
@@ -22,21 +22,43 @@ import joblib
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from dino_markers import (
+    CONTRACT_FIELD,
+    INFERENCE,
+    INTENSITY_MODEL,
+    JOINT_MODEL,
+    MarkerContract,
+    bundle_contract,
+    contract_of,
+    cutoff_key,
+    metric_key,
+    model_key,
+    oof_probability_column,
+    prediction_column,
+    probability_column,
+    require_same_contract,
+    scaler_key,
+)
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, brier_score_loss, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 import torch
 
-from dino.artifacts import _dump_joblib_atomic, file_sha256, ordered_cell_sha256, read_embedding_artifact
-from dino.classifier_features import TARGETS, load_context
-from dino.intensity_context import MODEL_SCHEMA
+from dino.artifacts import (
+    _dump_joblib_atomic,
+    file_sha256,
+    ordered_cell_sha256,
+    read_embedding_artifact,
+    require_embedding_markers,
+)
+from dino.classifier_features import load_context
+from dino.training_split import split_dataset_rows
 from dino.zarr_model import balanced_accuracy_cutoff
 from dino.zarr_source import write_json_atomic
 from dino.zarr_train import _best_logreg_c
 
-SCHEMA = 'dino-joint-dataset-v1'
 CV_FOLDS = 5
 INTENSITY_NEIGHBORS = 16
 EMBEDDING_WIDTH = 1024
@@ -80,12 +102,15 @@ def load_config(path: Path) -> tuple[list[Dataset], int, int, tuple[str, ...]]:
     return datasets, int(config['seed']), int(config['validation_cells']), tuple(config['context_features'])
 
 
-def read_labels(dataset: Dataset) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+def read_labels(dataset: Dataset, *, contract: MarkerContract) -> tuple[pd.DataFrame, list[dict[str, object]]]:
     """Freeze each live tranche once, hashing exactly the bytes that were parsed."""
+    markers = list(contract.markers)
     frames, records = [], []
     for tranche in dataset.tranches:
+        require_same_contract(contract, contract_of(tranche), expected_from=str(dataset.embedding_model),
+                              actual_from=str(tranche))
         raw = (tranche / 'labels.csv').read_bytes()
-        frame = pd.read_csv(io.BytesIO(raw), usecols=['cell', *TARGETS])
+        frame = pd.read_csv(io.BytesIO(raw), usecols=['cell', *markers])
         frame['tranche'] = tranche.name
         frames.append(frame)
         records.append({'path': str(tranche.resolve()), 'labels': len(frame),
@@ -94,34 +119,37 @@ def read_labels(dataset: Dataset) -> tuple[pd.DataFrame, list[dict[str, object]]
     labels['dataset'] = dataset.name
     if labels.cell.duplicated().any():
         raise ValueError(f'{dataset.name} tranches contain duplicate cell {labels.cell[labels.cell.duplicated()].iloc[0]}')
-    if not labels[list(TARGETS)].isin([0, 1]).all().all():
+    if not labels[markers].isin([0, 1]).all().all():
         raise ValueError(f'{dataset.name} labels must be binary')
-    labels[list(TARGETS)] = labels[list(TARGETS)].astype(np.int64)
+    labels[markers] = labels[markers].astype(np.int64)
     return labels, records
 
 
-def partition_embeddings(path: Path, embedding_path: Path,
-                         wanted: set[str]) -> tuple[list[str], list[int], dict[str, np.ndarray]]:
+def partition_embeddings(path: Path, embedding_path: Path, wanted: set[str],
+                         markers: tuple[str, ...]) -> tuple[list[str], list[int], dict[str, np.ndarray]]:
     """Return the requested cells of one persisted partition, in partition order."""
     rows = pq.read_table(path, columns=['cell', 'label']).to_pandas()
     selected = np.flatnonzero(rows.cell.isin(wanted).to_numpy())
     if not len(selected):
         return [], [], {}
     artifact = read_embedding_artifact(embedding_path)
+    require_embedding_markers(artifact, markers, path=embedding_path)
     if not torch.equal(artifact['cell_sha256'], ordered_cell_sha256(rows.cell.tolist())):
         raise ValueError(f'Prediction and embedding identities differ: {path}')
     index = torch.from_numpy(selected)
     return (rows.cell.iloc[selected].tolist(), rows.label.iloc[selected].astype(int).tolist(),
-            {t: artifact[t][index].float().numpy() for t in TARGETS})
+            {t: artifact[t][index].float().numpy() for t in markers})
 
 
 def labeled_embeddings(cells: list[str], run: Path, *, model_sha256: str, source_sha256: str,
-                       workers: int) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+                       workers: int, contract: MarkerContract) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Collect persisted marker embeddings and source labels for the requested identities."""
     wanted = set(cells)
     partitions = []
     for shard in sorted(run.glob('shard-*')):
         complete = json.loads((shard / 'complete.json').read_text())
+        require_same_contract(contract, INFERENCE.contract(complete, where=str(shard / 'complete.json')),
+                              expected_from='the embedding bundle', actual_from=str(shard / 'complete.json'))
         if not complete.get('stores_embeddings'):
             raise ValueError(f'Embeddings were not persisted for {shard}')
         if complete.get('model_sha256') != model_sha256 or complete.get('source_sha256') != source_sha256:
@@ -130,19 +158,19 @@ def labeled_embeddings(cells: list[str], run: Path, *, model_sha256: str, source
                           for path in sorted((shard / 'predictions').glob('part-*.parquet')))
     found: dict[str, tuple[int, dict[str, np.ndarray]]] = {}
     for names, labels, values in joblib.Parallel(n_jobs=workers)(
-            joblib.delayed(partition_embeddings)(path, embedding_path, wanted)
+            joblib.delayed(partition_embeddings)(path, embedding_path, wanted, contract.markers)
             for path, embedding_path in partitions):
         for row, (cell, label) in enumerate(zip(names, labels)):
             if cell in found:
                 raise ValueError(f'Embedding run contains duplicate cell {cell}')
-            found[cell] = (label, {t: values[t][row] for t in TARGETS})
+            found[cell] = (label, {t: values[t][row] for t in contract.markers})
     missing = sorted(wanted - set(found))
     if missing:
         raise ValueError(f'{len(missing)} labeled cells are absent from {run}, e.g. {missing[0]}')
     source_labels = np.array([found[cell][0] for cell in cells], dtype=np.int64)
     if not np.array_equal(source_labels, [int(cell.rsplit('|', 1)[1]) for cell in cells]):
         raise ValueError('Cell identities do not match source labels')
-    return source_labels, {t: np.stack([found[cell][1][t] for cell in cells]) for t in TARGETS}
+    return source_labels, {t: np.stack([found[cell][1][t] for cell in cells]) for t in contract.markers}
 
 
 def design_matrix(embedding: np.ndarray, context: np.ndarray, dataset_index: np.ndarray,
@@ -199,18 +227,25 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
     datasets, seed, validation_cells, context_features = load_config(config_path)
     names = [d.name for d in datasets]
     frames, tranches, embeddings, contexts, bundles, provenance = [], {}, [], [], {}, {}
+    contract = None
     for dataset in datasets:
-        labels, tranches[dataset.name] = read_labels(dataset)
         bundle = joblib.load(dataset.embedding_model)
+        dataset_contract = bundle_contract(bundle, where=str(dataset.embedding_model))
+        if contract is None:
+            contract = dataset_contract
+        else:
+            require_same_contract(contract, dataset_contract, expected_from=str(datasets[0].embedding_model),
+                                  actual_from=str(dataset.embedding_model))
+        labels, tranches[dataset.name] = read_labels(dataset, contract=contract)
         model_sha256 = file_sha256(dataset.embedding_model)
         source_labels, values = labeled_embeddings(
             labels.cell.astype(str).tolist(), dataset.embedding_run,
-            model_sha256=model_sha256, source_sha256=bundle['source_sha256'], workers=workers)
+            model_sha256=model_sha256, source_sha256=bundle['source_sha256'], workers=workers, contract=contract)
         record = json.loads(dataset.intensity_provenance.read_text())
         if record['props_sha256'] != file_sha256(dataset.intensity_props):
             raise ValueError(f'{dataset.name} intensity provenance does not match its props')
         context = load_context(context_features, dataset.intensity_props, dataset.dapi_props,
-                               scale_zyx_um=np.asarray(dataset.scale_zyx_um))
+                               scale_zyx_um=np.asarray(dataset.scale_zyx_um), markers=contract.markers)
         labels['label'] = source_labels
         frames.append(labels)
         embeddings.append(values)
@@ -228,31 +263,33 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
         if {key: bundles[name][key] for key in ENCODER_KEYS} != reference:
             raise ValueError(f'{name} embeddings use a different encoder than {names[0]}')
 
+    markers = contract.markers
     rows = pd.concat(frames, ignore_index=True)
     dataset_index = pd.Index(names).get_indexer(rows.dataset)
-    emb = {t: np.concatenate([e[t] for e in embeddings]) for t in TARGETS}
-    ctx = {t: np.concatenate([c[t] for c in contexts]) for t in TARGETS}
-    x = {t: design_matrix(emb[t], ctx[t], dataset_index, len(names)) for t in TARGETS}
-    strata = dataset_index * 4 + rows.brdu.to_numpy() + 2 * rows.edu.to_numpy()
-    train, validation = train_test_split(np.arange(len(rows)), test_size=validation_cells,
-                                         random_state=seed, stratify=strata)
-    train, validation = np.sort(train), np.sort(validation)
+    emb = {t: np.concatenate([e[t] for e in embeddings]) for t in markers}
+    ctx = {t: np.concatenate([c[t] for c in contexts]) for t in markers}
+    x = {t: design_matrix(emb[t], ctx[t], dataset_index, len(names)) for t in markers}
+    train, validation = split_dataset_rows(rows, markers=markers, dataset_index=dataset_index,
+                                           datasets=len(names), test_size=validation_cells, seed=seed)
     rows['split'] = 'training'
     rows.loc[validation, 'split'] = 'validation'
 
-    joint = {**reference, 'schema': SCHEMA, 'datasets': names, 'context_features': list(context_features),
-             'feature_layout': ['embedding'] + [f'{f}|{n}' for n in names for f in context_features]
-             + [f'intercept|{n}' for n in names],
-             'intensity_neighbors': INTENSITY_NEIGHBORS, 'split_seed': seed,
-             'validation_split': 'random, stratified by dataset and joint BrdU/EdU label',
-             'train_cells': rows.cell.iloc[train].tolist(), 'validation_cells': rows.cell.iloc[validation].tolist(),
-             'datasets_provenance': provenance, 'created_at_utc': datetime.now(timezone.utc).isoformat()}
+    joint = JOINT_MODEL.stamp(
+        {**reference, 'datasets': names, 'context_features': list(context_features),
+         'feature_layout': ['embedding'] + [f'{f}|{n}' for n in names for f in context_features]
+         + [f'intercept|{n}' for n in names],
+         'intensity_neighbors': INTENSITY_NEIGHBORS, 'split_seed': seed,
+         'validation_split': f'random, stratified by dataset and joint {"/".join(markers)} label, '
+                             'falling back to dataset and each marker in order',
+         'train_cells': rows.cell.iloc[train].tolist(), 'validation_cells': rows.cell.iloc[validation].tolist(),
+         'datasets_provenance': provenance, 'created_at_utc': datetime.now(timezone.utc).isoformat()},
+        contract)
     metrics: dict[str, object] = {'datasets': {n: {'labels': int((rows.dataset == n).sum()),
                                                    'training': int(((rows.dataset == n) & (rows.split == 'training')).sum()),
                                                    'validation': int(((rows.dataset == n) & (rows.split == 'validation')).sum())}
                                                for n in names},
                                   'split_seed': seed, 'targets': {}}
-    for target in TARGETS:
+    for target in markers:
         y = rows[target].to_numpy()
         best_c, cv_score, folds = _best_logreg_c(x[target][train], y[train], cv_folds=CV_FOLDS, seed=seed,
                                                  n_jobs=workers)
@@ -270,13 +307,13 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
             joblib.delayed(fit_and_score)(x[target][keep], y[keep], best_c, x[target][scored])
             for keep, scored in fits)
         cutoff, _ = balanced_accuracy_cutoff(y[validation], p[validation])
-        rows[f'p_{target}'] = p
-        rows[f'pred_{target}'] = p >= cutoff
+        rows[probability_column(target)] = p
+        rows[prediction_column(target)] = p >= cutoff
         oof = np.full(len(rows), np.nan)
         for held, (_, _, held_p) in zip(held_out, oof_fits):
             oof[held] = held_p
-        rows[f'oof_p_{target}'] = oof
-        joint.update({f'{target}_feature_scaler': scaler, f'{target}_model': model, f'{target}_cutoff': cutoff})
+        rows[oof_probability_column(target)] = oof
+        joint.update({scaler_key(target): scaler, model_key(target): model, cutoff_key(target): cutoff})
         metrics['targets'][target] = {
             'best_c': best_c, 'cv_folds': folds, 'cv_balanced_accuracy': cv_score, 'cutoff': cutoff,
             'validation': summarize(y[validation], p[validation], cutoff),
@@ -289,23 +326,24 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
 
     _dump_joblib_atomic(joint, output / 'model.joblib')
     joint_sha256 = file_sha256(output / 'model.joblib')
-    rows.to_csv(output / 'labels.csv', columns=['cell', *TARGETS, 'tranche', 'dataset'], index=False)
+    rows.to_csv(output / 'labels.csv', columns=['cell', *markers, 'tranche', 'dataset'], index=False)
     rows.to_parquet(output / 'labeled_predictions.parquet', index=False)
     for d, dataset in enumerate(datasets):
-        deployed = {key: value for key, value in bundles[dataset.name].items() if key not in STALE_KEYS}
+        deployed = {key: value for key, value in bundles[dataset.name].items()
+                    if key not in STALE_KEYS and key not in ('schema', CONTRACT_FIELD)}
         members = np.flatnonzero(dataset_index == d)
-        for target in TARGETS:
-            scaler, model = collapse(joint[f'{target}_feature_scaler'], joint[f'{target}_model'], index=d,
+        for target in markers:
+            scaler, model = collapse(joint[scaler_key(target)], joint[model_key(target)], index=d,
                                      datasets=len(names), embedding_width=EMBEDDING_WIDTH,
                                      context_width=len(context_features))
             np.testing.assert_allclose(
                 model.predict_proba(scaler.transform(np.column_stack([emb[target][members], ctx[target][members]])))[:, 1],
-                rows[f'p_{target}'].to_numpy()[members], rtol=0, atol=1e-10)
-            deployed.update({f'{target}_feature_scaler': scaler, f'{target}_model': model,
-                             f'{target}_cutoff': joint[f'{target}_cutoff'],
-                             f'{target}_best_c': metrics['targets'][target]['best_c']})
+                rows[probability_column(target)].to_numpy()[members], rtol=0, atol=1e-10)
+            deployed.update({scaler_key(target): scaler, model_key(target): model,
+                             cutoff_key(target): joint[cutoff_key(target)],
+                             metric_key(target, 'best_c'): metrics['targets'][target]['best_c']})
         deployed.update({
-            'schema': MODEL_SCHEMA, 'classifier_feature_mode': 'marker',
+            'classifier_feature_mode': 'marker',
             'context_features': list(context_features), 'intensity_neighbors': INTENSITY_NEIGHBORS,
             'intensity_scale_zyx_um': provenance[dataset.name]['intensity_scale_zyx_um'],
             'source_sha256': provenance[dataset.name]['source_sha256'],
@@ -321,14 +359,15 @@ def fit(config_path: Path, output: Path, *, workers: int) -> None:
             'validation_cells': rows.cell.iloc[members][rows.split.iloc[members] == 'validation'].tolist(),
             'split_seed': seed, 'created_at_utc': joint['created_at_utc'],
             'joint_model': {'path': str((output / 'model.joblib').resolve()), 'sha256': joint_sha256,
-                            'schema': SCHEMA, 'dataset': dataset.name, 'datasets': names}})
+                            'schema': joint['schema'], 'dataset': dataset.name, 'datasets': names}})
+        deployed = INTENSITY_MODEL.stamp(deployed, contract)
         destination = output / 'deploy' / dataset.name
         _dump_joblib_atomic(deployed, destination / 'model.joblib')
-        rows.iloc[members].to_csv(destination / 'labels.csv', columns=['cell', *TARGETS, 'tranche'], index=False)
+        rows.iloc[members].to_csv(destination / 'labels.csv', columns=['cell', *markers, 'tranche'], index=False)
         metrics['datasets'][dataset.name]['deployed_model'] = str((destination / 'model.joblib').resolve())
         metrics['datasets'][dataset.name]['deployed_model_sha256'] = file_sha256(destination / 'model.joblib')
     metrics.update({'joint_model': str((output / 'model.joblib').resolve()), 'joint_model_sha256': joint_sha256,
-                    'classifier_features': {t: int(joint[f'{t}_model'].n_features_in_) for t in TARGETS},
+                    'classifier_features': {t: int(joint[model_key(t)].n_features_in_) for t in markers},
                     'feature_layout': joint['feature_layout'], 'tranches': tranches})
     write_json_atomic(metrics, output / 'metrics.json')
 

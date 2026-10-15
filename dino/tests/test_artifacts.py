@@ -13,6 +13,7 @@ from dino.artifacts import (
     path_sha256,
     read_embedding_artifact,
     read_parquet_artifact,
+    require_embedding_markers,
     row_feature_cache_key,
     validate_model_artifacts,
     write_csv_atomic,
@@ -52,6 +53,80 @@ def test_atomic_embedding_refuses_existing_destination(tmp_path: Path) -> None:
             },
             output,
         )
+
+
+def _embeddings(*keys: str, rows: int = 3) -> dict[str, torch.Tensor]:
+    return {key: torch.ones((rows, 4), dtype=torch.bfloat16) for key in keys} | {
+        "cell_sha256": torch.zeros(32, dtype=torch.uint8)
+    }
+
+
+def test_embedding_artifact_round_trips_any_valid_marker_set(tmp_path: Path) -> None:
+    for name, keys in (("three", ("edu", "brdu", "pcna")), ("pi", ("pi", "edu")), ("one", ("brdu",))):
+        embeddings = _embeddings(*keys)
+        write_embedding_atomic(embeddings, tmp_path / f"{name}.pt")
+        actual = read_embedding_artifact(tmp_path / f"{name}.pt")
+        assert list(actual) == list(embeddings)
+        assert all(torch.equal(actual[key], embeddings[key]) for key in embeddings)
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("no_markers", "at least one marker"),
+        ("no_digest", "must contain cell_sha256"),
+        ("shape", "share one two-dimensional shape"),
+        ("rank", "share one two-dimensional shape"),
+        ("dtype", "native torch.bfloat16"),
+        ("digest", "32-byte uint8"),
+        ("uppercase", "must match"),
+        ("leading_underscore", "must match"),
+        ("reserved", "is reserved"),
+    ],
+)
+def test_embedding_artifact_rejects_structural_damage(tmp_path: Path, damage: str, message: str) -> None:
+    artifact = _embeddings("edu", "brdu", "pcna")
+    if damage == "no_markers":
+        artifact = {"cell_sha256": artifact["cell_sha256"]}
+    elif damage == "no_digest":
+        del artifact["cell_sha256"]
+    elif damage == "shape":
+        artifact["pcna"] = artifact["pcna"][:2]
+    elif damage == "rank":
+        artifact["pcna"] = artifact["pcna"][0]
+    elif damage == "dtype":
+        artifact["pcna"] = artifact["pcna"].float()
+    elif damage == "digest":
+        artifact["cell_sha256"] = torch.zeros(31, dtype=torch.uint8)
+    elif damage == "uppercase":
+        artifact["PCNA"] = artifact.pop("pcna")
+    elif damage == "leading_underscore":
+        artifact["_pcna"] = artifact.pop("pcna")
+    else:
+        artifact["labels"] = artifact.pop("pcna")
+
+    with pytest.raises(ValueError, match=message):
+        write_embedding_atomic(artifact, tmp_path / "part.pt")
+    assert not (tmp_path / "part.pt").exists()
+
+
+def test_reading_an_invalid_embedding_artifact_names_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "part.pt"
+    torch.save({**_embeddings("edu", "brdu"), "BrdU": torch.ones((3, 4), dtype=torch.bfloat16)}, path)
+
+    with pytest.raises(ValueError, match="Unable to read Cell-DINO embedding artifact .*part.pt"):
+        read_embedding_artifact(path)
+
+
+def test_require_embedding_markers_accepts_exactly_the_contract_markers(tmp_path: Path) -> None:
+    require_embedding_markers(_embeddings("edu", "brdu", "pcna"), ("pcna", "edu", "brdu"), path=tmp_path)
+
+
+@pytest.mark.parametrize("keys", [("edu", "brdu"), ("edu", "brdu", "pcna", "extra")])
+def test_require_embedding_markers_rejects_missing_and_extra_markers(tmp_path: Path, keys) -> None:
+    path = tmp_path / "part.pt"
+    with pytest.raises(ValueError, match=r"part\.pt.*holds markers .*expected \['brdu', 'edu', 'pcna'\]"):
+        require_embedding_markers(_embeddings(*keys), ("edu", "brdu", "pcna"), path=path)
 
 
 def test_model_artifacts_reject_changed_weights(tmp_path: Path) -> None:

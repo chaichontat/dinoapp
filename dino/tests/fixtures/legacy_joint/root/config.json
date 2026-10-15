@@ -1,0 +1,43 @@
+{
+  "datasets": [
+    {
+      "name": "first",
+      "tranches": [
+        "/tmp/dino-wf4c-legacy-joint/inputs/first/tranche"
+      ],
+      "embedding_run": "/tmp/dino-wf4c-legacy-joint/inputs/first/embeddings",
+      "embedding_model": "/tmp/dino-wf4c-legacy-joint/inputs/first/embedding-model.joblib",
+      "intensity_props": "/tmp/dino-wf4c-legacy-joint/inputs/first/props.parquet",
+      "intensity_provenance": "/tmp/dino-wf4c-legacy-joint/inputs/first/intensity.json",
+      "dapi_props": "/tmp/dino-wf4c-legacy-joint/inputs/first/dapi.parquet",
+      "scale_zyx_um": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "name": "second",
+      "tranches": [
+        "/tmp/dino-wf4c-legacy-joint/inputs/second/tranche"
+      ],
+      "embedding_run": "/tmp/dino-wf4c-legacy-joint/inputs/second/embeddings",
+      "embedding_model": "/tmp/dino-wf4c-legacy-joint/inputs/second/embedding-model.joblib",
+      "intensity_props": "/tmp/dino-wf4c-legacy-joint/inputs/second/props.parquet",
+      "intensity_provenance": "/tmp/dino-wf4c-legacy-joint/inputs/second/intensity.json",
+      "dapi_props": "/tmp/dino-wf4c-legacy-joint/inputs/second/dapi.parquet",
+      "scale_zyx_um": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "seed": 7,
+  "validation_cells": 12,
+  "context_features": [
+    "log1p_cell_mean",
+    "log_cell_over_local_mean",
+    "log1p_dapi_mean"
+  ]
+}

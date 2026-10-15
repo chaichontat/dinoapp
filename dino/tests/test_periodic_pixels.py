@@ -101,6 +101,7 @@ def test_training_and_inference_batch_path_corrects_before_quantization(tmp_path
     reader = CellCropReader(labels=labels, channels=channels, offset_zyx=(0, 0, 0), cache_bytes=1000000)
     rows = pd.DataFrame(dict(cell=["cell-1"], label=[1], plane_z=[0], centroid_y=[4.0], centroid_x=[4.0]))
     bundle = dict(
+        schema="dino-zarr-model-v6",
         crop_size=8,
         input_channels=4,
         highpass_sigma_px=0,

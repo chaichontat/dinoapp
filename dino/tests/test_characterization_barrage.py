@@ -184,7 +184,7 @@ def _write_pixel_model(directory: Path, source_sha256: str) -> tuple[Path, dict]
 
 
 def _load_training_rows(barrage_dirs: tuple[Path, ...]) -> pd.DataFrame:
-    return zarr_train._load_training_rows_many(barrage_dirs)
+    return zarr_train._load_training_rows_many(barrage_dirs, contract=DEFAULT_CONTRACT)
 
 
 def _load_training_sources(barrage_dirs: tuple[Path, ...]) -> dict:

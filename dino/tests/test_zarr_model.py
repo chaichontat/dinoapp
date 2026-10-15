@@ -4,21 +4,30 @@ import sys
 from types import SimpleNamespace
 
 import dinov2
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+import zarr
+from sklearn.preprocessing import SplineTransformer
 
+from dino import zarr_model
+from dino.artifacts import file_sha256
+from dino.periodic_pixels import PeriodicPixels
 from dino.zarr_model import (
     balanced_accuracy_cutoff,
     extract_normalized_features,
     extract_normalized_feature_tensor,
     iter_model_image_batches,
     load_cell_dino_model,
+    model_crop_reader,
     prepare_model_batch,
     read_model_images,
+    sort_cells_for_io,
 )
-from dino.zarr_source import CellCrop
+from dino.zarr_source import CellCrop, CellCropReader, OpenSource
+from dino_markers import ContractMismatchError, MarkerContract, UnsupportedArtifactError
 
 
 def test_model_image_batches_require_positive_batch_size() -> None:
@@ -228,3 +237,185 @@ def test_read_model_images_marks_fully_eroded_cell_invalid() -> None:
 
     assert not has_mask
     assert not images["brdu"].any()
+
+
+class _Subtraction:
+    target = "brdu"
+    reference = "dapi"
+
+    def __call__(self, target, reference, origin_zyx):
+        return target - reference
+
+
+class _Periodic:
+    targets = ("brdu", "edu")
+
+    def __call__(self, name, pixels, origin_zyx):
+        return pixels + 1
+
+
+def _two_channel_crop() -> CellCrop:
+    return CellCrop(
+        labels=np.ones((2, 2), dtype=np.uint32),
+        mask=np.ones((2, 2), dtype=bool),
+        neighbor_mask=np.zeros((2, 2), dtype=bool),
+        channels={
+            "brdu": np.full((2, 2), 512, dtype=np.uint16),
+            "edu": np.full((2, 2), 256, dtype=np.uint16),
+            "dapi": np.full((2, 2), 100, dtype=np.uint16),
+        },
+    )
+
+
+def _read_images(monkeypatch, **corrections):
+    references = []
+    correct = zarr_model.correct_channels
+
+    def spy(channels, origin, *, reference=None, **kwargs):
+        references.append(reference)
+        return correct(channels, origin, reference=reference, **kwargs)
+
+    monkeypatch.setattr(zarr_model, "correct_channels", spy)
+
+    class Reader:
+        offset_zyx = (0, 0, 0)
+
+        def read_cell(self, **kwargs):
+            return _two_channel_crop()
+
+    read_model_images(
+        Reader(),
+        pd.Series({"label": 1, "plane_z": 0, "centroid_y": 1, "centroid_x": 1}),
+        crop_size=2,
+        input_channels=4,
+        channel_names_by_target={"brdu": ("brdu",), "edu": ("edu",)},
+        **corrections,
+    )
+    return references
+
+
+def test_read_model_images_passes_the_subtraction_reference_only_when_one_exists(monkeypatch) -> None:
+    assert _read_images(monkeypatch, pixel_correction=_Periodic()) == [None]
+    assert _read_images(monkeypatch, spatial_subtraction=_Subtraction()) == ["dapi"]
+    assert _read_images(monkeypatch, spatial_subtraction=_Subtraction(), pixel_correction=_Periodic()) == ["dapi"]
+
+
+def test_model_crop_reader_opens_the_subtraction_reference_channel(monkeypatch, tmp_path) -> None:
+    from dino.spatial_pixels import SpatialPixels
+
+    monkeypatch.setattr(SpatialPixels, "from_spec", classmethod(lambda cls, spec: _Subtraction()))
+    labels = zarr.open_array(tmp_path / "labels", mode="w", shape=(1, 4, 4), chunks=(1, 4, 4), dtype="u4")
+    channels = {
+        name: zarr.open_array(tmp_path / name, mode="w", shape=(1, 4, 4), chunks=(1, 4, 4), dtype="u2")
+        for name in ("brdu", "edu", "dapi", "pi")
+    }
+    source = OpenSource({"offset_zyx": [0, 0, 0]}, labels, channels)
+
+    reader = model_crop_reader(
+        source, cache_gb=0.001, channel_names=("brdu", "edu"), spatial_subtraction={"model": "unused"}
+    )
+
+    assert set(reader.channels) == {"brdu", "edu", "dapi"}
+    reader.close()
+
+
+def _write_field(directory, targets):
+    spline = SplineTransformer(
+        knots=np.tile(np.linspace(0, 1, 5)[:, None], (1, 2)), extrapolation="periodic"
+    ).fit([[0.0, 0.0], [1.0, 1.0]])
+    path = directory / "field.joblib"
+    joblib.dump(
+        dict(
+            period_xy_um=np.array([11.0, 17.0]),
+            periodic_spline=spline,
+            periodic_center=np.full(16, 1 / 16),
+            coefficient=np.random.default_rng(7).normal(0, 0.5, (16, len(targets))),
+            targets=targets,
+        ),
+        path,
+    )
+    return PeriodicPixels(str(path), file_sha256(path), (1.0, 1.0, 1.0))
+
+
+def _batch_inputs(tmp_path, markers):
+    labels = zarr.open_array(tmp_path / "labels.zarr", mode="w", shape=(2, 8, 8), chunks=(1, 4, 4), dtype="u4")
+    labels[:] = 1
+    channels = {}
+    for index, marker in enumerate(markers):
+        array = zarr.open_array(tmp_path / f"{marker}.zarr", mode="w", shape=labels.shape, chunks=labels.chunks, dtype="u2")
+        array[:] = np.arange(128).reshape(labels.shape) * 10 + 1000 * (index + 1)
+        channels[marker] = array
+    reader = CellCropReader(labels=labels, channels=channels, offset_zyx=(0, 0, 0), cache_bytes=1_000_000)
+    rows = pd.DataFrame(dict(cell=["cell-1"], label=[1], plane_z=[0], centroid_y=[4.0], centroid_x=[4.0]))
+    return reader, rows, channels
+
+
+def _bundle(**fields) -> dict:
+    return dict(crop_size=8, input_channels=4, highpass_sigma_px=0, mask_erosion_px=0, **fields)
+
+
+def _batches(reader, rows, bundle, markers):
+    return list(
+        iter_model_image_batches(
+            sort_cells_for_io(rows, reader),
+            bundle=bundle,
+            channel_names_by_target={marker: (marker,) for marker in markers},
+            reader=reader,
+            batch_size=1,
+            prefetch_workers=1,
+            crop_workers=2,
+            require_mask=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("markers", [("brdu", "edu"), ("edu", "brdu")])
+def test_periodic_correction_binds_to_the_bundle_contract_order(tmp_path, markers) -> None:
+    transform = _write_field(tmp_path, list(markers))
+    reader, rows, channels = _batch_inputs(tmp_path, markers)
+    contract = MarkerContract("pi", markers)
+    bundle = _bundle(
+        schema="dino-zarr-model-v7", marker_contract=contract.to_json(), pixel_correction=transform.identity
+    )
+
+    images, _ = _batches(reader, rows, bundle, markers)[0]
+
+    for marker in markers:
+        corrected = transform(marker, channels[marker][0], (0, 0, 0))
+        np.testing.assert_array_equal(images[marker][0][0], np.clip(corrected / 256.0, 0, 255).astype(np.uint8))
+    reader.close()
+
+
+def test_periodic_correction_rejects_a_same_length_reorder_of_the_bundle_contract(tmp_path) -> None:
+    transform = _write_field(tmp_path, ["edu", "brdu"])
+    reader, rows, _ = _batch_inputs(tmp_path, ("brdu", "edu"))
+    bundle = _bundle(schema="dino-zarr-model-v6", pixel_correction=transform.identity)
+
+    with pytest.raises(ContractMismatchError, match="marker order is part of the contract"):
+        _batches(reader, rows, bundle, ("brdu", "edu"))
+    reader.close()
+
+
+def test_periodic_correction_requires_a_versioned_bundle(tmp_path) -> None:
+    transform = _write_field(tmp_path, ["brdu", "edu"])
+    reader, rows, _ = _batch_inputs(tmp_path, ("brdu", "edu"))
+
+    with pytest.raises(UnsupportedArtifactError, match="model bundle"):
+        _batches(reader, rows, _bundle(pixel_correction=transform.identity), ("brdu", "edu"))
+    reader.close()
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [MarkerContract("dapi", ("brdu", "edu")), MarkerContract("pi", ("edu", "pcna"))],
+    ids=["reference-dapi", "no-brdu"],
+)
+def test_spatial_subtraction_rejects_contracts_it_cannot_serve(tmp_path, contract) -> None:
+    reader, rows, _ = _batch_inputs(tmp_path, contract.markers)
+    bundle = _bundle(
+        schema="dino-zarr-model-v7", marker_contract=contract.to_json(), spatial_subtraction={"model": "unused"}
+    )
+
+    with pytest.raises(ValueError, match="spatial subtraction supports only BrdU against the pi channel"):
+        _batches(reader, rows, bundle, contract.markers)
+    reader.close()

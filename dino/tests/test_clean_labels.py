@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from dino import clean_labels
+from dino_markers import MarkerContract, parse_config, save_config
 from dinoapp.label_store import update_label
 
 
@@ -85,3 +86,36 @@ def test_backup_collision_preserves_existing_backup_and_labels(monkeypatch, tmp_
     assert backup.read_bytes() == b"previous backup"
     assert path.read_bytes() == original
 
+
+
+def _declare(directory, contract):
+    save_config(parse_config({
+        "version": 1, "reference": {"key": contract.reference, "label": contract.reference.upper()},
+        "markers": [{"key": m, "label": m.upper(), "color": "#ff0000"} for m in contract.markers],
+        "presentation": {"crop_panels": list(contract.channel_keys), "negative_color": [0.25, 0.25, 0.25],
+                         "uncalled_color": "#999999"}}, source="test"), directory)
+
+
+def test_cleaning_keeps_every_marker_of_the_barrage_contract_in_contract_order(monkeypatch, tmp_path):
+    _declare(tmp_path, MarkerContract("dapi", ("edu", "brdu", "pcna")))
+    (tmp_path / "labels.csv").write_bytes(
+        b"pcna,note,brdu,cell,edu\n1,x,0,r|2,1\n0,y,1,r|1,0\n1,z,1,r|1,1\n"
+    )
+    monkeypatch.setattr("sys.argv", ["clean-labels", "--barrage-dir", str(tmp_path), "--apply"])
+
+    clean_labels.main()
+
+    assert (tmp_path / "labels.csv").read_bytes() == b"cell,edu,brdu,pcna\nr|1,1,1,1\nr|2,1,0,1\n"
+
+
+def test_cleaning_requires_every_contract_marker_column_and_changes_nothing(monkeypatch, tmp_path):
+    _declare(tmp_path, MarkerContract("dapi", ("edu", "brdu", "pcna")))
+    original = b"cell,edu,brdu\nr|1,1,0\n"
+    (tmp_path / "labels.csv").write_bytes(original)
+    monkeypatch.setattr("sys.argv", ["clean-labels", "--barrage-dir", str(tmp_path), "--apply"])
+
+    with pytest.raises(ValueError, match=r"missing required columns: \['pcna'\]"):
+        clean_labels.main()
+
+    assert (tmp_path / "labels.csv").read_bytes() == original
+    assert not list(tmp_path.glob("labels.csv.bak_*"))

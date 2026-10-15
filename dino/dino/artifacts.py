@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from dino_markers import MarkerContract
 
 if TYPE_CHECKING:
     import torch
@@ -170,20 +172,39 @@ def ordered_cell_sha256(cells: Iterable[str]) -> torch.Tensor:
 def _validate_embedding_artifact(artifact: Mapping[str, torch.Tensor]) -> None:
     import torch
 
-    required = {"brdu", "edu", "cell_sha256"}
-    if set(artifact) != required:
-        raise ValueError(f"Embedding artifact keys must be {sorted(required)}")
-    brdu = artifact["brdu"]
-    edu = artifact["edu"]
+    if "cell_sha256" not in artifact:
+        raise ValueError("Embedding artifact must contain cell_sha256")
     cell_sha256 = artifact["cell_sha256"]
-    if brdu.device.type != "cpu" or edu.device.type != "cpu":
-        raise ValueError("Embedding tensors must be stored on CPU")
-    if brdu.dtype != torch.bfloat16 or edu.dtype != torch.bfloat16:
-        raise ValueError("Embedding tensors must use native torch.bfloat16")
-    if brdu.ndim != 2 or edu.shape != brdu.shape:
-        raise ValueError("BrdU and EdU embedding tensors must have the same two-dimensional shape")
     if cell_sha256.dtype != torch.uint8 or cell_sha256.shape != (32,):
         raise ValueError("cell_sha256 must be a 32-byte uint8 tensor")
+    keys = tuple(key for key in artifact if key != "cell_sha256")
+    if not keys:
+        raise ValueError("Embedding artifact must contain at least one marker tensor")
+    # The contract's key rules apply to marker keys; any reference outside them completes a contract.
+    reference = next(name for name in map("ref{}".format, itertools.count()) if name not in keys)
+    MarkerContract(reference, keys)
+    shape = artifact[keys[0]].shape
+    for key in keys:
+        tensor = artifact[key]
+        if tensor.device.type != "cpu":
+            raise ValueError(f"Embedding tensor {key!r} must be stored on CPU")
+        if tensor.dtype != torch.bfloat16:
+            raise ValueError(f"Embedding tensor {key!r} must use native torch.bfloat16")
+        if tensor.ndim != 2 or tensor.shape != shape:
+            raise ValueError(
+                f"Embedding tensors must share one two-dimensional shape; {key!r} is {tuple(tensor.shape)}"
+                f", expected {tuple(shape)}"
+            )
+
+
+def require_embedding_markers(
+    artifact: Mapping[str, torch.Tensor], markers: Sequence[str], *, path: Path
+) -> None:
+    found = set(artifact) - {"cell_sha256"}
+    if found != set(markers):
+        raise ValueError(
+            f"Embedding artifact {path} holds markers {sorted(found)}, expected {sorted(markers)}"
+        )
 
 
 def write_embedding_atomic(artifact: Mapping[str, torch.Tensor], path: Path) -> None:

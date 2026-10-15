@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,19 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+from dino_markers import (
+    DEFAULT_CONTRACT,
+    FEATURE_CACHE,
+    ZARR_MODEL,
+    MarkerContract,
+    contract_of,
+    cutoff_key,
+    load_config,
+    metric_key,
+    model_key,
+    require_same_contract,
+    scaler_key,
+)
 from loguru import logger
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
@@ -25,7 +39,6 @@ from dino.zarr_model import (
     FEATURE_EXECUTION,
     FEATURE_PRECISIONS,
     MODEL_INPUT_CHANNELS,
-    MODEL_SCHEMA,
     balanced_accuracy_cutoff,
     build_cell_transform,
     extract_normalized_features,
@@ -38,9 +51,6 @@ from dino.zarr_model import (
     sort_cells_for_io,
 )
 from dino.zarr_source import OpenSource, load_source
-
-
-TARGETS = ("brdu", "edu")
 
 
 @dataclass(frozen=True)
@@ -66,22 +76,65 @@ class TrainConfig:
     highpass_sigma_px: float
     mask_erosion_px: int
     feature_precision: str
-    brdu_input_channel_names: tuple[str, ...]
-    edu_input_channel_names: tuple[str, ...]
+    input_channel_names_by_target: Mapping[str, tuple[str, ...]]
+    contract: MarkerContract
 
     @property
     def input_channels(self) -> int:
         return MODEL_INPUT_CHANNELS[self.hub_model]
 
-    @property
-    def input_channel_names_by_target(self) -> dict[str, tuple[str, ...]]:
-        return {
-            "brdu": self.brdu_input_channel_names,
-            "edu": self.edu_input_channel_names,
-        }
+
+def resolve_input_channels(
+    values: Sequence[str], contract: MarkerContract, *, slots: int
+) -> dict[str, tuple[str, ...]]:
+    """Parse repeated `TARGET=CHANNEL` flags into each marker's ordered model input channels."""
+    channels: dict[str, list[str]] = {marker: [] for marker in contract.markers}
+    for value in values:
+        target, separator, channel = value.partition("=")
+        if not separator or not target or not channel:
+            raise ValueError(f"--input-channel must be TARGET=CHANNEL, got {value!r}")
+        if target not in channels:
+            raise ValueError(f"--input-channel target {target!r} is not a marker of {contract}")
+        if channel not in contract.channel_keys:
+            raise ValueError(
+                f"--input-channel channel {channel!r} is not a channel of {contract}; "
+                f"channels are {list(contract.channel_keys)}"
+            )
+        if channel in channels[target]:
+            raise ValueError(f"--input-channel values for {target!r} must be unique, got {channel!r} twice")
+        channels[target].append(channel)
+    if contract == DEFAULT_CONTRACT:
+        channels = {target: names or list(DEFAULT_INPUT_CHANNEL_NAMES) for target, names in channels.items()}
+    else:
+        missing = [target for target, names in channels.items() if not names]
+        if missing:
+            raise ValueError(f"--input-channel is required for every marker of {contract}; missing {missing}")
+    too_many = {target: len(names) for target, names in channels.items() if len(names) > slots}
+    if too_many:
+        raise ValueError(f"More --input-channel values were supplied than the model's {slots} slots accept: {too_many}")
+    return {target: tuple(names) for target, names in channels.items()}
 
 
-def _load_training_rows(barrage_dir: Path) -> pd.DataFrame:
+def _training_contract(
+    barrage_dirs: Sequence[Path], target_source_dir: Path | None, markers: Path | None
+) -> MarkerContract:
+    """The contract shared by every barrage and the target source, which `--markers` must equal."""
+    contract = contract_of(barrage_dirs[0])
+    for directory in (*barrage_dirs[1:], target_source_dir or barrage_dirs[0]):
+        require_same_contract(
+            contract,
+            contract_of(directory),
+            expected_from=str(barrage_dirs[0]),
+            actual_from=str(directory),
+        )
+    if markers is not None:
+        require_same_contract(
+            load_config(markers).contract, contract, expected_from="--markers", actual_from=str(barrage_dirs[0])
+        )
+    return contract
+
+
+def _load_training_rows(barrage_dir: Path, *, contract: MarkerContract) -> pd.DataFrame:
     index_path = barrage_dir / "index.csv"
     labels_path = barrage_dir / "labels.csv"
     if not index_path.is_file() or not labels_path.is_file():
@@ -107,13 +160,13 @@ def _load_training_rows(barrage_dir: Path) -> pd.DataFrame:
     missing = sorted(required_index - set(index.columns))
     if missing:
         raise ValueError(f"Direct-Zarr index.csv missing required columns: {missing}")
-    required_labels = {"cell", "brdu", "edu"}
+    required_labels = {"cell", *contract.markers}
     missing = sorted(required_labels - set(labels.columns))
     if missing:
         raise ValueError(f"labels.csv missing required columns: {missing}")
     rows = labels.merge(index, on="cell", how="inner").drop_duplicates("cell", keep="last")
-    rows["brdu"] = rows["brdu"].astype(np.int64)
-    rows["edu"] = rows["edu"].astype(np.int64)
+    for marker in contract.markers:
+        rows[marker] = rows[marker].astype(np.int64)
     return rows.reset_index(drop=True)
 
 
@@ -130,9 +183,9 @@ def _load_training_sources(barrage_dir: Path) -> dict[str, OpenSource]:
     return sources
 
 
-def _load_training_rows_many(barrage_dirs: tuple[Path, ...]) -> pd.DataFrame:
+def _load_training_rows_many(barrage_dirs: tuple[Path, ...], *, contract: MarkerContract) -> pd.DataFrame:
     rows = pd.concat(
-        [_load_training_rows(barrage_dir) for barrage_dir in barrage_dirs],
+        [_load_training_rows(barrage_dir, contract=contract) for barrage_dir in barrage_dirs],
         ignore_index=True,
     )
     duplicates = rows.loc[rows["cell"].duplicated(keep=False), "cell"].astype(str)
@@ -211,13 +264,14 @@ def _feature_key(target: str, row: pd.Series) -> str:
 def _cached_features(
     rows: pd.DataFrame,
     cache: dict[str, Any],
+    markers: Sequence[str],
 ) -> tuple[dict[str, list[np.ndarray | None]], dict[int, tuple[str, ...]]]:
     entries: dict[str, Any] = cache["entries"]
-    features = {target: [None] * len(rows) for target in TARGETS}
+    features = {target: [None] * len(rows) for target in markers}
     missing: dict[int, tuple[str, ...]] = {}
     for row_index, (_, row) in enumerate(rows.iterrows()):
         row_missing: list[str] = []
-        for target in TARGETS:
+        for target in markers:
             cached = entries.get(_feature_key(target, row))
             if isinstance(cached, dict) and "feature" in cached:
                 features[target][row_index] = np.asarray(cached["feature"], dtype=np.float32)
@@ -232,9 +286,9 @@ def _stack_features(
     features: dict[str, list[np.ndarray | None]],
 ) -> dict[str, np.ndarray]:
     stacked: dict[str, np.ndarray] = {}
-    for target in TARGETS:
-        present = [feature for feature in features[target] if feature is not None]
-        if len(present) != len(features[target]):
+    for target, values in features.items():
+        present = [feature for feature in values if feature is not None]
+        if len(present) != len(values):
             raise RuntimeError(f"Feature extraction did not populate every {target} row")
         stacked[target] = np.stack(present)
     return stacked
@@ -268,7 +322,7 @@ def _extract_missing_features(
         source = sources[str(source_sha256)]
         needed_targets = tuple(
             target
-            for target in TARGETS
+            for target in cfg.input_channel_names_by_target
             if any(target in targets for targets in source_rows["_missing_targets"])
         )
         channel_names = tuple(
@@ -370,18 +424,22 @@ def _parse_args() -> TrainConfig:
         help="Precision used for frozen Cell-DINO feature extraction (default: bfloat16).",
     )
     parser.add_argument(
-        "--brdu-input-channel",
-        dest="brdu_input_channel_names",
+        "--input-channel",
+        dest="input_channels",
         action="append",
-        default=None,
-        help="Source channel for each populated BrdU model slot, in order. May be repeated.",
+        default=[],
+        metavar="TARGET=CHANNEL",
+        help=(
+            "Source channel for the next populated model slot of a marker, in flag order. May be "
+            "repeated. The default marker contract defaults each marker to brdu and edu; every marker "
+            "of any other contract must be given."
+        ),
     )
     parser.add_argument(
-        "--edu-input-channel",
-        dest="edu_input_channel_names",
-        action="append",
+        "--markers",
+        type=Path,
         default=None,
-        help="Source channel for each populated EdU model slot, in order. May be repeated.",
+        help="Marker configuration that the barrages and target source must match.",
     )
     args = parser.parse_args()
     if (
@@ -402,20 +460,14 @@ def _parse_args() -> TrainConfig:
         parser.error("--highpass-sigma-px must be non-negative")
     if args.mask_erosion_px < 0:
         parser.error("--mask-erosion-px must be non-negative")
-    input_channel_names_by_target = {
-        "brdu": tuple(args.brdu_input_channel_names or DEFAULT_INPUT_CHANNEL_NAMES),
-        "edu": tuple(args.edu_input_channel_names or DEFAULT_INPUT_CHANNEL_NAMES),
-    }
-    for target, channel_names in input_channel_names_by_target.items():
-        if len(channel_names) > MODEL_INPUT_CHANNELS[args.hub_model]:
-            parser.error(f"More --{target}-input-channel values were supplied than the model accepts")
-        if len(set(channel_names)) != len(channel_names):
-            parser.error(f"--{target}-input-channel values must be unique")
+    barrage_dirs = tuple(path.expanduser() for path in args.barrage_dir)
+    target_source_dir = args.target_source_dir.expanduser() if args.target_source_dir is not None else None
+    contract = _training_contract(
+        barrage_dirs, target_source_dir, args.markers.expanduser() if args.markers is not None else None
+    )
     return TrainConfig(
-        barrage_dirs=tuple(path.expanduser() for path in args.barrage_dir),
-        target_source_dir=(
-            args.target_source_dir.expanduser() if args.target_source_dir is not None else None
-        ),
+        barrage_dirs=barrage_dirs,
+        target_source_dir=target_source_dir,
         out_dir=args.out_dir.expanduser(),
         feature_cache=args.feature_cache.expanduser() if args.feature_cache is not None else None,
         dinov2_repo=args.dinov2_repo.expanduser(),
@@ -435,8 +487,10 @@ def _parse_args() -> TrainConfig:
         highpass_sigma_px=args.highpass_sigma_px,
         mask_erosion_px=args.mask_erosion_px,
         feature_precision=args.feature_precision,
-        brdu_input_channel_names=input_channel_names_by_target["brdu"],
-        edu_input_channel_names=input_channel_names_by_target["edu"],
+        input_channel_names_by_target=resolve_input_channels(
+            args.input_channels, contract, slots=MODEL_INPUT_CHANNELS[args.hub_model]
+        ),
+        contract=contract,
     )
 
 
@@ -444,12 +498,13 @@ def main() -> None:
     cfg = _parse_args()
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
-    rows = _load_training_rows_many(cfg.barrage_dirs)
+    markers = cfg.contract.markers
+    rows = _load_training_rows_many(cfg.barrage_dirs, contract=cfg.contract)
     if len(rows) < 8:
         raise ValueError(f"Need at least eight labeled cells, got {len(rows)}")
     rows["_source_order"] = np.arange(len(rows), dtype=np.int64)
     train_rows, validation_rows = split_training_rows(
-        rows, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed
+        rows, markers=markers, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed
     )
     selected_rows = (
         pd.concat([train_rows, validation_rows], ignore_index=True)
@@ -472,8 +527,7 @@ def main() -> None:
 
     weights_sha256 = file_sha256(cfg.weights)
     model_source_sha256 = path_sha256(cfg.dinov2_repo)
-    cache_metadata = {
-        "schema": "dino-zarr-features-v2",
+    cache_fields = {
         "source_sha256s": training_source_sha256s,
         "weights_sha256": weights_sha256,
         "model_source_sha256": model_source_sha256,
@@ -490,17 +544,24 @@ def main() -> None:
             for target, channel_names in cfg.input_channel_names_by_target.items()
         },
     }
+    cache_metadata = FEATURE_CACHE.stamp(cache_fields, cfg.contract)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cfg.feature_cache or (cfg.out_dir / "features.joblib")
     cache = joblib.load(cache_path) if cache_path.is_file() else {"metadata": cache_metadata, "entries": {}}
-    if cache.get("metadata") != cache_metadata or not isinstance(cache.get("entries"), dict):
+    metadata = cache.get("metadata")
+    if (
+        not isinstance(metadata, dict)
+        or not FEATURE_CACHE.recognizes(metadata)
+        or FEATURE_CACHE.normalize(metadata, where=str(cache_path)) != cache_metadata
+        or not isinstance(cache.get("entries"), dict)
+    ):
         cache = {"metadata": cache_metadata, "entries": {}}
 
-    features, missing = _cached_features(selected_rows, cache)
+    features, missing = _cached_features(selected_rows, cache, markers)
     miss_count = sum(map(len, missing.values()))
     logger.info(
         f"Feature cache rows={len(selected_rows)} "
-        f"hits={len(TARGETS) * len(selected_rows) - miss_count} misses={miss_count}"
+        f"hits={len(markers) * len(selected_rows) - miss_count} misses={miss_count}"
     )
     if missing:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -528,12 +589,12 @@ def main() -> None:
             missing=missing,
         )
     all_features = _stack_features(features)
-    targets = train_rows[list(TARGETS)].to_numpy(dtype=np.int64)
-    validation_targets = validation_rows[list(TARGETS)].to_numpy(dtype=np.int64)
+    targets = train_rows[list(markers)].to_numpy(dtype=np.int64)
+    validation_targets = validation_rows[list(markers)].to_numpy(dtype=np.int64)
     models: dict[str, LogisticRegression] = {}
     scalers: dict[str, StandardScaler] = {}
     metrics: dict[str, float | int] = {}
-    for target_index, target in enumerate(TARGETS):
+    for target_index, target in enumerate(markers):
         train_features = all_features[target][train_positions]
         validation_features = all_features[target][validation_positions]
         scaler = StandardScaler()
@@ -554,15 +615,14 @@ def main() -> None:
         scalers[target] = scaler
         metrics.update(
             {
-                f"{target}_best_c": c_value,
-                f"{target}_cv_balanced_accuracy": cv_score,
-                f"{target}_cv_folds": folds,
-                f"{target}_cutoff": cutoff,
-                f"{target}_validation_balanced_accuracy": cutoff_score,
+                metric_key(target, "best_c"): c_value,
+                metric_key(target, "cv_balanced_accuracy"): cv_score,
+                metric_key(target, "cv_folds"): folds,
+                cutoff_key(target): cutoff,
+                metric_key(target, "validation_balanced_accuracy"): cutoff_score,
             }
         )
-    bundle = {
-        "schema": MODEL_SCHEMA,
+    bundle_fields = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_sha256": source_sha256,
         "training_source_sha256s": training_source_sha256s,
@@ -584,16 +644,15 @@ def main() -> None:
         "mask_erosion_px": cfg.mask_erosion_px,
         "feature_precision": cfg.feature_precision,
         "feature_execution": FEATURE_EXECUTION,
-        "brdu_feature_scaler": scalers["brdu"],
-        "edu_feature_scaler": scalers["edu"],
-        "brdu_model": models["brdu"],
-        "edu_model": models["edu"],
+        **{scaler_key(target): scalers[target] for target in markers},
+        **{model_key(target): models[target] for target in markers},
         "train_cells": train_rows["cell"].astype(str).tolist(),
         "validation_cells": validation_rows["cell"].astype(str).tolist(),
         "split_seed": cfg.seed,
         "test_fraction": cfg.test_fraction,
         **metrics,
     }
+    bundle = ZARR_MODEL.stamp(bundle_fields, cfg.contract)
     model_path = cfg.out_dir / "model.joblib"
     _dump_joblib_atomic(bundle, model_path)
     logger.info(f"Wrote direct-Zarr Cell-DINO bundle: {model_path}")
@@ -602,8 +661,8 @@ def main() -> None:
     print(f"validation_rows={len(validation_rows)}")
     print(f"feature_precision={cfg.feature_precision}")
     print(f"feature_cache={cache_path}")
-    print(f"brdu_cutoff={bundle['brdu_cutoff']:.8g}")
-    print(f"edu_cutoff={bundle['edu_cutoff']:.8g}")
+    for target in markers:
+        print(f"{cutoff_key(target)}={bundle[cutoff_key(target)]:.8g}")
 
 
 if __name__ == "__main__":

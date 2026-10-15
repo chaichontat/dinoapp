@@ -1,15 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+from dino_markers import intensity_column
 from scipy.spatial import cKDTree
-
-
-TARGETS = ("brdu", "edu")
-MODEL_SCHEMA = "dino-knn-intensity-v1"
 
 
 @dataclass(frozen=True)
@@ -22,33 +20,31 @@ class IntensityContext:
     scale_zyx_um: np.ndarray
 
     @classmethod
-    def load(cls, path: Path, *, scale_zyx_um: np.ndarray) -> IntensityContext:
+    def load(cls, path: Path, *, scale_zyx_um: np.ndarray, markers: Sequence[str]) -> IntensityContext:
         parquet = pq.ParquetFile(path)
         count = parquet.metadata.num_rows
         points = np.empty((count, 3), dtype=np.float64)
-        means = {target: np.empty(count, dtype=np.float64) for target in TARGETS}
+        means = {marker: np.empty(count, dtype=np.float64) for marker in markers}
         columns = [
             "label",
             "centroid_z",
             "centroid_y",
             "centroid_x",
-            "intensity_brdu_mean",
-            "intensity_edu_mean",
+            *(intensity_column(marker) for marker in markers),
         ]
         offset = 0
         for batch in parquet.iter_batches(columns=columns, batch_size=262_144):
             size = batch.num_rows
-            labels = batch.column(0).to_numpy(zero_copy_only=False)
+            labels = batch.column("label").to_numpy(zero_copy_only=False)
             expected = np.arange(offset + 1, offset + size + 1, dtype=labels.dtype)
             if not np.array_equal(labels, expected):
                 raise ValueError("Intensity labels must be contiguous and ordered from one")
-            for axis in range(3):
+            for axis, column in enumerate(("centroid_z", "centroid_y", "centroid_x")):
                 points[offset : offset + size, axis] = (
-                    batch.column(axis + 1).to_numpy(zero_copy_only=False)
-                    * scale_zyx_um[axis]
+                    batch.column(column).to_numpy(zero_copy_only=False) * scale_zyx_um[axis]
                 )
-            for column, target in enumerate(TARGETS, start=4):
-                means[target][offset : offset + size] = batch.column(column).to_numpy(
+            for marker in markers:
+                means[marker][offset : offset + size] = batch.column(intensity_column(marker)).to_numpy(
                     zero_copy_only=False
                 )
             offset += size
@@ -94,9 +90,9 @@ class IntensityContext:
         indices = np.asarray(labels, dtype=np.int64) - 1
         selected = self.neighbor_indices_for_labels(labels, neighbors=neighbors)
         features: dict[str, np.ndarray] = {}
-        for target in TARGETS:
-            target_mean = self.means[target][indices]
-            local_mean = self.means[target][selected].mean(axis=1)
+        for target, means in self.means.items():
+            target_mean = means[indices]
+            local_mean = means[selected].mean(axis=1)
             features[target] = np.column_stack(
                 (
                     np.log1p(target_mean),

@@ -10,6 +10,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 import torch
+from dino_markers import bundle_contract
 from loguru import logger
 from sklearn.metrics import balanced_accuracy_score
 
@@ -28,7 +29,6 @@ MODEL_INPUT_CHANNELS = {
     "cell_dino_cp_vits8": 5,
     "cell_dino_hpa_vitl16": 4,
 }
-MODEL_SCHEMA = "dino-zarr-model-v6"
 DEFAULT_INPUT_CHANNEL_NAMES = ("brdu", "edu")
 FEATURE_PRECISIONS = ("float32", "bfloat16")
 FEATURE_EXECUTION = "native_sdpa"
@@ -147,8 +147,8 @@ def model_crop_reader(
     if spatial_subtraction is not None:
         from dino.spatial_pixels import SpatialPixels
 
-        SpatialPixels.from_spec(spatial_subtraction)
-        channel_names = tuple(dict.fromkeys((*channel_names, "pi")))
+        subtraction = SpatialPixels.from_spec(spatial_subtraction)
+        channel_names = tuple(dict.fromkeys((*channel_names, subtraction.reference)))
     missing = sorted(set(channel_names) - set(source.channels))
     if missing:
         raise ValueError(f"Source is missing model input channels: {missing}")
@@ -191,7 +191,7 @@ def read_model_images(
         channels = correct_channels(
             crop.channels,
             origin,
-            reference="pi",
+            reference=spatial_subtraction.reference if spatial_subtraction is not None else None,
             spatial_subtraction=spatial_subtraction,
             pixel_correction=pixel_correction,
         )
@@ -259,14 +259,19 @@ def iter_model_image_batches(
 
     pixel_correction = None
     spatial_subtraction = None
+    if "spatial_subtraction" in bundle or "pixel_correction" in bundle:
+        contract = bundle_contract(bundle, where="model bundle")
     if "spatial_subtraction" in bundle:
-        from dino.spatial_pixels import SpatialPixels
+        from dino.spatial_pixels import SpatialPixels, require_spatial_subtraction_contract
 
+        require_spatial_subtraction_contract(contract, artifact="model bundle")
         spatial_subtraction = SpatialPixels.from_spec(bundle["spatial_subtraction"])
-        if "pi" not in reader.channels:
-            raise ValueError("Spatial subtraction crop reader requires raw pi (405 nm DAPI)")
+        if spatial_subtraction.reference not in reader.channels:
+            raise ValueError(
+                f"Spatial subtraction crop reader requires raw {spatial_subtraction.reference} (405 nm DAPI)"
+            )
     if "pixel_correction" in bundle:
-        from dino.periodic_pixels import PeriodicPixels
+        from dino.periodic_pixels import PeriodicPixels, require_periodic_targets
 
         correction = bundle["pixel_correction"]
         pixel_correction = PeriodicPixels(
@@ -274,6 +279,7 @@ def iter_model_image_batches(
             correction["model_sha256"],
             tuple(correction["scale_zyx_um"]),
         )
+        require_periodic_targets(pixel_correction, contract, artifact="model bundle")
 
     def prepare_row(row: pd.Series) -> tuple[dict[str, np.ndarray], bool]:
         return read_model_images(

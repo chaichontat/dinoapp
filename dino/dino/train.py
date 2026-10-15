@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from dino.artifacts import _dump_joblib_atomic, array_sha256, file_sha256, path_sha256
 from dino.artifacts import row_feature_cache_key as _row_feature_cache_key
 from dino.training_split import split_training_rows
+from dino_markers import DEFAULT_CONTRACT
 from dino.workspace_inputs import (
     centered_segmentation_labels,
     cell_id_roi_and_label,
@@ -393,7 +394,7 @@ def _best_logreg_for_target_cv(
 
 
 def _make_split_tables(train: pd.DataFrame, *, cfg: TrainConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return split_training_rows(train, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed)
+    return split_training_rows(train, markers=DEFAULT_CONTRACT.markers, limit=cfg.limit, test_fraction=cfg.test_fraction, seed=cfg.seed)
 
 
 def _load_cell_dino_model(*, repo: Path, hub_model: str, weights: Path, device: torch.device) -> Any:

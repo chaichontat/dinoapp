@@ -194,9 +194,9 @@ Items reported by finished waves that later slices must pick up (their spec sect
 
 | From | Owner | Item |
 | --- | --- | --- |
-| WF3 E | C (WF4) | `zarr_model.py`: call `require_spatial_subtraction_contract(bundle_contract(...))` and `require_periodic_targets(...)` when binding corrections; use `subtraction.reference` instead of the literal `"pi"`; pass the reference only when a subtraction exists. |
-| WF3 E | C (WF4) | `test_periodic.py` `IntensityContext.load(..., markers=DEFAULT_CONTRACT.markers)`; `test_periodic_pixels.py` schema-less bundle gains `schema="dino-zarr-model-v6"` once `iter_model_image_batches` reads the bundle contract. |
-| WF3 E | D (WF4) | `zarr_infer._load_bundle`: call `require_spatial_subtraction_contract` with the bundle contract. |
 | WF3 E | H (WF5) | `display_pixels.py`: call `require_periodic_targets` and `require_spatial_subtraction_contract`; pass `reference=self.spatial.reference` to `correct_channels`. |
 | WF3 A | I (WF5) | `dino/README.md` Direct Zarr workflow: `--channel pi=P --channel edu=E --channel brdu=B`, optional `--markers`; barrage invocation docs. |
 | WF3 B | H (WF5) | `render_crop` callers in `native.py`, `prod3.py`, `rhu2.py`, `corrected_barrage.py` carry the bridge `panels=default_config().panels`; replace with the spec form. |
+| WF4 C | F (WF5) | `test_clean_labels.py:59`: `update_label(..., contract=DEFAULT_CONTRACT)` once F adds the parameter (spec 5.0 table). |
+| WF4 C, D | I (WF5) | READMEs: `dino-zarr train --input-channel TARGET=CHANNEL` replaces `--brdu-input-channel`/`--edu-input-channel`; inference records now `dino-zarr-infer-v3` with `marker_contract`; `load_calls` returns calls keyed by marker. |
+

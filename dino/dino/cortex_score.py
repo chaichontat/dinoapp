@@ -9,6 +9,7 @@ run and not copied into the output.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 import json
 import multiprocessing
@@ -19,16 +20,27 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+from dino_markers import (
+    CORTEX_RESCORE,
+    INFERENCE,
+    MarkerContract,
+    cutoff_key,
+    model_key,
+    positive_count_key,
+    probability_column,
+    require_same_contract,
+    scaler_key,
+)
 
 from dino.artifacts import (
     file_sha256,
     ordered_cell_sha256,
     read_embedding_artifact,
     read_parquet_artifact,
+    require_embedding_markers,
     write_parquet_atomic,
 )
 from dino.classifier_features import (
-    TARGETS,
     EMBEDDING_WIDTH,
     validate_feature_contract,
     Context,
@@ -55,19 +67,22 @@ def score_rows(
     embeddings: dict[str, torch.Tensor],
     bundle: dict[str, object],
     context: Context,
+    markers: Sequence[str],
 ) -> pd.DataFrame:
     """Apply the saved scaler and logistic model to embeddings plus kNN intensity context."""
     labels = rows["label"].to_numpy(dtype=np.int64)
     context_features = context.features_for_labels(labels, neighbors=int(bundle["intensity_neighbors"]))
-    values = {target: embeddings[target].float().numpy() for target in TARGETS}
+    values = {target: embeddings[target].float().numpy() for target in markers}
     mode = str(bundle.get("classifier_feature_mode", "marker"))
     result = rows.loc[:, ["cell", "dataset", "roi", "label"]].reset_index(drop=True)
-    for target in TARGETS:
-        features = assemble_classifier_features(values, context_features, target=target, mode=mode)
-        scaler = bundle[f"{target}_feature_scaler"]
-        probability = bundle[f"{target}_model"].predict_proba(scaler.transform(features))[:, 1].astype(np.float32)
-        result[f"p_{target}"] = probability
-        result[target] = probability >= float(bundle[f"{target}_cutoff"])
+    for target in markers:
+        features = assemble_classifier_features(
+            values, context_features, target=target, mode=mode, markers=markers
+        )
+        scaler = bundle[scaler_key(target)]
+        probability = bundle[model_key(target)].predict_proba(scaler.transform(features))[:, 1].astype(np.float32)
+        result[probability_column(target)] = probability
+        result[target] = probability >= float(bundle[cutoff_key(target)])
     return result
 
 
@@ -76,24 +91,37 @@ class _Worker:
     context: Context
     cortex: np.ndarray
     labeled: set[str]
-    contract: dict[str, object]
+    run_record: dict[str, object]
+    markers: tuple[str, ...]
     output: Path
 
 
-def _init_worker(model: Path, cortex: np.ndarray, labeled: set[str], contract: dict[str, object], output: Path) -> None:
+def _init_worker(
+    model: Path,
+    cortex: np.ndarray,
+    labeled: set[str],
+    run_record: dict[str, object],
+    markers: tuple[str, ...],
+    output: Path,
+) -> None:
     _Worker.bundle = joblib.load(model)
     _Worker.context = load_classifier_context(_Worker.bundle)
     if len(_Worker.context.points_zyx_um) + 1 != len(cortex):
         raise ValueError("Cortex selection and intensity context cell counts differ")
-    _Worker.cortex, _Worker.labeled, _Worker.contract, _Worker.output = cortex, labeled, contract, output
+    _Worker.cortex, _Worker.labeled, _Worker.run_record = cortex, labeled, run_record
+    _Worker.markers, _Worker.output = markers, output
 
 
-def _score_partition(shard_name: str, prediction_path: Path, embedding_path: Path) -> tuple[int, int, int] | None:
-    """Score and publish one source partition; return its cortical row and positive counts."""
+def _score_partition(
+    shard_name: str, prediction_path: Path, embedding_path: Path
+) -> tuple[int, dict[str, int]] | None:
+    """Score and publish one source partition; return its cortical row count and positives per marker."""
+    markers = _Worker.markers
     source = pq.read_table(prediction_path, columns=["cell", "dataset", "roi", "label"]).to_pandas()
     artifact = read_embedding_artifact(embedding_path)
+    require_embedding_markers(artifact, markers, path=embedding_path)
     cells = source["cell"].astype(str)
-    if len(source) != artifact["brdu"].shape[0] or not torch.equal(
+    if len(source) != artifact[markers[0]].shape[0] or not torch.equal(
         artifact["cell_sha256"], ordered_cell_sha256(cells.tolist())
     ):
         raise ValueError(f"Prediction and embedding identities differ: {prediction_path}")
@@ -106,7 +134,7 @@ def _score_partition(shard_name: str, prediction_path: Path, embedding_path: Pat
         return None
     destination = _Worker.output / "predictions" / f"{shard_name}-{prediction_path.name}"
     part_contract = {
-        **_Worker.contract,
+        **_Worker.run_record,
         "source_prediction": str(prediction_path.resolve()),
         "source_embedding": str(embedding_path.resolve()),
         "source_rows": len(source),
@@ -116,30 +144,40 @@ def _score_partition(shard_name: str, prediction_path: Path, embedding_path: Pat
         provenance, rows = read_parquet_artifact(destination)
         if provenance != part_contract or rows != len(selected):
             raise ValueError(f"Existing output has a different contract: {destination}")
-        scored = pq.read_table(destination, columns=list(TARGETS)).to_pandas()
+        scored = pq.read_table(destination, columns=list(markers)).to_pandas()
     else:
         scored = score_rows(
             selected,
-            embeddings={target: artifact[target][torch.from_numpy(keep)] for target in TARGETS},
+            embeddings={target: artifact[target][torch.from_numpy(keep)] for target in markers},
             bundle=_Worker.bundle,
             context=_Worker.context,
+            markers=markers,
         )
         write_parquet_atomic(scored, destination, provenance=part_contract)
-    return len(selected), int(scored["brdu"].sum()), int(scored["edu"].sum())
+    return len(selected), {target: int(scored[target].sum()) for target in markers}
 
 
-def _partitions(embedding_run: Path, *, source_sha256: str, model_sha256: str) -> list[tuple[str, Path, Path]]:
+def _partitions(
+    embedding_run: Path, *, source_sha256: str, model_sha256: str, contract: MarkerContract
+) -> list[tuple[str, Path, Path]]:
     tasks = []
     shard_count = None
     shard_indices = set()
     for shard_dir in sorted(embedding_run.glob("shard-*")):
-        manifest = json.loads((shard_dir / "complete.json").read_text())
+        complete_path = shard_dir / "complete.json"
+        manifest = json.loads(complete_path.read_text())
         if not manifest.get("stores_embeddings"):
             raise ValueError(f"Embedding run did not persist embeddings: {shard_dir}")
         if manifest.get("source_sha256") != source_sha256:
             raise ValueError(f"Embedding source differs from the fitted model: {shard_dir}")
         if manifest.get("model_sha256") != model_sha256:
             raise ValueError(f"Embedding model identity differs for {shard_dir}")
+        require_same_contract(
+            contract,
+            INFERENCE.contract(manifest, where=str(complete_path)),
+            expected_from="embedding model bundle",
+            actual_from=str(complete_path),
+        )
         for key in ("shard_count", "shard_index", "cells", "partition_cells"):
             if type(manifest.get(key)) is not int:
                 raise ValueError(f"Invalid embedding completion {key}: {shard_dir}")
@@ -180,13 +218,13 @@ def score_cortex(
     if workers < 1:
         raise ValueError("workers must be positive")
     bundle = joblib.load(model)
-    validate_feature_contract(bundle, joblib.load(embedding_model))
+    contract = validate_feature_contract(bundle, joblib.load(embedding_model))
+    markers = contract.markers
     embedding_model_sha256 = file_sha256(embedding_model)
     cortex = load_cortex_lookup(cortex_props)
     labeled = set(pd.read_csv(labeled_cells, usecols=["cell"])["cell"].astype(str))
     mode = str(bundle.get("classifier_feature_mode", "marker"))
-    contract = {
-        "artifact": "dino-cortex-rescore-v1",
+    fields = {
         "model": str(model.resolve()),
         "model_sha256": file_sha256(model),
         "embedding_model": str(embedding_model.resolve()),
@@ -200,8 +238,8 @@ def score_cortex(
         "source_sha256": str(bundle["source_sha256"]),
         "model_schema": str(bundle["schema"]),
         "embedding_dimension": EMBEDDING_WIDTH,
-        "classifier_embedding_dimension": EMBEDDING_WIDTH if mode == "marker" else EMBEDDING_WIDTH * len(TARGETS),
-        "classifier_feature_count": int(bundle["brdu_feature_scaler"].n_features_in_),
+        "classifier_embedding_dimension": EMBEDDING_WIDTH if mode == "marker" else EMBEDDING_WIDTH * len(markers),
+        "classifier_feature_count": int(bundle[scaler_key(markers[0])].n_features_in_),
         "classifier_feature_mode": mode,
         "embedding_pca_components": None,
         "context_features": list(bundle["context_features"]),
@@ -211,70 +249,79 @@ def score_cortex(
         "dapi_props_sha256": bundle.get("dapi_props_sha256"),
         "intensity_neighbors": int(bundle["intensity_neighbors"]),
         "classifier_feature_schema": str(bundle["schema"]),
-        "brdu_cutoff": float(bundle["brdu_cutoff"]),
-        "edu_cutoff": float(bundle["edu_cutoff"]),
+        **{cutoff_key(marker): float(bundle[cutoff_key(marker)]) for marker in markers},
     }
+    expected = CORTEX_RESCORE.stamp(fields, contract)
     tasks = _partitions(
-        embedding_run, source_sha256=str(bundle["source_sha256"]), model_sha256=embedding_model_sha256
+        embedding_run, source_sha256=str(bundle["source_sha256"]), model_sha256=embedding_model_sha256,
+        contract=contract,
     )
     if not tasks:
         raise ValueError(f"No embedding partitions found under {embedding_run}")
     complete_path = output_dir / "complete.json"
+    prediction_dir = output_dir / "predictions"
     if complete_path.exists():
-        previous = json.loads(complete_path.read_text())
-        if any(key not in previous or previous[key] != value for key, value in contract.items()):
-            raise ValueError(f"Existing completion has a different contract: {complete_path}")
+        recorded = json.loads(complete_path.read_text())
+        recorded_from = complete_path
+    else:
+        recorded_from = next(iter(sorted(prediction_dir.glob("*.parquet"))), None)
+        recorded = read_parquet_artifact(recorded_from)[0] if recorded_from is not None else None
+    if recorded is None:
+        run_record = expected
+    else:
+        normalized = CORTEX_RESCORE.normalize(recorded, where=str(recorded_from))
+        if any(key not in normalized or normalized[key] != value for key, value in expected.items()):
+            raise ValueError(f"Existing completion has a different contract: {recorded_from}")
+        run_record = {key: value for key, value in recorded.items() if key in expected}
     source_by_output = {
         f"{shard_name}-{prediction_path.name}": (prediction_path, embedding_path)
         for shard_name, prediction_path, embedding_path in tasks
     }
-    prediction_dir = output_dir / "predictions"
     for path in prediction_dir.glob("*.parquet"):
         if path.name not in source_by_output:
             raise ValueError(f"Unexpected existing output partition: {path}")
         prediction_path, embedding_path = source_by_output[path.name]
         provenance, rows = read_parquet_artifact(path)
-        expected = {
-            **contract,
+        expected_partition = {
+            **run_record,
             "source_prediction": str(prediction_path.resolve()),
             "source_embedding": str(embedding_path.resolve()),
             "source_rows": pq.ParquetFile(prediction_path).metadata.num_rows,
             "partition_rows": rows,
         }
-        if provenance != expected or rows < 1:
+        if provenance != expected_partition or rows < 1:
             raise ValueError(f"Existing output has a different contract: {path}")
     prediction_dir.mkdir(parents=True, exist_ok=True)
     total, output_parts = 0, 0
     expected_outputs = set()
-    positive = {target: 0 for target in TARGETS}
+    positive = {target: 0 for target in markers}
     # Spawned workers each load the bundle and kNN context; forking after pyarrow has started
     # its thread pools is unsafe.
     with ProcessPoolExecutor(
         max_workers=workers,
         mp_context=multiprocessing.get_context("spawn"),
         initializer=_init_worker,
-        initargs=(model, cortex, labeled, contract, output_dir),
+        initargs=(model, cortex, labeled, run_record, markers, output_dir),
     ) as executor:
         results = executor.map(_score_partition, *zip(*tasks))
         for source_parts, (task, result) in enumerate(zip(tasks, results), start=1):
             if result is not None:
                 expected_outputs.add(f"{task[0]}-{task[1].name}")
-                rows, brdu, edu = result
+                rows, partition_positive = result
                 output_parts += 1
                 total += rows
-                positive["brdu"] += brdu
-                positive["edu"] += edu
+                for target in markers:
+                    positive[target] += partition_positive[target]
             if source_parts % 20 == 0:
                 print(f"parts={source_parts} cortical_rows={total}", flush=True)
     if {path.name for path in prediction_dir.glob("*.parquet")} != expected_outputs:
         raise ValueError(f"Output partition roster differs from selected source partitions: {prediction_dir}")
     complete = {
-        **contract,
+        **run_record,
         "source_partitions": len(tasks),
         "prediction_partitions": output_parts,
         "cells": total,
-        "brdu_positive": positive["brdu"],
-        "edu_positive": positive["edu"],
+        **{positive_count_key(target): positive[target] for target in markers},
         "stores_embeddings": False,
     }
     write_json_atomic(complete, output_dir / "complete.json")

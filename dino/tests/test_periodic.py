@@ -133,7 +133,7 @@ def test_apply_corrects_neighbors_and_binds_classifier_once(tmp_path):
     assert "marker_contract" not in correction and "schema" not in correction
     assert saved["periodic_correction"] == correction
     context = IntensityContext.load(
-        out / "props-corrected.parquet", scale_zyx_um=np.ones(3)
+        out / "props-corrected.parquet", scale_zyx_um=np.ones(3), markers=DEFAULT_CONTRACT.markers
     )
     np.testing.assert_allclose(context.means["brdu"], [5, 10, 15])
     np.testing.assert_allclose(

@@ -1,0 +1,154 @@
+{
+  "classifier_features": {
+    "brdu": 1032,
+    "edu": 1032
+  },
+  "datasets": {
+    "first": {
+      "deployed_model": "/tmp/dino-wf4c-legacy-joint/output/deploy/first/model.joblib",
+      "deployed_model_sha256": "c17262d40ca7b3f05799a3dc1a0968e5302902b5f7308048a2bea11ccf5dc80d",
+      "labels": 24,
+      "training": 18,
+      "validation": 6
+    },
+    "second": {
+      "deployed_model": "/tmp/dino-wf4c-legacy-joint/output/deploy/second/model.joblib",
+      "deployed_model_sha256": "b249e1b970d2ab72fbf050f9627ce221d7ae0f137b6609ef74e74ea97b5852ad",
+      "labels": 24,
+      "training": 18,
+      "validation": 6
+    }
+  },
+  "feature_layout": [
+    "embedding",
+    "log1p_cell_mean|first",
+    "log_cell_over_local_mean|first",
+    "log1p_dapi_mean|first",
+    "log1p_cell_mean|second",
+    "log_cell_over_local_mean|second",
+    "log1p_dapi_mean|second",
+    "intercept|first",
+    "intercept|second"
+  ],
+  "joint_model": "/tmp/dino-wf4c-legacy-joint/output/model.joblib",
+  "joint_model_sha256": "74b7eaad1a364f4372ccb0dc37ec427569d8390045d89124e4ab8e0441df664b",
+  "split_seed": 7,
+  "targets": {
+    "brdu": {
+      "best_c": 0.05623413251903491,
+      "cutoff": 0.37809116186693825,
+      "cv_balanced_accuracy": 0.5416666666666666,
+      "cv_folds": 5,
+      "out_of_fold_by_dataset": {
+        "first": {
+          "accuracy": 0.5833333333333334,
+          "auc": 0.6041666666666666,
+          "balanced_accuracy": 0.5833333333333334,
+          "brier": 0.23752656711055184,
+          "cells": 24,
+          "positive": 12
+        },
+        "second": {
+          "accuracy": 0.6666666666666666,
+          "auc": 0.5208333333333334,
+          "balanced_accuracy": 0.6666666666666666,
+          "brier": 0.2483053596746072,
+          "cells": 24,
+          "positive": 12
+        }
+      },
+      "validation": {
+        "accuracy": 0.8333333333333334,
+        "auc": 0.7142857142857143,
+        "balanced_accuracy": 0.8,
+        "brier": 0.22958470716271318,
+        "cells": 12,
+        "positive": 7
+      },
+      "validation_by_dataset": {
+        "first": {
+          "accuracy": 0.8333333333333334,
+          "auc": 0.5,
+          "balanced_accuracy": 0.75,
+          "brier": 0.279267469809321,
+          "cells": 6,
+          "positive": 4
+        },
+        "second": {
+          "accuracy": 0.8333333333333334,
+          "auc": 0.888888888888889,
+          "balanced_accuracy": 0.8333333333333333,
+          "brier": 0.17990194451610528,
+          "cells": 6,
+          "positive": 3
+        }
+      }
+    },
+    "edu": {
+      "best_c": 0.0017782794100389228,
+      "cutoff": 0.5084677624230783,
+      "cv_balanced_accuracy": 0.6583333333333333,
+      "cv_folds": 5,
+      "out_of_fold_by_dataset": {
+        "first": {
+          "accuracy": 0.5,
+          "auc": 0.6111111111111112,
+          "balanced_accuracy": 0.5,
+          "brier": 0.2449368140820564,
+          "cells": 24,
+          "positive": 12
+        },
+        "second": {
+          "accuracy": 0.5833333333333334,
+          "auc": 0.6944444444444444,
+          "balanced_accuracy": 0.5833333333333334,
+          "brier": 0.23930855571536894,
+          "cells": 24,
+          "positive": 12
+        }
+      },
+      "validation": {
+        "accuracy": 0.75,
+        "auc": 0.6944444444444444,
+        "balanced_accuracy": 0.75,
+        "brier": 0.2417985915624915,
+        "cells": 12,
+        "positive": 6
+      },
+      "validation_by_dataset": {
+        "first": {
+          "accuracy": 0.5,
+          "auc": 0.4444444444444445,
+          "balanced_accuracy": 0.5,
+          "brier": 0.25124452025044514,
+          "cells": 6,
+          "positive": 3
+        },
+        "second": {
+          "accuracy": 1.0,
+          "auc": 1.0,
+          "balanced_accuracy": 1.0,
+          "brier": 0.23235266287453782,
+          "cells": 6,
+          "positive": 3
+        }
+      }
+    }
+  },
+  "tranches": {
+    "first": [
+      {
+        "labels": 24,
+        "labels_sha256": "ccf0888309f052a895900bd5e5940718b3442154575065bbd70d29ce4ff23177",
+        "path": "/tmp/dino-wf4c-legacy-joint/inputs/first/tranche"
+      }
+    ],
+    "second": [
+      {
+        "labels": 24,
+        "labels_sha256": "e3c670ba970a438aa34791431744373084e5082b00addefce887927762da3b01",
+        "path": "/tmp/dino-wf4c-legacy-joint/inputs/second/tranche"
+      }
+    ]
+  }
+}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import heapq
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,24 +13,35 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+from dino_markers import (
+    INFERENCE,
+    INTENSITY_MODEL,
+    ZARR_MODEL,
+    MarkerContract,
+    bundle_contract,
+    contract_of,
+    cutoff_key,
+    load_config,
+    model_key,
+    probability_column,
+    require_same_contract,
+    scaler_key,
+)
 
 from dino.artifacts import (
     file_sha256,
     ordered_cell_sha256,
     read_embedding_artifact,
     read_parquet_artifact,
+    require_embedding_markers,
     validate_model_artifacts,
     write_embedding_atomic,
     write_parquet_atomic,
 )
-from dino.intensity_context import (
-    MODEL_SCHEMA as INTENSITY_MODEL_SCHEMA,
-    IntensityContext,
-)
+from dino.intensity_context import IntensityContext
 from dino.zarr_model import (
     FEATURE_EXECUTION,
     MODEL_INPUT_CHANNELS,
-    MODEL_SCHEMA,
     build_cell_transform,
     extract_normalized_feature_tensor,
     feature_dtype,
@@ -44,14 +55,12 @@ from dino.zarr_model import (
 from dino.zarr_source import CellCropReader, load_source, write_json_atomic
 
 
-TARGETS = ("brdu", "edu")
-
-
 @dataclass(frozen=True)
 class InferConfig:
     source_dir: Path
     model_dir: Path
     out_dir: Path
+    markers: MarkerContract | None
     cells: Path | None
     dinov2_repo: Path | None
     weights: Path | None
@@ -68,9 +77,11 @@ class InferConfig:
 
 def _load_bundle(path: Path) -> dict[str, Any]:
     bundle = joblib.load(path)
-    schemas = {MODEL_SCHEMA, INTENSITY_MODEL_SCHEMA}
-    if not isinstance(bundle, dict) or bundle.get("schema") not in schemas:
-        raise ValueError(f"Expected one of {sorted(schemas)}: {path}")
+    kinds = (ZARR_MODEL, INTENSITY_MODEL)
+    if not isinstance(bundle, dict) or not any(kind.recognizes(bundle) for kind in kinds):
+        schemas = sorted(version for kind in kinds for version in (kind.legacy, kind.current))
+        raise ValueError(f"Expected one of {schemas}: {path}")
+    contract = bundle_contract(bundle, where=str(path))
     required = {
         "source_sha256",
         "feature_extractor",
@@ -87,21 +98,21 @@ def _load_bundle(path: Path) -> dict[str, Any]:
         "input_channel_names_by_target",
         "feature_precision",
         "feature_execution",
-        "brdu_feature_scaler",
-        "edu_feature_scaler",
-        "brdu_model",
-        "edu_model",
-        "brdu_cutoff",
-        "edu_cutoff",
+        *(
+            name
+            for marker in contract.markers
+            for name in (scaler_key(marker), model_key(marker), cutoff_key(marker))
+        ),
     }
     missing = sorted(required - set(bundle))
     if missing:
         raise ValueError(f"Direct-Zarr model bundle missing keys: {missing}")
     if "spatial_subtraction" in bundle:
-        from dino.spatial_pixels import SpatialPixels
+        from dino.spatial_pixels import SpatialPixels, require_spatial_subtraction_contract
 
+        require_spatial_subtraction_contract(contract, artifact=str(path))
         SpatialPixels.from_spec(bundle["spatial_subtraction"])
-    if bundle["schema"] == INTENSITY_MODEL_SCHEMA:
+    if INTENSITY_MODEL.recognizes(bundle):
         context_required = {
             "intensity_props",
             "intensity_neighbors",
@@ -249,16 +260,15 @@ def _predict(
     prefetch_workers: int,
     crop_workers: int,
     store_embeddings: bool,
+    markers: Sequence[str],
     intensity_context: IntensityContext | None = None,
 ) -> tuple[pd.DataFrame, dict[str, torch.Tensor] | None]:
     ordered = sort_cells_for_io(cells, reader)
-    p_brdu_out = np.full(len(cells), np.nan, dtype=np.float32)
-    p_edu_out = np.full(len(cells), np.nan, dtype=np.float32)
-    brdu_out = np.zeros(len(cells), dtype=bool)
-    edu_out = np.zeros(len(cells), dtype=bool)
+    probabilities_out = {marker: np.full(len(cells), np.nan, dtype=np.float32) for marker in markers}
+    calls_out = {marker: np.zeros(len(cells), dtype=bool) for marker in markers}
     valid_out = np.zeros(len(cells), dtype=bool)
     channel_names_by_target = {
-        target: tuple(bundle["input_channel_names_by_target"][target]) for target in TARGETS
+        target: tuple(bundle["input_channel_names_by_target"][target]) for target in markers
     }
     precision = str(bundle["feature_precision"])
     dtype = feature_dtype(precision)
@@ -276,11 +286,10 @@ def _predict(
         raise ValueError("Model bundle and loaded intensity context disagree")
     if store_embeddings:
         dimensions = {
-            int(bundle[f"{target}_feature_scaler"].n_features_in_) - context_dimensions
-            for target in TARGETS
+            int(bundle[scaler_key(target)].n_features_in_) - context_dimensions for target in markers
         }
         if len(dimensions) != 1:
-            raise ValueError("BrdU and EdU classifiers require different embedding dimensions")
+            raise ValueError("Marker classifiers require different embedding dimensions")
         dimension = dimensions.pop()
         embeddings = {
             target: torch.full(
@@ -288,7 +297,7 @@ def _predict(
                 torch.nan,
                 dtype=dtype,
             )
-            for target in TARGETS
+            for target in markers
         }
     image_batches = iter_model_image_batches(
         ordered,
@@ -301,8 +310,7 @@ def _predict(
         require_mask=False,
     )
     for pending_images, pending_row_orders in iter_prefetched_batches(image_batches):
-        probabilities: dict[str, np.ndarray] = {}
-        for target in TARGETS:
+        for target in markers:
             batch = prepare_model_batch(
                 pending_images[target],
                 transform=transform,
@@ -321,25 +329,17 @@ def _predict(
                 features = np.column_stack(
                     (features, context_features[target][pending_row_orders])
                 )
-            scaled = bundle[f"{target}_feature_scaler"].transform(features)
-            probabilities[target] = bundle[f"{target}_model"].predict_proba(scaled)[:, 1]
-        for row_order, p_brdu, p_edu in zip(
-            pending_row_orders,
-            probabilities["brdu"],
-            probabilities["edu"],
-            strict=True,
-        ):
-            p_brdu_out[row_order] = p_brdu
-            p_edu_out[row_order] = p_edu
-            brdu_out[row_order] = p_brdu >= float(bundle["brdu_cutoff"])
-            edu_out[row_order] = p_edu >= float(bundle["edu_cutoff"])
-            valid_out[row_order] = True
+            scaled = bundle[scaler_key(target)].transform(features)
+            probability = bundle[model_key(target)].predict_proba(scaled)[:, 1]
+            probabilities_out[target][pending_row_orders] = probability
+            calls_out[target][pending_row_orders] = probability >= float(bundle[cutoff_key(target)])
+        valid_out[pending_row_orders] = True
     result = cells.loc[:, ["cell", "dataset", "roi", "label"]].copy().reset_index(drop=True)
-    result["p_brdu"] = p_brdu_out
-    result["p_edu"] = p_edu_out
-    result["brdu"] = pd.array(brdu_out, dtype="boolean")
-    result["edu"] = pd.array(edu_out, dtype="boolean")
-    result.loc[~valid_out, ["brdu", "edu"]] = pd.NA
+    for marker in markers:
+        result[probability_column(marker)] = probabilities_out[marker]
+    for marker in markers:
+        result[marker] = pd.array(calls_out[marker], dtype="boolean")
+    result.loc[~valid_out, list(markers)] = pd.NA
     return result, embeddings
 
 
@@ -348,6 +348,12 @@ def _parse_args() -> InferConfig:
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--markers",
+        type=Path,
+        default=None,
+        help="Marker configuration asserted against the model bundle; its contract must equal the bundle's.",
+    )
     parser.add_argument("--cells", type=Path, default=None)
     parser.add_argument("--dinov2-repo", type=Path, default=None)
     parser.add_argument("--weights", type=Path, default=None)
@@ -382,6 +388,7 @@ def _parse_args() -> InferConfig:
         source_dir=args.source_dir.expanduser(),
         model_dir=args.model_dir.expanduser(),
         out_dir=args.out_dir.expanduser(),
+        markers=load_config(args.markers.expanduser()).contract if args.markers is not None else None,
         cells=args.cells.expanduser() if args.cells is not None else None,
         dinov2_repo=args.dinov2_repo.expanduser() if args.dinov2_repo is not None else None,
         weights=args.weights.expanduser() if args.weights is not None else None,
@@ -402,14 +409,15 @@ def _validate_partition(
     embedding_path: Path,
     *,
     cells: pd.DataFrame,
-    contract: dict[str, Any],
+    run_record: dict[str, Any],
+    markers: Sequence[str],
     partition_index: int,
 ) -> bool:
     """Validate any published half before reuse, including interrupted pairs."""
     cell_ids = cells["cell"].astype(str).tolist()
     cell_digest = ordered_cell_sha256(cell_ids)
     part_contract = {
-        **contract,
+        **run_record,
         "partition_index": partition_index,
         "partition_rows": len(cells),
         "cell_sha256": bytes(cell_digest.tolist()).hex(),
@@ -421,20 +429,30 @@ def _validate_partition(
         saved_ids = pd.read_parquet(part_path, columns=["cell"])["cell"].astype(str).tolist()
         if saved_ids != cell_ids:
             raise ValueError(f"Prediction partition cell order mismatch: {part_path}")
-    if contract["stores_embeddings"] and embedding_path.exists():
+    if run_record["stores_embeddings"] and embedding_path.exists():
         embeddings = read_embedding_artifact(embedding_path)
+        require_embedding_markers(embeddings, markers, path=embedding_path)
         if not torch.equal(embeddings["cell_sha256"], cell_digest) or any(
-            embeddings[target].shape != (len(cells), contract["embedding_dimension"])
-            for target in TARGETS
+            embeddings[target].shape != (len(cells), run_record["embedding_dimension"])
+            for target in markers
         ):
             raise ValueError(f"Embedding partition cell identity or shape mismatch: {embedding_path}")
-    return part_path.is_file() and (not contract["stores_embeddings"] or embedding_path.is_file())
+    return part_path.is_file() and (not run_record["stores_embeddings"] or embedding_path.is_file())
 
 
 def main() -> None:
     cfg = _parse_args()
     model_path = cfg.model_dir / "model.joblib"
     bundle = _load_bundle(model_path)
+    contract = bundle_contract(bundle, where=str(model_path))
+    markers = contract.markers
+    if cfg.markers is not None:
+        require_same_contract(
+            cfg.markers, contract, expected_from="--markers", actual_from=str(model_path)
+        )
+    require_same_contract(
+        contract_of(cfg.source_dir), contract, expected_from=str(cfg.source_dir), actual_from=str(model_path)
+    )
     if cfg.store_embeddings and bundle["feature_precision"] != "bfloat16":
         raise ValueError("--store-embeddings requires a bfloat16 model bundle")
     source = load_source(cfg.source_dir)
@@ -446,10 +464,11 @@ def main() -> None:
         raise FileNotFoundError(f"Missing prepared cell table: {source_cells_path}")
     source_cell_count = pq.ParquetFile(source_cells_path).metadata.num_rows
     intensity_context = None
-    if bundle["schema"] == INTENSITY_MODEL_SCHEMA:
+    if INTENSITY_MODEL.recognizes(bundle):
         intensity_context = IntensityContext.load(
             Path(bundle["intensity_props"]),
             scale_zyx_um=np.asarray(bundle["intensity_scale_zyx_um"], dtype=np.float64),
+            markers=markers,
         )
         if len(intensity_context.points_zyx_um) != source_cell_count:
             raise ValueError("Intensity context and prepared source cell counts differ")
@@ -475,13 +494,12 @@ def main() -> None:
     embedding_path = cfg.out_dir / "embeddings"
     complete_path = cfg.out_dir / "complete.json"
     contract_path = cfg.out_dir / "contract.json"
-    contract = {
+    fields = {
         "prepared_cells_sha256": file_sha256(source_cells_path),
         "requested_input_sha256": file_sha256(cfg.cells) if cfg.cells is not None else None,
         "requested_cells_sha256": bytes(ordered_cell_sha256(
             str(cell) for partition in cell_partitions() for cell in partition["cell"]
         ).tolist()).hex(),
-        "artifact": "dino-zarr-infer-v2",
         "source_sha256": source_sha256,
         "model_source_sha256": str(bundle["model_source_sha256"]),
         "model_sha256": file_sha256(model_path),
@@ -489,8 +507,7 @@ def main() -> None:
         "source_cells": source_cell_count,
         "shard_index": cfg.shard_index,
         "shard_count": cfg.shard_count,
-        "brdu_cutoff": float(bundle["brdu_cutoff"]),
-        "edu_cutoff": float(bundle["edu_cutoff"]),
+        **{cutoff_key(marker): float(bundle[cutoff_key(marker)]) for marker in markers},
         "feature_precision": str(bundle["feature_precision"]),
         "feature_execution": str(bundle["feature_execution"]),
         "partition_cells": cfg.partition_cells,
@@ -498,26 +515,32 @@ def main() -> None:
         "model_schema": str(bundle["schema"]),
     }
     if intensity_context is not None:
-        contract["intensity_props_sha256"] = file_sha256(Path(bundle["intensity_props"]))
+        fields["intensity_props_sha256"] = file_sha256(Path(bundle["intensity_props"]))
     if cfg.store_embeddings:
-        contract.update(
+        fields.update(
             {
                 "embedding_format": "pytorch-tensor-v1",
                 "embedding_dtype": "bfloat16",
-                "embedding_targets": list(TARGETS),
-                "embedding_dimension": int(bundle["brdu_feature_scaler"].n_features_in_)
+                "embedding_targets": list(markers),
+                "embedding_dimension": int(bundle[scaler_key(markers[0])].n_features_in_)
                 - len(bundle.get("context_features", ())),
             }
         )
+    expected = INFERENCE.stamp(fields, contract)
     repo = cfg.dinov2_repo or Path(bundle["dinov2_repo"]).expanduser()
     weights = cfg.weights or Path(bundle["weights"]).expanduser()
     validate_model_artifacts(bundle=bundle, weights=weights, model_source=repo)
     if cfg.out_dir.exists() and any(cfg.out_dir.iterdir()):
         if not cfg.resume:
             raise FileExistsError(f"Refusing --no-resume with occupied destination: {cfg.out_dir}")
-        if not contract_path.is_file() or json.loads(contract_path.read_text()) != contract:
+        if not contract_path.is_file():
             raise ValueError(f"Inference output contract mismatch: {cfg.out_dir}")
-    if complete_path.exists() and json.loads(complete_path.read_text()) != contract:
+        run_record = json.loads(contract_path.read_text())
+        if INFERENCE.normalize(run_record, where=str(contract_path)) != expected:
+            raise ValueError(f"Inference output contract mismatch: {cfg.out_dir}")
+    else:
+        run_record = expected
+    if complete_path.exists() and json.loads(complete_path.read_text()) != run_record:
         raise ValueError(f"Inference completion contract mismatch: {complete_path}")
 
     completed_partitions = []
@@ -530,7 +553,7 @@ def main() -> None:
         if cfg.store_embeddings:
             expected_embeddings.add(embedding)
         completed_partitions.append(_validate_partition(
-            part, embedding, cells=partition, contract=contract, partition_index=index,
+            part, embedding, cells=partition, run_record=run_record, markers=markers, partition_index=index,
         ))
     for directory, expected_paths in (
         (output_path, expected_predictions), (embedding_path, expected_embeddings),
@@ -548,7 +571,7 @@ def main() -> None:
     if feature_extractor not in MODEL_INPUT_CHANNELS:
         raise ValueError(f"Unsupported feature extractor: {feature_extractor}")
     if not contract_path.exists():
-        write_json_atomic(contract, contract_path, overwrite=False)
+        write_json_atomic(run_record, contract_path, overwrite=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_cell_dino_model(
         repo=repo,
@@ -569,7 +592,7 @@ def main() -> None:
     input_channel_names = tuple(
         dict.fromkeys(
             name
-            for target in TARGETS
+            for target in markers
             for name in input_channel_names_by_target[target]
         )
     )
@@ -601,10 +624,11 @@ def main() -> None:
                 prefetch_workers=cfg.prefetch_workers,
                 crop_workers=cfg.crop_workers,
                 store_embeddings=cfg.store_embeddings,
+                markers=markers,
                 intensity_context=intensity_context,
             )
             part_contract = {
-                **contract,
+                **run_record,
                 "partition_index": partition_index,
                 "partition_rows": len(predictions),
                 "cell_sha256": bytes(ordered_cell_sha256(predictions["cell"].astype(str)).tolist()).hex(),
@@ -622,7 +646,7 @@ def main() -> None:
             rows_written += len(predictions)
     finally:
         reader.close()
-    write_json_atomic(contract, complete_path, overwrite=False)
+    write_json_atomic(run_record, complete_path, overwrite=False)
     print(f"output_path={output_path}")
     print(f"rows={rows_written}")
     print("status=complete")

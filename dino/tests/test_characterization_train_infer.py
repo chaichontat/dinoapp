@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 from click.testing import CliRunner
+from dino_markers import DEFAULT_CONTRACT
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -122,7 +123,7 @@ def _read_embeddings(path: Path) -> dict[str, torch.Tensor]:
 
 
 def _intensity_features(path: Path, labels: np.ndarray, *, neighbors: int):
-    context = IntensityContext.load(path, scale_zyx_um=np.ones(3))
+    context = IntensityContext.load(path, scale_zyx_um=np.ones(3), markers=DEFAULT_CONTRACT.markers)
     return context, context.features_for_labels(labels, neighbors=neighbors)
 
 
@@ -158,11 +159,15 @@ def _feature_cache_key(target: str, row: pd.Series) -> str:
 
 
 def _split(rows: pd.DataFrame, *, limit: int, test_fraction: float, seed: int):
-    return training_split.split_training_rows(rows, limit=limit, test_fraction=test_fraction, seed=seed)
+    return training_split.split_training_rows(
+        rows, markers=DEFAULT_CONTRACT.markers, limit=limit, test_fraction=test_fraction, seed=seed
+    )
 
 
 def _assemble(embeddings, contexts, *, target: str, mode: str) -> np.ndarray:
-    return classifier_features.assemble_classifier_features(embeddings, contexts, target=target, mode=mode)
+    return classifier_features.assemble_classifier_features(
+        embeddings, contexts, target=target, mode=mode, markers=DEFAULT_CONTRACT.markers
+    )
 
 
 def _validate_feature_contract(bundle: dict, embedding_bundle: dict) -> None:
@@ -176,11 +181,14 @@ def _combined_uncertainty(p_brdu, p_edu, *, brdu_cutoff: float, edu_cutoff: floa
 
 
 def _score_rows(rows: pd.DataFrame, *, embeddings, bundle, context) -> pd.DataFrame:
-    return cortex_score.score_rows(rows, embeddings=embeddings, bundle=bundle, context=context)
+    return cortex_score.score_rows(
+        rows, embeddings=embeddings, bundle=bundle, context=context, markers=DEFAULT_CONTRACT.markers
+    )
 
 
 def _load_calls(inference: Path, expected_cells: list[np.ndarray], source_hash: str):
-    return call_provenance.load_calls(inference, expected_cells, source_hash)
+    calls, records = call_provenance.load_calls(inference, expected_cells, source_hash)
+    return calls["brdu"], calls["edu"], records
 
 
 def _clean_labels_cli(monkeypatch, barrage_dir: Path) -> None:
@@ -346,6 +354,7 @@ EXPECTED_PARTITIONS = [
     },
 ]
 
+DEFAULT_JSON = {"version": 1, "reference": "pi", "markers": ["brdu", "edu"]}
 PREDICTION_COLUMNS = ["cell", "dataset", "roi", "label", "p_brdu", "p_edu", "brdu", "edu"]
 PREDICTION_TYPES = {
     "cell": pa.string(),
@@ -382,10 +391,13 @@ def _assert_same_estimator(left, right) -> None:
 
 
 def _assert_reproduces_legacy_bundle(bundle: dict, legacy_bundle: dict, *, barrage_dir: Path) -> None:
-    assert set(bundle) == set(legacy_bundle) == EXPECTED_BUNDLE_KEYS
+    assert set(legacy_bundle) == EXPECTED_BUNDLE_KEYS
+    assert set(bundle) == EXPECTED_BUNDLE_KEYS | {"marker_contract"}
+    assert bundle["schema"] == "dino-zarr-model-v7"
+    assert bundle["marker_contract"] == DEFAULT_JSON
     assert bundle["training_barrage_dirs"] == [str(barrage_dir.resolve())]
     pd.Timestamp(bundle["created_at_utc"])
-    for key in EXPECTED_BUNDLE_KEYS - {"created_at_utc", "training_barrage_dirs"}:
+    for key in EXPECTED_BUNDLE_KEYS - {"schema", "created_at_utc", "training_barrage_dirs"}:
         if key.endswith(("_model", "_feature_scaler")):
             _assert_same_estimator(bundle[key], legacy_bundle[key])
         else:
@@ -474,7 +486,10 @@ def test_fresh_training_reproduces_legacy_cache_and_bundle(legacy, monkeypatch) 
     assert sorted(path.name for path in (legacy / "fresh").iterdir()) == ["features.joblib", "model.joblib"]
     cache = joblib.load(legacy / "fresh" / "features.joblib")
     legacy_cache = joblib.load(legacy / "model" / "features.joblib")
-    assert cache["metadata"] == legacy_cache["metadata"] == EXPECTED_CACHE_METADATA
+    assert legacy_cache["metadata"] == EXPECTED_CACHE_METADATA
+    assert cache["metadata"] == {
+        **EXPECTED_CACHE_METADATA, "schema": "dino-zarr-features-v3", "marker_contract": DEFAULT_JSON
+    }
     assert set(cache["entries"]) == set(legacy_cache["entries"])
     for key, entry in legacy_cache["entries"].items():
         np.testing.assert_array_equal(cache["entries"][key]["feature"], entry["feature"])
@@ -605,17 +620,17 @@ def test_fresh_inference_on_legacy_bundle_reproduces_legacy_run(legacy, monkeypa
 
     assert "status=complete" in result.output
     run, rerun = legacy / INFERENCE_RUN, legacy / "rerun"
+    stamped = {"artifact": "dino-zarr-infer-v3", "marker_contract": DEFAULT_JSON}
     for name in ("contract.json", "complete.json"):
-        assert json.loads((rerun / name).read_text()) == json.loads((run / name).read_text())
+        assert json.loads((rerun / name).read_text()) == {**json.loads((run / name).read_text()), **stamped}
     for index in range(2):
         part = f"part-{index:06d}"
         pd.testing.assert_frame_equal(
             pd.read_parquet(rerun / "predictions" / f"{part}.parquet"),
             pd.read_parquet(run / "predictions" / f"{part}.parquet"),
         )
-        assert read_parquet_artifact(rerun / "predictions" / f"{part}.parquet") == read_parquet_artifact(
-            run / "predictions" / f"{part}.parquet"
-        )
+        provenance, rows = read_parquet_artifact(run / "predictions" / f"{part}.parquet")
+        assert read_parquet_artifact(rerun / "predictions" / f"{part}.parquet") == ({**provenance, **stamped}, rows)
         saved = _read_embeddings(run / "embeddings" / f"{part}.pt")
         rerun_saved = _read_embeddings(rerun / "embeddings" / f"{part}.pt")
         assert set(rerun_saved) == set(saved)
@@ -842,6 +857,7 @@ RESCORE_CONTRACT_KEYS = {
     "classifier_feature_schema",
     "brdu_cutoff",
     "edu_cutoff",
+    "marker_contract",
 }
 
 
@@ -881,7 +897,7 @@ def _write_rescore_inputs(root: Path) -> None:
     shard = root / "infer" / "shard-000"
     (shard / "predictions").mkdir(parents=True)
     (shard / "complete.json").write_text(json.dumps({
-        "stores_embeddings": True, "source_sha256": "source",
+        "artifact": "dino-zarr-infer-v2", "stores_embeddings": True, "source_sha256": "source",
         "model_sha256": file_sha256(root / "embedding-model.joblib"),
         "shard_count": 1, "shard_index": 0, "cells": 6, "partition_cells": 3,
     }))
@@ -915,9 +931,10 @@ def test_cortex_rescore_complete_and_partition_contracts(tmp_path) -> None:
         "classifier_embedding_dimension", "classifier_feature_count", "classifier_feature_mode",
         "embedding_pca_components", "context_features", "dapi_props", "dapi_props_sha256",
         "intensity_neighbors", "classifier_feature_schema", "brdu_cutoff", "edu_cutoff",
-        "source_partitions", "prediction_partitions", "cells", "stores_embeddings",
+        "source_partitions", "prediction_partitions", "cells", "stores_embeddings", "marker_contract",
     )} == {
-        "artifact": "dino-cortex-rescore-v1",
+        "artifact": "dino-cortex-rescore-v2",
+        "marker_contract": DEFAULT_JSON,
         "excluded_labeled_cells": 1,
         "source_sha256": "source",
         "model_schema": "dino-knn-intensity-v1",
