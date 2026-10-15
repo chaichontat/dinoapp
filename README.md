@@ -37,22 +37,32 @@ Python 3.12 or newer:
 uv sync --package dinoapp                        # crop review
 uv sync --package dinoapp --extra native         # native field review
 uv sync --package thesis-dino --extra compute    # preparation, fitting, inference
-uv pip install --no-deps -e /path/to/cell-dino-dinov2
 ```
 
-The `dinov2` distribution on PyPI is not Cell-DINO. After a `compute` sync,
-install the Cell-DINO DINOv2 checkout over it without dependencies, as in the last
-line; [dino/README.md](dino/README.md#installation) describes the checkpoint.
+The `compute` sync installs `dinov2` from `facebookresearch/dinov2` at the commit
+that provides Cell-DINO (`7b187bd`), and the root `pyproject.toml` overrides its
+2023 training pins. Model loading also reads the checkout's `hubconf.py` and
+requires the installed package to be that checkout, so install a clone of the same
+commit over it after each sync;
+[dino/README.md](dino/README.md#installation) describes the checkpoint:
+
+```bash
+git clone https://github.com/facebookresearch/dinov2 /path/to/dinov2
+git -C /path/to/dinov2 checkout 7b187bd4df8efce2cbcbbb67bd01532c19bf4c9c
+uv pip install --no-deps -e /path/to/dinov2
+```
 
 With pip, `dino-markers` is not on PyPI and must be installed from `markers/` in
-the same command. The PyPI `squisher` is an unrelated package, so install squisher
-from GitHub first when the native or compute extras need it:
+the same command. The PyPI `squisher` and `dinov2` are unrelated packages, so
+install squisher from GitHub and the DINOv2 clone first when the native or compute
+extras need them:
 
 ```bash
 python -m pip install -e ./markers -e ./dinoapp
 python -m pip install \
   "squisher @ git+https://github.com/chaichontat/squisher#subdirectory=squisher" \
   "squisher-segment @ git+https://github.com/chaichontat/squisher#subdirectory=segment"
+python -m pip install --no-deps -e /path/to/dinov2
 python -m pip install -e ./markers -e './dino[compute]' -e './dinoapp[native]'
 ```
 

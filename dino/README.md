@@ -28,8 +28,9 @@ that is installed from there alongside this package.
 
 Use `[compute]` for encoder execution, spatial fitting, direct-Zarr preparation,
 and pixelwise regionprops measurements. The uv workspace resolves `squisher` and
-`squisher-segment` from GitHub. Run these commands from the `dinoinfer`
-repository root:
+`squisher-segment` from GitHub and `dinov2` from `facebookresearch/dinov2` at
+commit `7b187bd`. Run these commands from the `dinoinfer` repository root, with
+`/home/chaichontat/dinov2` a clone at that commit:
 
 ```bash
 uv sync --package thesis-dino --extra compute
@@ -42,7 +43,7 @@ supplies the microscopy workspace, crop, and barrage readers. fishtools requires
 NumPy 1 and squisher NumPy 2.4 or newer, so install it with `./dino[legacy]` in a
 separate environment.
 
-Cell-DINO requires the Cell-DINO DINOv2 checkout installed editable in the same environment and the selected Cell-DINO checkpoint. `--dinov2-repo` (or the path recorded in the model bundle) must identify that installed checkout: transforms are imported from the installed package, and model loading uses its local `hubconf.py`. The `--no-deps` install above preserves the environment's existing Torch stack; the checkout's legacy dependency pins should not replace it. The optional MNIST validation command requires DINOv3 to be importable in the environment.
+Cell-DINO requires the Cell-DINO DINOv2 checkout installed editable in the same environment and the selected Cell-DINO checkpoint. `--dinov2-repo` (or the path recorded in the model bundle) must identify that installed checkout: transforms are imported from the installed package, and model loading uses its local `hubconf.py`. `uv sync` reinstalls the locked copy, so repeat the editable install after each sync. The root `pyproject.toml` overrides the checkout's legacy dependency pins, and the `--no-deps` install preserves the environment's Torch stack. The optional MNIST validation command requires DINOv3 to be importable in the environment.
 
 ## Marker configuration
 
