@@ -17,6 +17,11 @@ Design review: the Astra consultation in `~/.cache/codex-consult/dinoinfer-marke
 | D5 | Commits | Work happens on the `generalize` branch. The migration is committed first (worktrees contain only committed files), then one signed commit per wave so the next wave's worktrees start from it. |
 | D6 | Full test suites | Both package suites run in full at each wave's integration gate. |
 | D7 | Out-of-repo caller | Replace `--brdu-input-channel`/`--edu-input-channel` with `--input-channel TARGET=CH` and update `thesis-internal/scripts/dino_train_405.sh`. |
+| D8 | Contract recording | Every new artifact records the marker contract (new version string plus `marker_contract`), including under the default BrdU/EdU config. Legacy records are normalized in memory to the BrdU/EdU contract at every equality check. |
+| D9 | Reviewer badge colors | Optional `presentation.badge_colors` in the JSON; defaults reproduce today's five colors (`native_app.py:39-46`). |
+| D10 | Other out-of-repo callers | Update `thesis-internal/scripts/dino_render_calls.py`, `thesis-internal/test/test_dino_call_provenance.py`, and `thesis-internal/scripts/dino_neighbor_eval.py` to the new APIs; no compatibility aliases. |
+| D11 | GAM callers | Slice D also updates `thesis-internal/thesis/gam/gam/uv_soft_joint.py` (require `DEFAULT_CONTRACT`, pass its markers to `assemble_classifier_features`), `thesis-internal/thesis/scripts/prepare_uv_gam.py` (prediction-override branch only: accept recognized rescore and model versions, require the default contract, keep the identity checks), and declares `dino-markers` in `thesis-internal/thesis/gam/pyproject.toml`; applied by the main session at the WF4 gate. |
+| D12 | Periodic correction records | An explicit exception to D8: the periodic field bundle, `correction.json` and measure records keep their versions; the field bundle's ordered `targets` list is their recorded contract and is checked against the active contract. Classifier bundles that `periodic apply`/`measure` and `bind_spatial_subtraction` derive are new artifacts and are stamped. |
 
 ## 2. Target design (the contract every agent codes against)
 
@@ -58,7 +63,7 @@ The contract is `{"version": 1, "reference": "pi", "markers": ["brdu", "edu"]}`:
 | Periodic correction | existing `targets` list (already artifact-owned order) | current bundles |
 | RHU2 spatial snapshot | `spatial.json` | `rhu2-spatial-review-v1` |
 | Annotations | the owning artifact's contract; checked under the existing `labels.csv.lock` on every write | `labels.csv` in any legacy barrage |
-| Change journal | a `markers` field on each new record | records without it are positional `[brdu, edu]` |
+| Change journal | `schema` and `marker_contract` on each record of a new journal file | records without it are positional `[brdu, edu]` |
 
 New artifact versions require the field; a missing field fails instead of defaulting. `--markers PATH` on a command that consumes existing artifacts asserts compatibility and never reinterprets them. Legacy records are normalized in memory, per recognized schema version, before the whole-dictionary equality checks in `zarr_train.py:475` (feature cache), `zarr_barrage.py:487` (barrage contract), and `zarr_infer.py:518` (resume); old bundles are never rewritten, because their file hashes identify them downstream.
 
@@ -123,11 +128,11 @@ Output: `tests/test_characterization_*.py` per package. Gate: all pass on the ba
 
 Gate: package tests, characterization tests unchanged, basic `dinoapp` import without `thesis-dino`.
 
-### WF3. Usable path: prepare, barrage, annotation storage (≈8–10 agents)
+### WF3. Prepare, barrage and pixel corrections (≈6–8 agents)
 
-Four implementers in worktrees (slices A, B, E, F in section 5), each followed in a pipeline by one reviewer and an optional fix agent. Order inside the workflow is free: the slices meet only through the frozen spec.
+Three implementers in worktrees (slices A, B, E in section 5), each followed in a pipeline by one reviewer and an optional fix agent. Order inside the workflow is free: the slices meet only through the frozen spec.
 
-Gate: characterization tests unchanged; new tests for custom contracts at each artifact; reorder rejection at prepare→barrage→labels.
+Gate: characterization tests unchanged; new tests for custom contracts at each artifact; reorder rejection at prepare→barrage.
 
 ### WF4. Training and inference (≈6–8 agents)
 
@@ -135,11 +140,11 @@ Slices C and D, each implement → review (two lenses) → fix. C consumes A's c
 
 Gate: characterization tests unchanged (including feature-cache and resume equality on legacy fixtures); a three-marker train→infer run on stub encoders; same-size reorder rejected at train and infer; joint feature order bound to the bundle.
 
-### WF5. Reviewer and frozen-path adaptations (≈8–10 agents)
+### WF5. Annotation storage, reviewer and frozen-path adaptations (≈10–12 agents)
 
-Slices G (reviewer UI), H (dataset adapters and the shared prediction loader), I (frozen-path call sites and docs), each implement → review → fix. G and H depend on F's storage API and D's `combined_uncertainty`.
+Slices F (annotation storage), G (reviewer UI), H (dataset adapters, the shared prediction loader and `review_contracts.py`), I (frozen-path call sites and docs), each implement → review → fix. G, H and I call F's storage API; F's `NativeSource.crop` calls H's `marker_crop`, and F's tests call G's gallery APIs; I's `review_activation.py` calls H's `combined_uncertainty` (spec 5.0). Training needs none of them: `zarr_train.py:84-90` and `joint_train.py:83-88` read `labels.csv` directly.
 
-Gate: dinoapp characterization unchanged under the default config; Streamlit AppTest runs of cell review and both galleries with a three-marker barrage; stale-session writes rejected after a contract change; basic crop review without `thesis-dino`.
+Gate: dinoapp characterization unchanged under the default config; custom-contract tests at `labels.csv` and the change journal; reorder rejection at label write; Streamlit AppTest runs of cell review and both galleries with a three-marker barrage; stale-session writes rejected after a contract change; basic crop review without `thesis-dino` (`test_plain_crop_workspace_runs_without_native_or_compute_dependencies`).
 
 ### WF6. Integration review and acceptance (≈8 agents)
 
@@ -155,11 +160,11 @@ Gate: dinoapp characterization unchanged under the default config; Streamlit App
 | A Source and prepare | WF3 | `dino/dino/zarr_source.py`, `zarr_prepare.py`, their tests | `required_channels` from config; `--channel KEY=PATH`; contract in prepare `complete.json`; `source.json` unchanged |
 | B Barrage and rendering | WF3 | `zarr_barrage.py`, `crop_rendering.py`, their tests | stats and `display_max` from config; panels from `crop_panels`; contract in barrage records; `markers.json` written |
 | E Pixel corrections | WF3 | `pixel_corrections.py`, `periodic_pixels.py`, `periodic.py`, `spatial_pixels.py`, their tests | periodic order from bundle `targets`; subtraction dispatch from saved identity; reject unsupported |
-| F Annotation storage | WF3 | `dinoapp/src/dinoapp/label_store.py`, `sources.py`, `review_session.py`, `dinoapp/docs/data-format.md`, their tests | N-tuple labels; columns from contract; contract check under the lock; journal `markers` field; generic `marker_crop` on `ReviewSource` |
 | C Training | WF4 | `zarr_train.py`, `zarr_model.py`, `classifier_features.py`, `training_split.py`, `intensity_context.py`, `joint_train.py`, `clean_labels.py`, their tests | loops over contract; `--input-channel`; joint feature order bound to bundle; N-marker stratification; name-based intensity columns; before changing `joint_train.py`, freeze legacy `dino-knn-intensity-v1` and `dino-joint-dataset-v1` bundles as fixtures (WF0 did not cover them) |
-| D Inference and provenance | WF4 | `zarr_infer.py`, `call_provenance.py`, `cortex_score.py`, `review_contracts.py`, `artifacts.py`, their tests | per-target arrays; N-ary `combined_uncertainty`; contract in outputs; legacy resume normalization |
+| D Inference and provenance | WF4 | `zarr_infer.py`, `call_provenance.py`, `cortex_score.py`, `artifacts.py`, their tests | per-target arrays; contract in outputs; legacy resume normalization |
+| F Annotation storage | WF5 | `dinoapp/src/dinoapp/label_store.py`, `sources.py`, `review_session.py`, `dinoapp/docs/data-format.md`, their tests | N-tuple labels; columns from contract; contract check under the lock; journal `schema` and `marker_contract` fields; generic `marker_crop` on `ReviewSource` |
 | G Reviewer UI | WF5 | `dinoapp/src/dinoapp/app.py`, `native_app.py`, their tests | views from config; per-marker controls with "Save and next"; per-marker filters; labels from config |
-| H Dataset adapters | WF5 | `native.py`, `prod3.py`, `prod3_2.py`, `prod2_2.py`, `rhu2.py`, `rhu2_app.py`, `rhu2_prepare.py`, `corrected_barrage.py`, `display_pixels.py`, their tests | one shared prediction loader keeping each adapter's checks; adapters declare raw-channel→marker mapping; palette and composite from config |
+| H Dataset adapters | WF5 | `native.py`, `prod3.py`, `prod3_2.py`, `prod2_2.py`, `rhu2.py`, `rhu2_app.py`, `rhu2_prepare.py`, `corrected_barrage.py`, `display_pixels.py`, `dino/dino/review_contracts.py`, their tests | N-ary `combined_uncertainty`; one shared prediction loader keeping each adapter's checks; adapters declare raw-channel→marker mapping; palette and composite from config |
 | I Frozen paths and docs | WF5 | legacy `train.py`, `infer.py`, `roc.py`, `rhu2_train.py`, `rhu2_embed.py`, `rhu2_predict.py`, `legacy_labeler.py` (call sites only); all READMEs | adapt calls to changed shared helpers under the BrdU/EdU contract; document the config and CLI |
 
 A slice that needs a change in a file it does not own reports it instead of editing; the main session routes it at integration.
