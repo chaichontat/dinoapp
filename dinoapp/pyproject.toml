@@ -32,7 +32,6 @@ native = [
     "zarr",
 ]
 legacy = [
-    "fishtools",
     "numpy",
     "scikit-learn",
 ]

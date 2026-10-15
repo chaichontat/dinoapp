@@ -35,9 +35,8 @@ compute = [
     "torch",
     "torchvision",
 ]
-workspace = [
+legacy = [
     "anndata",
-    "fishtools",
     "tifffile",
 ]
 dev = [

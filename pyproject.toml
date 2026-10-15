@@ -5,6 +5,8 @@ members = ["dinoapp", "dino", "markers"]
 dinoapp = { workspace = true }
 dino-markers = { workspace = true }
 thesis-dino = { workspace = true }
+squisher = { git = "https://github.com/chaichontat/squisher", subdirectory = "squisher" }
+squisher-segment = { git = "https://github.com/chaichontat/squisher", subdirectory = "segment" }
 
 [tool.pytest.ini_options]
 testpaths = ["dinoapp/tests", "dino/tests", "markers/tests"]
